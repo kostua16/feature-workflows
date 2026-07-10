@@ -7,8 +7,10 @@ samples/
 __pycache__/
 .idea/
 
-# Claude Code local settings
+# Claude Code local settings and runtime state
 .claude/settings.local.json
+.claude/worktrees/
+.claude/agent-memory/
 
 # Local debug / scratch artifacts
 progress_debug*.py
