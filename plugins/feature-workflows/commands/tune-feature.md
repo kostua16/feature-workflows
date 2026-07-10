@@ -1,13 +1,23 @@
 ---
 description: FIX flow — read issues-and-improvements.md -> derive minimal gate-revisit plan -> refine those design gates in place -> preserve done stages -> re-enable designReady. Then re-run /implement-feature.
 argument-hint: <planDir> [--no-confirm] [--no-reconcile] [--no-enhancer] [--no-quick-decider] [--decision-cap=N] [--retries=N] [--max-reconcile-iterations=N]
-allowed-tools: Workflow
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
 Run the `feature-pipeline` workflow in **tune mode** — the FIX flow that consumes
 `issues-and-improvements.md` (written by a prior `/implement-feature` upstream-defect handoff),
 derives a minimal design-gate revisit plan, refines only those gates in place, preserves completed
 plan stages, then re-enables `designReady` so you can re-run `/implement-feature`.
+
+## Preflight — engine must be installed
+
+- Engine installed: !`test -f .claude/workflows/feature-pipeline.js && echo INSTALLED || echo MISSING`
+- Installed engine version: !`grep -m1 "engine-version:" .claude/workflows/feature-pipeline.js 2>/dev/null || echo none`
+- Plugin engine version: !`grep -m1 "engine-version:" "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" 2>/dev/null || echo unknown`
+
+If the engine is MISSING: tell the user to run `/feature-workflows:setup` first and STOP — do not
+call the Workflow tool. If the two versions differ: warn that the installed engine is outdated and
+recommend re-running `/feature-workflows:setup`, then proceed with the user's request.
 
 This command REQUIRES a `<planDir>` positional arg (the planDir from your `/implement-feature` handoff)
 and a prior `/implement-feature` run that hit `blockedAt === 'issues-handoff'` (so
@@ -66,6 +76,9 @@ Examples:
 
 ## Editing the workflow script
 
-After editing `.claude/workflows/feature-pipeline.js`, validate it as **ES module** — see the
-**Validation** section in `.claude/workflows/feature-pipeline.md`. Plain `node --check` parses as
-CommonJS and silently passes invalid ESM; use the `--input-type=module` recipe there.
+The canonical engine source lives in the plugin at `plugins/feature-workflows/workflows/feature-pipeline.js`
+(resolved at runtime as `${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js`). The project copy at
+`.claude/workflows/feature-pipeline.js` is installed by `/feature-workflows:setup` and overwritten on
+re-run — edit the plugin source, not the copy. After editing, validate as **ES module** — see the
+**Validation** section in the `feature-pipeline.md` reference next to the engine. Plain `node --check`
+parses as CommonJS and silently passes invalid ESM; use the `--input-type=module` recipe there.
