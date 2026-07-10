@@ -1,5 +1,5 @@
 // feature-pipeline.js
-// engine-version: 1.2.0
+// engine-version: 1.3.0
 // Gate-enforcing pipeline for new features / bug-fixes.
 //
 // Enhancements:
@@ -20,12 +20,18 @@
 
 export const meta = {
   name: 'feature-pipeline',
-  version: '1.2.0',
-  description: '1 engine + 4 modes (design/implement/tune/status) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). Durable cross-mode state via pipeline-state.json; status mode renders it read-only.',
+  version: '1.3.0',
+  description: '1 engine + 5 modes (design/implement/tune/extract/status) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). EXTRACT reverse-engineers design docs from existing code. Durable cross-mode state via pipeline-state.json; status mode renders it read-only.',
   phases: [
     { title: 'Categorize' },
     { title: 'Translate' },
     { title: 'Tune' },
+    { title: 'Extract Scope' },
+    { title: 'Decompose' },
+    { title: 'Extract Slice' },
+    { title: 'Design Audit' },
+    { title: 'System Overview' },
+    { title: 'Extract' },
     { title: 'Define' },
     { title: 'Knowledge' },
     { title: 'Codebase Facts' },
@@ -721,8 +727,8 @@ const PIPELINE_STATE = {
     planDir: { type: 'string' },
     lastGate: { type: 'string', description: 'Most recent gate reached' },
     checksum: { type: 'string', description: 'IM-1: djb2 hash of JSON.stringify(result), verified on resume (validatePipelineState) to detect a truncated chunked write. Optional — pre-checksum state files still resume.' },
-    result: { type: 'object', description: 'Full pipeline result object (verbatim). Phase F-K split adds optional fields inside result: mode (design|implement|tune), stages[], designReady, issuesPath, tunePlan, handoff. v1.2.0 adds gateTelemetry (per-gate agent-call counters), designApproved + approvalPending (human design-approval checkpoint). All default so older state still hydrates.' },
-    config: { type: 'object', description: 'args-derived flags, so resume re-derives without re-parsing. Gains mode/useChunker/useIssues/useTuneConfirm (Phase F-K); useApproval (v1.2.0).' },
+    result: { type: 'object', description: 'Full pipeline result object (verbatim). Phase F-K split adds optional fields inside result: mode (design|implement|tune|extract), stages[], designReady, issuesPath, tunePlan, handoff. v1.2.0 adds gateTelemetry (per-gate agent-call counters), designApproved + approvalPending (human design-approval checkpoint). v1.3.0 extract mode adds extractScope, scopeManifestPath, scopeConfirmed, extractQueue[], overviewPath, extractReady, auditPath. All default so older state still hydrates.' },
+    config: { type: 'object', description: 'args-derived flags, so resume re-derives without re-parsing. Gains mode/useChunker/useIssues/useTuneConfirm (Phase F-K); useApproval (v1.2.0); useScopeConfirm/useDecompose/useAudit/useExtractRequirements/useExtractReview/maxSlices/slices (v1.3.0 extract).' },
   },
 }
 
@@ -820,6 +826,130 @@ const TUNE_PLAN_VERDICT = {
   },
 }
 
+// scope-resolver (extract Gate X0): resolve the hybrid extract input (free text / paths /
+// globs / entry points) into a concrete scope manifest written to <planDir>/scope-manifest.md.
+// Gate = scopePath + files populated. `wide=true` routes into the decomposition gate.
+const SCOPE_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['scopePath', 'files', 'wide', 'summary'],
+  properties: {
+    scopePath: { type: 'string', description: 'Path to the scope-manifest.md written' },
+    files: { type: 'array', items: { type: 'string' }, description: 'Concrete resolved file paths in scope' },
+    entryPoints: { type: 'array', items: { type: 'string' }, description: 'Observable entry points (API routes, CLI commands, event handlers, exported functions)' },
+    symbols: { type: 'array', items: { type: 'string' }, description: 'Key symbols (classes/functions) anchoring the scope' },
+    confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'How confident the resolver is that the scope matches the input' },
+    ambiguities: { type: 'array', items: { type: 'string' }, description: 'Scope ambiguities recorded to open-questions.md (non-blocking)' },
+    wide: { type: 'boolean', description: 'true when the scope spans multiple coherent subsystems and should be decomposed into slices' },
+    suggestedSlices: {
+      type: 'array',
+      description: 'When wide: candidate feature/subsystem slices for the decomposition gate',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'name'],
+        properties: {
+          id: { type: 'string', description: 'kebab-case slice id' },
+          name: { type: 'string' },
+          files: { type: 'array', items: { type: 'string' } },
+          entryPoints: { type: 'array', items: { type: 'string' } },
+          reason: { type: 'string', description: 'why this is a coherent slice' },
+        },
+      },
+    },
+    summary: { type: 'string' },
+  },
+}
+
+// subsystem-decomposer (extract Gate X1): split a confirmed wide scope into dependency-aware
+// feature/subsystem slices. Gate = slices non-empty. The slice list seeds the resumable
+// extract queue (one full extraction cycle runs per slice).
+const DECOMPOSE_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['slices', 'summary'],
+  properties: {
+    slices: {
+      type: 'array',
+      description: 'Dependency-aware feature/subsystem slices (each gets its own extraction cycle)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'name', 'files'],
+        properties: {
+          id: { type: 'string', description: 'kebab-case slice id' },
+          name: { type: 'string', description: 'short human-readable slice name' },
+          files: { type: 'array', items: { type: 'string' }, description: 'files this slice owns' },
+          entryPoints: { type: 'array', items: { type: 'string' } },
+          dependsOn: { type: 'array', items: { type: 'string' }, description: 'slice ids this slice depends on (extraction order hint)' },
+        },
+      },
+    },
+    overviewNotes: { type: 'string', description: 'cross-slice observations for the system-overview synthesis' },
+    summary: { type: 'string' },
+  },
+}
+
+// as-is design auditor (extract Gate X7): audit the EXTRACTED design docs for design debt,
+// gaps, and doc<->code inconsistencies. Findings mirror ISSUE_CLASSIFY_VERDICT's field shape
+// (severity/gate/finding/suggestedFix) so they append to issues-and-improvements.md in the
+// exact section format the tune planner already consumes.
+const AUDIT_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['auditPath', 'findings', 'summary'],
+  properties: {
+    auditPath: { type: 'string', description: 'Path to the design-audit.md written' },
+    findings: {
+      type: 'array',
+      description: 'Design-debt / gap / inconsistency findings on the extracted design',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['severity', 'gate', 'finding'],
+        properties: {
+          severity: { type: 'string', enum: ['blocker', 'high', 'medium', 'low'] },
+          gate: {
+            type: 'string',
+            enum: ['requirements', 'architecture', 'design', 'plan', 'tests', 'none'],
+            description: 'which design gate owns the doc this finding maps to ("none" if purely code-level)',
+          },
+          finding: { type: 'string', description: 'the issue, phrased for a design-doc author' },
+          suggestedFix: { type: 'string' },
+          evidence: { type: 'string', description: 'file:line evidence from the code' },
+        },
+      },
+    },
+    summary: { type: 'string' },
+  },
+}
+
+// system-overview synthesizer (extract Gate X8, multi-slice only): synthesize per-slice
+// architectures into <parentPlanDir>/system-overview.md with a slice index table.
+const OVERVIEW_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['overviewPath', 'summary'],
+  properties: {
+    overviewPath: { type: 'string', description: 'Path to the system-overview.md written' },
+    sliceIndex: {
+      type: 'array',
+      description: 'Index of the slices covered by the overview',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'planDir', 'status'],
+        properties: {
+          id: { type: 'string' },
+          planDir: { type: 'string' },
+          status: { type: 'string' },
+        },
+      },
+    },
+    summary: { type: 'string' },
+  },
+}
+
 // ---- Helpers --------------------------------------------------------------
 
 // Global retry budget. The pipeline only exits on a TRUE hard error (no artifact,
@@ -888,6 +1018,11 @@ const MODEL_DEFAULTS = {
   planChunker: 'sonnet',  // plan-chunker (design tail: plan.md -> stageNN.md)
   issueClassifier: 'opus', // classifies implement findings as upstream-vs-code
   tunePlanner: 'opus',    // derives minimal gate-revisit plan from issues file
+  // Extract mode (reverse design extraction) gates.
+  scopeResolver: 'sonnet', // code-explorer resolving hybrid input into a scope manifest (Gate X0)
+  decomposer: 'opus',      // arch-design-orchestrator slicing a wide scope into subsystems (Gate X1)
+  audit: 'opus',           // critical-reviewer auditing the extracted design for debt (Gate X7)
+  overview: 'sonnet',      // arch-design-orchestrator synthesizing the multi-slice overview (Gate X8)
 }
 
 // Config profiles: a named preset for the gate-control flag zoo. Individual --no-*
@@ -903,6 +1038,7 @@ const PROFILES = {
   standard: {
     useE2eUsecase: false,
     useKnowledgeConsult: false,
+    useExtractReview: false,
   },
   light: {
     useEnhancer: false,
@@ -913,6 +1049,9 @@ const PROFILES = {
     useE2eUsecase: false,
     useKnowledgeConsult: false,
     useInterview: false,
+    useExtractReview: false,
+    useExtractRequirements: false,
+    useAudit: false,
   },
 }
 // Resolve a profile name to its flag-default overrides. Pure; unknown => 'full'.
@@ -981,13 +1120,13 @@ function gm(key) {
 }
 
 // Phase F-K: resolve the pipeline mode. Precedence:
-//   1. explicit args.mode (the slash command sets it: design-feature/implement-feature/tune-feature)
+//   1. explicit args.mode (the slash command sets it: design/implement/tune/extract-feature commands)
 //   2. persisted config.mode (resume honors the mode that wrote the state)
 //   3. default 'design' (bare /feature-pipeline backward-compat).
 // On --resume with an explicit different mode (e.g. implement after design), the explicit
 // arg wins so the user can drive the design->implement->tune cycle from the command line.
 function resolveMode(args, persistedConfig, resumed) {
-  const VALID = { design: true, implement: true, tune: true, status: true }
+  const VALID = { design: true, implement: true, tune: true, status: true, extract: true }
   if (args && args.mode && VALID[args.mode]) return args.mode
   if (persistedConfig && persistedConfig.mode && VALID[persistedConfig.mode]) return persistedConfig.mode
   if (resumed && resumed.result && resumed.result.mode && VALID[resumed.result.mode]) return resumed.result.mode
@@ -996,11 +1135,13 @@ function resolveMode(args, persistedConfig, resumed) {
 
 // Phase F-K: RUN_GATE guard. A gate runs only if its mode is active. Design gates
 // (THINK: define...review/refine + chunker) run in design+tune (tune revisits a subset in
-// refine mode). Implement gates (DO: execute...commit) run in implement only. This is the
-// single structural seam that turns one engine into 3 pipelines without code duplication.
+// refine mode). Implement gates (DO: execute...commit) run in implement only. Extract gates
+// (reverse design extraction: scope...audit/overview) run in extract only. This is the
+// single structural seam that turns one engine into 5 pipelines without code duplication.
 function gateModeActive(gateGroup, mode) {
   if (gateGroup === 'design') return mode === 'design' || mode === 'tune'
   if (gateGroup === 'implement') return mode === 'implement'
+  if (gateGroup === 'extract') return mode === 'extract'
   return true // shared front-matter gates (categorize/translate/resume) always active
 }
 
@@ -1355,7 +1496,12 @@ async function repairResumeArtifactFlags(result) {
     { pathKey: 'archPath', flags: ['_arch', '_reviewedArch'], gate: 'Architecture' },
     { pathKey: 'designPath', flags: ['_design', '_reviewedDesign'], gate: 'Detailed Design' },
     { pathKey: 'planPath', flags: ['planned', '_plan', '_reviewedPlan', 'planAccepted', 'tddEnforced', 'reconcile'], gate: 'Plan' },
-  ]
+  ].filter((a) =>
+    // Extract mode writes no plan.md — planPath is planDir math only. Verifying it on an
+    // extract resume would null result.planPath (disabling every later state flush in
+    // consolidate) and clear designReady. Skip the Plan artifact for extract-mode state.
+    !(result.mode === 'extract' && a.pathKey === 'planPath')
+  )
   for (const artifact of artifacts) {
     const path = result[artifact.pathKey]
     if (!path) continue
@@ -1668,6 +1814,422 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
   else if (gate === 'plan') result.planAccepted = true
   plogFromResult(result, `tune: gate ${gate} revisit ${review && review.accepted ? 'accepted' : 'fail-forward'} after ${review ? review.iterations : 0} iteration(s)`)
   return { gate, review }
+}
+
+// ---- Extract mode (reverse design extraction) helpers ----------------------
+
+// seedExtractQueue: build the resumable slice queue from the confirmed scope. PURE.
+// Single coherent scope (or decomposition disabled) -> one entry whose planDir IS the
+// parent planDir (artifacts land flat, no slices/ nesting). Wide scope -> one entry per
+// slice under <parentPlanDir>slices/<slice-id>/. `selectedSlices` (--slices) filters by id;
+// `maxSlices` caps the run — excess entries are kept with status 'skipped' so the index
+// stays complete and a later run can resume them. Slices are ordered so dependencies
+// (dependsOn) come first; on a cycle the given order is kept (stable).
+function seedExtractQueue(scope, slices, parentPlanDir, maxSlices, selectedSlices) {
+  const parent = String(parentPlanDir || '').replace(/\/$/, '') + '/'
+  if (!slices || !slices.length) {
+    return [{
+      id: 'main',
+      name: 'whole scope',
+      planDir: parent,
+      files: (scope && scope.files) || [],
+      entryPoints: (scope && scope.entryPoints) || [],
+      status: 'pending',
+      artifacts: {},
+    }]
+  }
+  // Stable dependency ordering: repeatedly take slices whose dependsOn are all placed.
+  // A cycle (or dangling dependsOn) falls back to the given order for the remainder.
+  const remaining = slices.slice()
+  const ordered = []
+  const placed = new Set()
+  while (remaining.length) {
+    const idx = remaining.findIndex((s) => (s.dependsOn || []).every((d) => placed.has(d) || !slices.some((o) => o.id === d)))
+    const next = idx === -1 ? remaining.shift() : remaining.splice(idx, 1)[0]
+    ordered.push(next)
+    placed.add(next.id)
+  }
+  const selected = new Set((selectedSlices || []).map(String))
+  const cap = Number.isFinite(maxSlices) && maxSlices > 0 ? maxSlices : ordered.length
+  let active = 0
+  return ordered.map((s) => {
+    const id = categorizeSlug(s.id || s.name) || 'slice'
+    const deselected = selected.size > 0 && !selected.has(s.id) && !selected.has(id)
+    const overCap = active >= cap
+    const status = deselected || overCap ? 'skipped' : 'pending'
+    if (status === 'pending') active++
+    return {
+      id,
+      name: s.name || id,
+      planDir: `${parent}slices/${id}/`,
+      files: s.files || [],
+      entryPoints: s.entryPoints || [],
+      status,
+      artifacts: {},
+    }
+  })
+}
+
+// nextPendingSlice: first queue entry still pending. PURE.
+function nextPendingSlice(queue) {
+  return (queue || []).find((s) => s.status === 'pending') || null
+}
+
+// resolveScope (extract Gate X0): code-explorer resolves the hybrid input (free text /
+// paths / globs / entry points) into a concrete scope manifest. Blocking — no scope means
+// nothing to extract. Ambiguities are recorded to open-questions.md, not blocked on.
+async function resolveScope({ task, planDir, result }) {
+  const scopePath = planDir + 'scope-manifest.md'
+  return flexibleAgent(
+    `You are the code-explorer agent. Resolve the extraction input below into a CONCRETE code scope
+and write a scope manifest to ${scopePath}. The input may be free text describing a feature/subsystem,
+explicit paths/globs, entry points (API routes, CLI commands, exported functions), or any mix.
+Use Serena tools (activate the project, list_dir, find_symbol, find_referencing_symbols,
+search_for_pattern) to locate the code — do NOT guess paths.
+
+IMPORTANT: You are running inside an automated workflow pipeline. AskUserQuestion is NOT available.
+Record anything needing user judgment in the ambiguities array instead of asking.
+
+Extraction input:
+${task}
+
+Write to the manifest (and return in the verdict):
+- files: every concrete file path in scope (resolved, existing files only)
+- entryPoints: observable entry points into this code (routes, commands, handlers, exports)
+- symbols: the key classes/functions anchoring the scope
+- confidence: high|medium|low that this scope matches the input's intent
+- wide: true ONLY if the scope spans multiple coherent subsystems that deserve separate design
+  docs (e.g. a whole repo or a large multi-module directory); a single feature = wide:false
+- suggestedSlices: when wide, candidate subsystem slices ({id, name, files, entryPoints, reason})
+- ambiguities: unclear boundaries or intent questions (recorded, not blocking)
+
+Do NOT modify any code. Do NOT commit. Return scopePath set to ${scopePath}.`,
+    { label: 'code-explorer(scope)', phase: 'Extract Scope', schema: SCOPE_VERDICT, model: gm('scopeResolver') },
+    result
+  )
+}
+
+// auditExtractedDesign (extract Gate X7): critical-reviewer as an AS-IS design auditor.
+// It audits the EXTRACTED docs (and the code they describe) for design debt, gaps, and
+// doc<->code inconsistencies — it does NOT reject the docs. Findings append to
+// <sliceDir>/issues-and-improvements.md in the exact section format the tune planner
+// consumes (mirrors classifyAndRecordIssue), so /tune-feature <sliceDir> becomes the FIX
+// flow for audit findings. Non-blocking.
+async function auditExtractedDesign({ slicePlanDir, sliceState, task, result }) {
+  const auditPath = slicePlanDir + 'design-audit.md'
+  const docs = [
+    sliceState.designPath ? `detailed design: ${sliceState.designPath}` : null,
+    sliceState.archPath ? `architecture: ${sliceState.archPath}` : null,
+    sliceState.useCasePath ? `e2e use cases: ${sliceState.useCasePath}` : null,
+    sliceState.requirementsPath ? `requirements: ${sliceState.requirementsPath}` : null,
+    sliceState.factsPath ? `codebase facts: ${sliceState.factsPath}` : null,
+  ].filter(Boolean).join('\n')
+  const verdict = await safeAgent(
+    `You are the critical-reviewer agent acting as an AS-IS DESIGN AUDITOR. The design docs below were
+EXTRACTED from existing code — they describe what the code does today. Do NOT reject or rewrite them.
+Instead, audit the design they reveal for:
+- design debt (wrong boundaries, leaky abstractions, tangled dependencies, missing seams)
+- gaps (unhandled errors/edge cases, missing validation, absent tests for critical paths)
+- cross-artifact inconsistencies (docs contradicting each other or the code)
+Cite file:line evidence from the CODE for every finding. Write the audit report to ${auditPath}.
+
+Extracted docs:
+${docs}
+
+Task context: ${task}
+
+For each finding set: severity (blocker|high|medium|low), gate = the design doc that would have to
+change to fix it (requirements|architecture|design|plan|tests|none), the finding phrased for a
+design-doc author, a concrete suggestedFix, and evidence. Do NOT modify code or docs. Do NOT commit.`,
+    { label: 'critical-reviewer(audit)', phase: 'Design Audit', schema: AUDIT_VERDICT, model: gm('audit') },
+    result
+  )
+  if (!verdict || !verdict.auditPath) {
+    plogFromResult(result, 'Design Audit: auditor returned no report (non-blocking) — skipping')
+    return null
+  }
+  sliceState.auditPath = verdict.auditPath
+  const upstream = (verdict.findings || []).filter((f) => f.gate && f.gate !== 'none')
+  if (upstream.length) {
+    const issuesPath = slicePlanDir.replace(/\/$/, '') + '/issues-and-improvements.md'
+    const sections = upstream.map((f) => [
+      `## Upstream issue — gate: ${f.gate}`,
+      '',
+      `**Severity:** ${f.severity || '(unspecified)'}`,
+      `**Finding:** ${f.finding || '(unspecified)'}`,
+      `**Suggested fix:** ${f.suggestedFix || '(none)'}`,
+      '',
+      '---',
+      '',
+    ].join('\n')).join('\n')
+    try {
+      const ack = await safeAgent(
+        `You are a file-writer agent. APPEND the markdown sections below to ${issuesPath}.
+If the file does not exist, create it with a "# Issues & Improvements" header first, then the sections.
+Do NOT overwrite existing content — append only. Return ok=true and totalBytes = the file's total
+size in bytes AFTER appending.
+
+${sections}`,
+        { label: 'file-writer(audit-issues)', phase: 'Design Audit', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+        result
+      )
+      sliceState.issuesPath = issuesPath
+      const growth = verifyAppendGrowth(result, issuesPath, ack)
+      if (growth && growth.ok === false) plogFromResult(result, `Design Audit: issues-and-improvements.md DID NOT grow (possible overwrite): ${issuesPath} ${growth.prev}->${growth.now}`)
+      plogFromResult(result, `Design Audit: ${upstream.length} finding(s) recorded to ${issuesPath} (tune-consumable)`)
+    } catch (e) {
+      plogFromResult(result, `Design Audit: issues append failed (non-blocking): ${String(e)}`)
+    }
+  }
+  plogFromResult(result, `Design Audit: report at ${verdict.auditPath}; findings=${(verdict.findings || []).length} (${upstream.length} upstream)`)
+  return verdict
+}
+
+// extractSlice: run the per-slice extraction cycle (facts -> e2e use cases -> detailed
+// design -> architecture [-> fidelity reviews] [-> requirements] [-> audit]) writing all
+// artifacts under slice.planDir. `sliceState` receives the artifact paths — it is the main
+// `result` for a single-slice run, or a synthesized design-shaped result (flushed to a
+// slice-local pipeline-state.json by the caller) for a multi-slice run. Sub-gates skip when
+// their artifact path is already set, so an interrupted slice resumes mid-cycle. Returns
+// {status: 'done'|'blocked', gate?} — a blocked slice never kills the whole queue.
+async function extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap }) {
+  const dir = slice.planDir
+  const scopeHint = [
+    slice.files && slice.files.length ? `Files in scope:\n${slice.files.join('\n')}` : '',
+    slice.entryPoints && slice.entryPoints.length ? `Entry points:\n${slice.entryPoints.join('\n')}` : '',
+  ].filter(Boolean).join('\n')
+  const noAsk = `IMPORTANT: You are running inside an automated workflow pipeline. AskUserQuestion is NOT
+available. Record anything needing user judgment in the openQuestions/ambiguities field instead.`
+
+  // X2: code facts (deep, scoped). The extraction foundation — blocking for this slice.
+  if (!sliceState.factsPath) {
+    phase('Extract Slice')
+    plogFromResult(result, `Extract [${slice.id}]: gathering deep code facts`)
+    const facts = await safeAgent(
+      `You are the code-explorer agent. Explore ONLY the code scope below and write exhaustive
+STRUCTURE FACTS to ${dir}codebase-facts.md. Use Serena tools (activate the project, read_file,
+get_symbols_overview, find_referencing_symbols, search_for_pattern). This is a REVERSE-ENGINEERING
+pass: capture EVERY public interface, data carrier, integration point, and invariant in scope —
+deeper than a task-scoped exploration.
+
+${noAsk}
+
+Slice: ${slice.name}
+${scopeHint}
+Task context: ${task}
+
+Capture with file:line evidence: relevantFiles, patterns (conventions/invariants the code follows),
+callSites (how this code is wired into the rest of the system). Do NOT propose changes or commit.
+Return factsPath set to ${dir}codebase-facts.md.`,
+      { label: `code-explorer(extract:${slice.id})`, phase: 'Extract Slice', schema: CODEBASE_FACTS_VERDICT, model: gm('explorer') },
+      result
+    )
+    if (!facts || !facts.factsPath) return { status: 'blocked', gate: 'extract-facts' }
+    sliceState.factsPath = facts.factsPath
+    sliceState._facts = facts
+  }
+
+  // X3: behavioral e2e use cases (early — they anchor intent for the design extraction).
+  if (config.useE2eUsecase && !sliceState.useCasePath) {
+    phase('Extract Slice')
+    plogFromResult(result, `Extract [${slice.id}]: extracting observable e2e use cases`)
+    const useCases = await flexibleAgent(
+      `You are the e2e-usecase-extractor agent. Extract the end-to-end use cases this code OBSERVABLY
+implements TODAY — from its entry points, tests, and CLI/API surfaces — and write them to
+${dir}e2e-use-cases.md. Document AS-IS behavior, not aspirations: happy paths, alternative flows,
+edge cases, and error behaviors the code actually handles. Consume the code facts at
+${sliceState.factsPath}.
+
+${noAsk}
+
+Slice: ${slice.name}
+${scopeHint}
+Task context: ${task}
+
+Do NOT commit. Return useCasePath set to ${dir}e2e-use-cases.md.`,
+      { label: `e2e-usecase-extractor(extract:${slice.id})`, phase: 'Extract Slice', schema: E2E_USECASE_VERDICT, model: gm('e2eUsecase') },
+      result
+    )
+    // Same alternative-envelope normalization as the forward e2e gate.
+    if (useCases && !useCases.useCasePath) {
+      const candidate = useCases.file || useCases.path
+      if (candidate) {
+        useCases.useCasePath = candidate
+        useCases.summary = useCases.summary || '(e2e use cases written)'
+      }
+    }
+    if (!useCases || !useCases.useCasePath) return { status: 'blocked', gate: 'extract-e2e' }
+    sliceState.useCasePath = useCases.useCasePath
+    sliceState._e2e = useCases
+    if ((useCases.openQuestions || []).length) {
+      await writeOpenQuestions(dir, useCases.openQuestions.map((q) => ({ gate: 'Extract E2E', text: q, severity: 'unspecified' })), result)
+    }
+  }
+
+  // X4: detailed design reverse-engineered from the code.
+  if (config.useDetailedDesign && !sliceState.designPath) {
+    phase('Extract Slice')
+    plogFromResult(result, `Extract [${slice.id}]: reverse-engineering the detailed design`)
+    const design = await flexibleAgent(
+      `You are the detailed-design-architect agent. REVERSE-ENGINEER the implementation-level design
+AS IT EXISTS from the code in scope, and write it to ${dir}detailed-design.md. This is extraction,
+not design: describe what IS, citing file:line evidence throughout. Consume the code facts at
+${sliceState.factsPath}${sliceState.useCasePath ? ` and the observed use cases at ${sliceState.useCasePath}` : ''}.
+
+${noAsk}
+
+Slice: ${slice.name}
+${scopeHint}
+Task context: ${task}
+
+Cover: component breakdown, interfaces, data models, control flow, error handling, edge cases the
+code handles, and configuration — as implemented. Do NOT propose changes; record improvement
+candidates as neutral notes (a separate audit gate evaluates them). Do NOT commit.
+Return designPath set to ${dir}detailed-design.md.`,
+      { label: `detailed-design-architect(extract:${slice.id})`, phase: 'Extract Slice', schema: DETAILED_DESIGN_VERDICT, model: gm('detailedDesign') },
+      result
+    )
+    if (!design || !design.designPath) return { status: 'blocked', gate: 'extract-design' }
+    sliceState.designPath = design.designPath
+    sliceState._design = design
+  }
+
+  // X5: high-level architecture abstracted from the detailed design + facts.
+  if (config.useArchDesign && !sliceState.archPath) {
+    phase('Extract Slice')
+    plogFromResult(result, `Extract [${slice.id}]: abstracting the high-level architecture`)
+    const arch = await flexibleAgent(
+      `You are the arch-design-orchestrator agent. ABSTRACT the high-level architecture of this
+existing code and write it to ${dir}architecture.md. This is extraction from a brownfield system:
+describe the architecture AS BUILT — module boundaries, dependency directions, integration points,
+and the NFR posture the code actually achieves (performance, reliability, security as implemented).
+Consume the detailed design at ${sliceState.designPath || '(none)'} and the code facts at
+${sliceState.factsPath}.
+
+${noAsk}
+
+Slice: ${slice.name}
+Task context: ${task}
+
+Do NOT redesign or propose changes. Do NOT commit. Return archPath set to ${dir}architecture.md.`,
+      { label: `arch-design-orchestrator(extract:${slice.id})`, phase: 'Extract Slice', schema: ARCH_VERDICT, model: gm('archDesign') },
+      result
+    )
+    if (!arch || !arch.archPath) return { status: 'blocked', gate: 'extract-arch' }
+    sliceState.archPath = arch.archPath
+    sliceState._arch = arch
+  }
+
+  // X5.5: fidelity reviews (optional) — does each doc faithfully describe the code?
+  if (config.useExtractReview && !sliceState._reviewedDesign) {
+    for (const target of [
+      { path: sliceState.designPath, name: 'detailed-design', label: 'Detailed Design Review' },
+      { path: sliceState.archPath, name: 'architecture', label: 'Arch Review' },
+    ]) {
+      if (!target.path) continue
+      const review = await reviewLoop({
+        phaseLabel: target.label,
+        artifactPath: target.path,
+        artifactName: target.name,
+        reviewerPrompt:
+          `You are the critical-reviewer agent. This ${target.name} doc at ${target.path} was EXTRACTED from
+existing code (facts: ${sliceState.factsPath}). Review it for FIDELITY ONLY: does it faithfully and
+completely describe the code as it exists? Reject on: components/interfaces present in the code but
+missing from the doc, described behavior contradicting the code, or missing file:line evidence.
+Do NOT reject because the underlying design could be better — design debt belongs to the audit gate.
+Task:\n${task}`,
+        reviserPrompt: (rev) =>
+          `You are the design-reviser agent. Address these fidelity findings on the extracted ${target.name}
+at ${target.path}. Correct the doc to match the CODE (the code is the source of truth here). Write the
+revised doc to ${target.path} (in place).
+Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev && rev.gaps) || [], findings: (rev && rev.findings) || [] }, null, 2)}`,
+        reviewerModel: gm('reviewDesign'),
+        reviserModel: gm('revise'),
+        result, retryBudget, refineSubcap, spendRetry, planDir: dir,
+        useEnhancer: config.useEnhancer, useQuickDecider: config.useQuickDecider, decisionCap,
+      })
+      plogFromResult(result, `Extract [${slice.id}]: ${target.name} fidelity review ${review && review.accepted ? 'accepted' : 'fail-forward'} after ${review ? review.iterations : 0} iteration(s)`)
+    }
+    sliceState._reviewedDesign = true
+    sliceState._reviewedArch = true
+  }
+
+  // X6: reverse-derived requirements (optional; highest abstraction, extracted last).
+  if (config.useExtractRequirements && !sliceState.requirementsPath) {
+    phase('Extract Slice')
+    plogFromResult(result, `Extract [${slice.id}]: reverse-deriving requirements`)
+    const requirements = await safeAgent(
+      `You are the requirements-collector agent. REVERSE-DERIVE the functional and non-functional
+requirements this code DEMONSTRABLY satisfies, from the observed use cases at
+${sliceState.useCasePath || '(none)'} and the architecture at ${sliceState.archPath || '(none)'}.
+Write them to ${dir}requirements.md. Mark every requirement with the [extracted] prefix so readers
+know it was derived from code, not stakeholders.
+
+${noAsk}
+
+Slice: ${slice.name}
+Task context: ${task}
+
+Only include requirements with evidence in the code/docs — do not invent aspirational requirements.
+Do NOT commit. Return requirementsPath set to ${dir}requirements.md.`,
+      { label: `requirements-collector(extract:${slice.id})`, phase: 'Extract Slice', schema: REQUIREMENTS_VERDICT, model: gm('requirements') },
+      result
+    )
+    if (requirements && requirements.requirementsPath) {
+      sliceState.requirementsPath = requirements.requirementsPath
+      sliceState._requirements = requirements
+      if ((requirements.openQuestions || []).length) {
+        await writeOpenQuestions(dir, requirements.openQuestions.map((q) => ({ gate: 'Extract Requirements', text: q, severity: 'unspecified' })), result)
+      }
+    } else {
+      plogFromResult(result, `Extract [${slice.id}]: requirements extraction returned no path (non-blocking) — continuing`)
+    }
+  }
+
+  // X7: as-is design audit (optional, non-blocking).
+  if (config.useAudit && !sliceState.auditPath) {
+    phase('Design Audit')
+    await auditExtractedDesign({ slicePlanDir: dir, sliceState, task, result })
+  }
+
+  return { status: 'done' }
+}
+
+// writeSystemOverview (extract Gate X8, multi-slice only): synthesize the per-slice
+// architecture docs into <parentPlanDir>/system-overview.md with a slice index table.
+// Non-blocking.
+async function writeSystemOverview({ parentPlanDir, queue, task, result }) {
+  const overviewPath = parentPlanDir + 'system-overview.md'
+  const sliceLines = (queue || []).map((s) =>
+    `- ${s.id} (${s.name}) — status: ${s.status}; planDir: ${s.planDir}; architecture: ${(s.artifacts && s.artifacts.archPath) || '(none)'}`
+  ).join('\n')
+  try {
+    const verdict = await safeAgent(
+      `You are the arch-design-orchestrator agent. Synthesize a SYSTEM OVERVIEW from the per-slice
+architecture docs listed below and write it to ${overviewPath}. Cover: the system's module map
+(one paragraph per slice), cross-slice dependencies and integration points, and shared conventions.
+Include a slice index table (id, name, status, planDir) so readers can navigate to each slice's
+full design docs.
+
+Slices:
+${sliceLines}
+
+Task context: ${task}
+
+Do NOT redesign anything — describe the system as extracted. Do NOT commit.
+Return overviewPath set to ${overviewPath}.`,
+      { label: 'arch-design-orchestrator(overview)', phase: 'System Overview', schema: OVERVIEW_VERDICT, model: gm('overview') },
+      result
+    )
+    if (verdict && verdict.overviewPath) {
+      result.overviewPath = verdict.overviewPath
+      plogFromResult(result, `System Overview: written to ${verdict.overviewPath}`)
+    } else {
+      plogFromResult(result, 'System Overview: synthesizer returned no path (non-blocking)')
+    }
+  } catch (e) {
+    plogFromResult(result, 'System Overview: failed (non-blocking) — ' + String(e))
+  }
 }
 
 // Gate 5.5: knowledge-persist (adopted agent). NON-BLOCKING: gathers the
@@ -3173,6 +3735,21 @@ async function main() {
     // Human design-approval checkpoint at the design-stop. Opt-in (--approval); persisted
     // so the implement run of an approval-gated design honors it too.
     useApproval: cfgFlag(args && args.useApproval, persistedConfig.useApproval, false),
+    // Extract mode (reverse design extraction) gate flags + slice controls. The scope
+    // confirmation itself is a pause-and-resume checkpoint (subagents cannot AskUserQuestion):
+    // the engine returns handoff.status='awaiting-scope-confirm' and the command layer re-invokes
+    // with the transient args.scopeConfirmed/args.scopeFiles/args.slices confirmation payload.
+    useScopeConfirm: cfgFlag(args && args.useScopeConfirm, persistedConfig.useScopeConfirm, pdef('useScopeConfirm', true)),
+    useDecompose: cfgFlag(args && args.useDecompose, persistedConfig.useDecompose, pdef('useDecompose', true)),
+    useAudit: cfgFlag(args && args.useAudit, persistedConfig.useAudit, pdef('useAudit', true)),
+    useExtractRequirements: cfgFlag(args && args.useExtractRequirements, persistedConfig.useExtractRequirements, pdef('useExtractRequirements', true)),
+    useExtractReview: cfgFlag(args && args.useExtractReview, persistedConfig.useExtractReview, pdef('useExtractReview', true)),
+    maxSlices: (args && Number.isFinite(args.maxSlices) && args.maxSlices > 0)
+      ? args.maxSlices
+      : (Number.isFinite(persistedConfig.maxSlices) && persistedConfig.maxSlices > 0 ? persistedConfig.maxSlices : 8),
+    slices: (args && Array.isArray(args.slices) && args.slices.length)
+      ? args.slices
+      : (Array.isArray(persistedConfig.slices) ? persistedConfig.slices : []),
   }
 
   // R4 adopted-agent gates (full path only; default ON, disable via flags).
@@ -3204,9 +3781,12 @@ async function main() {
   const useIssues = config.useIssues
   const useTuneConfirm = config.useTuneConfirm
   const useApproval = config.useApproval
+  const useScopeConfirm = config.useScopeConfirm
+  const useDecompose = config.useDecompose
   const isDesignMode = mode === 'design'
   const isImplementMode = mode === 'implement'
   const isTuneMode = mode === 'tune'
+  const isExtractMode = mode === 'extract'
 
   // Dynamic planDir (Phase B1). Cases:
   //  - Explicit --plan (fresh OR resume): used verbatim (escapes categorization).
@@ -3220,8 +3800,11 @@ async function main() {
   let planPath
   if (explicitPlanPath) {
     planPath = explicitPlanPath
-  } else if (gateModeActive('design', mode)) {
-    // Fresh run with no explicit --plan → derive dynamically.
+  } else if (gateModeActive('design', mode) || isExtractMode) {
+    // Fresh run with no explicit --plan → derive dynamically. Extract runs share the
+    // categorizer but land under a mode-specific path segment (extract/ instead of feature/)
+    // so as-is extraction docsets are distinguishable from forward feature designs.
+    const kindSeg = isExtractMode ? 'extract' : 'feature'
     const leafId = jiraIdFromTask(task) || ((args && args.timestamp) ? args.timestamp : slug)
     if (useCategorizer) {
       phase('Categorize')
@@ -3248,15 +3831,15 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
         const shortLeaf = cat.leaf && leafSeg !== 'misc'
           ? leafSeg
           : (jiraIdFromTask(task) || ((args && args.timestamp) ? args.timestamp : slug))
-        planPath = `docs/${catSeg}/${subSeg}/feature/${shortLeaf}/plan.md`
+        planPath = `docs/${catSeg}/${subSeg}/${kindSeg}/${shortLeaf}/plan.md`
         log(`Categorized → ${catSeg}/${subSeg}/${shortLeaf}; planDir = ${planPath.replace(/plan\.md$/, '')}`)
       } else {
-        planPath = `docs/uncategorized/feature/${leafId}/plan.md`
-        log('Categorizer unavailable (null) — falling back to docs/uncategorized/feature/<leaf>/')
+        planPath = `docs/uncategorized/${kindSeg}/${leafId}/plan.md`
+        log(`Categorizer unavailable (null) — falling back to docs/uncategorized/${kindSeg}/<leaf>/`)
       }
     } else {
-      planPath = `docs/uncategorized/feature/${leafId}/plan.md`
-      log('Categorizer disabled (--no-categorizer) — using docs/uncategorized/feature/<leaf>/')
+      planPath = `docs/uncategorized/${kindSeg}/${leafId}/plan.md`
+      log(`Categorizer disabled (--no-categorizer) — using docs/uncategorized/${kindSeg}/<leaf>/`)
     }
   }
   const definitionPath = (args && args.definitionPath) ||
@@ -3308,6 +3891,14 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (result.designApproved === undefined) result.designApproved = null
     if (result.approvalPending === undefined) result.approvalPending = false
     if (!result.logLines) result.logLines = []
+    // Backfill extract-mode fields on pre-extract state.
+    if (result.extractScope === undefined) result.extractScope = null
+    if (result.scopeManifestPath === undefined) result.scopeManifestPath = null
+    if (result.scopeConfirmed === undefined) result.scopeConfirmed = false
+    if (!result.extractQueue) result.extractQueue = []
+    if (result.overviewPath === undefined) result.overviewPath = null
+    if (result.extractReady === undefined) result.extractReady = false
+    if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
     const resumeRepairs = await repairResumeArtifactFlags(result)
     for (const repair of resumeRepairs) {
@@ -3386,6 +3977,15 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       handoff: null, // handoff directive shown to user at mode boundaries (design->implement, implement->tune)
       designApproved: null, // human sign-off {approved,by,seq} recorded at the design-approval checkpoint
       approvalPending: false, // design stopped awaiting the human decision (--approval)
+      // Extract mode (reverse design extraction) state. All default so pre-extract
+      // pipeline-state.json hydrates without breakage (mirrors the F-K backward-compat rule).
+      extractScope: null, // SCOPE_VERDICT from Gate X0
+      scopeManifestPath: null, // <planDir>/scope-manifest.md
+      scopeConfirmed: false, // set via the pause-and-resume confirmation leg (args.scopeConfirmed)
+      extractQueue: [], // resumable slice queue: [{id,name,planDir,files,entryPoints,status,artifacts}]
+      overviewPath: null, // <planDir>/system-overview.md (multi-slice only)
+      extractReady: false, // extract terminal: all pending slices processed
+      auditPath: null, // <planDir>/design-audit.md (single-slice; per-slice audits live on queue entries)
     }
   }
 
@@ -3658,6 +4258,310 @@ ${task}`,
         plog('Task input is English — translator skipped')
         result._translator = { translated: false, originalLang: 'en', task: task }
       }
+    }
+
+    // ===== Extract mode: reverse design extraction branch ======================
+    // Extract climbs the abstraction ladder in reverse, per feature/subsystem slice:
+    // scope -> [confirm] -> [decompose] -> per slice (facts -> e2e -> detailed design ->
+    // architecture [-> fidelity review] [-> requirements] [-> audit]) -> [overview] ->
+    // publish/persist -> extractReady. Artifacts reuse the forward-pipeline names so the
+    // output is a /tune-feature- and /design-feature-compatible baseline. Runs AFTER
+    // Translate (free-text scope input benefits from translation), never enters E4.
+    if (isExtractMode) {
+      // Gate X0: scope resolution — hybrid input -> concrete scope manifest. Blocking.
+      if (result.scopeManifestPath) {
+        plog('resume: skip Extract Scope (scopeManifestPath set)')
+      } else {
+        phase('Extract Scope')
+        plog('Resolving extraction input into a scope manifest')
+        const scope = await resolveScope({ task, planDir, result })
+        if (!scope || !scope.scopePath || !(scope.files || []).length) {
+          result.blockedAt = 'extract-scope'
+          result.handoff = {
+            from: 'extract',
+            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points), or --resume ${planDir} after inspecting scope-manifest.md.`,
+            nextMode: 'extract',
+            planDir,
+          }
+          plog('Extract Scope: no scope resolved — blocking')
+          stateCheckpoint('Extract Scope', 'blocked')
+          await consolidate(slug, result, config)
+          return result
+        }
+        result.extractScope = scope
+        result.scopeManifestPath = scope.scopePath
+        plog(`Extract Scope: ${scope.files.length} file(s), ${(scope.entryPoints || []).length} entry point(s), confidence=${scope.confidence || 'unspecified'}, wide=${!!scope.wide}`)
+        if ((scope.ambiguities || []).length) {
+          await writeOpenQuestions(planDir, scope.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        }
+        stateCheckpoint('Extract Scope', 'done')
+      }
+
+      // Gate X0.5: scope confirmation — pause-and-resume checkpoint, NO agent involved.
+      // Subagents spawned by the workflow cannot AskUserQuestion, so the engine returns a
+      // deliberate awaiting-scope-confirm handoff (not a blockedAt error); the command layer
+      // asks the user in the main session and re-invokes with the transient confirmation args
+      // (scopeConfirmed / scopeFiles / slices). --no-confirm skips the pause entirely.
+      if (!result.scopeConfirmed && args && args.scopeConfirmed === false) {
+        result.blockedAt = 'extract-cancelled'
+        result.handoff = {
+          from: 'extract',
+          message: `Extraction cancelled at scope confirmation. Re-run /extract-design when ready (or --resume ${planDir} to revisit this scope).`,
+          nextMode: 'extract',
+          planDir,
+        }
+        plog('Extract: user rejected the resolved scope — stopping')
+        stateCheckpoint('Extract Scope', 'cancelled')
+        await consolidate(slug, result, config)
+        return result
+      }
+      if (!result.scopeConfirmed && args && args.scopeConfirmed === true) {
+        if (Array.isArray(args.scopeFiles) && args.scopeFiles.length && result.extractScope) {
+          result.extractScope.files = args.scopeFiles
+          plog(`Extract: scope files adjusted by user (${args.scopeFiles.length} file(s))`)
+        }
+        result.scopeConfirmed = true
+        plog('Extract: scope confirmed by user')
+      }
+      if (useScopeConfirm && !result.scopeConfirmed) {
+        const scope = result.extractScope || {}
+        result.handoff = {
+          from: 'extract',
+          status: 'awaiting-scope-confirm',
+          message: `Scope resolved to ${(scope.files || []).length} file(s) (see ${result.scopeManifestPath}). Confirm the scope, then resume: /extract-design --resume ${planDir}`,
+          nextMode: 'extract',
+          planDir,
+          scopeSummary: {
+            files: scope.files || [],
+            entryPoints: scope.entryPoints || [],
+            confidence: scope.confidence || 'unspecified',
+            wide: !!scope.wide,
+            suggestedSlices: scope.suggestedSlices || [],
+          },
+        }
+        plog('Extract: awaiting scope confirmation (pause-and-resume checkpoint) — returning')
+        stateCheckpoint('Extract Scope', 'awaiting-confirm')
+        await consolidate(slug, result, config)
+        return result
+      }
+
+      // Gate X1: decompose a wide scope into slices + seed the resumable queue.
+      if (!result.extractQueue.length) {
+        const scope = result.extractScope || {}
+        let slices = null
+        if (scope.wide && useDecompose) {
+          phase('Decompose')
+          plog('Wide scope — decomposing into feature/subsystem slices')
+          const decomposed = await safeAgent(
+            `You are the arch-design-orchestrator agent. Decompose the code scope below into coherent
+feature/subsystem SLICES for design extraction — each slice gets its own full design docset, so a
+slice must be a unit a reader would want documented together (a feature, a subsystem, a layer).
+Assign every in-scope file to exactly one slice. Note inter-slice dependencies (dependsOn) so
+foundational slices are extracted first.
+
+Scope manifest: ${result.scopeManifestPath}
+Files:
+${(scope.files || []).join('\n')}
+${(scope.suggestedSlices || []).length ? `Suggested slices from scope resolution (validate/refine these):\n${JSON.stringify(scope.suggestedSlices, null, 2)}` : ''}
+
+Task context: ${task}
+
+Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
+            { label: 'subsystem-decomposer', phase: 'Decompose', schema: DECOMPOSE_VERDICT, model: gm('decomposer') },
+            result
+          )
+          if (decomposed && (decomposed.slices || []).length) {
+            slices = decomposed.slices
+            plog(`Decompose: ${slices.length} slice(s) — ${slices.map((s) => s.id).join(', ')}`)
+          } else if ((scope.suggestedSlices || []).length) {
+            slices = scope.suggestedSlices
+            plog('Decompose: decomposer unavailable — falling back to scope-resolver suggested slices')
+          } else {
+            plog('Decompose: no slices derived — extracting the whole scope as one slice')
+          }
+          stateCheckpoint('Decompose', 'done')
+        }
+        result.extractQueue = seedExtractQueue(scope, slices, planDir, config.maxSlices, config.slices)
+        const pending = result.extractQueue.filter((s) => s.status === 'pending').length
+        const skipped = result.extractQueue.length - pending
+        plog(`Extract queue seeded: ${result.extractQueue.length} slice(s), ${pending} pending${skipped ? `, ${skipped} skipped (--slices/--max-slices)` : ''}`)
+        await flushPipelineState(planDir, result, config)
+      }
+
+      // A slice left 'in-progress' by an interrupted run resumes as pending — its completed
+      // sub-gates are skipped via the artifact paths recorded on the queue entry.
+      for (const entry of result.extractQueue) {
+        if (entry.status === 'in-progress') entry.status = 'pending'
+      }
+
+      const multiSlice = result.extractQueue.length > 1
+        || (result.extractQueue[0] && result.extractQueue[0].planDir !== planDir)
+
+      // Slice loop: one full extraction cycle per pending slice, state flushed after each
+      // slice so a kill/resume continues mid-queue. A blocked slice logs and the queue moves
+      // on (one slice failing to extract is information, not a reason to abandon the rest).
+      let slice
+      while ((slice = nextPendingSlice(result.extractQueue))) {
+        if (budgetExhausted(retryBudget)) {
+          result.blockedAt = 'extract-budget'
+          result.handoff = {
+            from: 'extract',
+            message: `Retry budget exhausted mid-queue (${retryState.used}/${retryBudget}). Completed slices are preserved; resume the rest: /extract-design --resume ${planDir}`,
+            nextMode: 'extract',
+            planDir,
+          }
+          plog(`Extract: retry budget exhausted with ${result.extractQueue.filter((s) => s.status === 'pending').length} slice(s) pending — blocking (resumable)`)
+          stateCheckpoint('Extract Slice', 'blocked')
+          await consolidate(slug, result, config)
+          return result
+        }
+        slice.status = 'in-progress'
+        const single = slice.planDir === planDir
+        plog(`Extract: slice ${slice.id} (${slice.name}) — ${single ? 'flat layout' : slice.planDir}`)
+        const sliceState = single ? result : {
+          task: `${task} — slice: ${slice.name}`,
+          slug: `${slug}-${slice.id}`,
+          planPath: slice.planDir + 'plan.md',
+          planDir: slice.planDir,
+          mode: 'design',
+          stages: [],
+          designReady: false,
+          issuesPath: null,
+          handoff: null,
+          blockedAt: null,
+          logLines: [],
+          _state: { seq: 0, lastGate: 'Extract', status: null },
+          factsPath: (slice.artifacts && slice.artifacts.factsPath) || null,
+          useCasePath: (slice.artifacts && slice.artifacts.useCasePath) || null,
+          designPath: (slice.artifacts && slice.artifacts.designPath) || null,
+          archPath: (slice.artifacts && slice.artifacts.archPath) || null,
+          requirementsPath: (slice.artifacts && slice.artifacts.requirementsPath) || null,
+          auditPath: (slice.artifacts && slice.artifacts.auditPath) || null,
+          _reviewedDesign: !!(slice.artifacts && slice.artifacts.reviewed),
+          _reviewedArch: !!(slice.artifacts && slice.artifacts.reviewed),
+        }
+        let outcome
+        try {
+          outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+        } catch (e) {
+          outcome = { status: 'blocked', gate: 'uncaught-throw' }
+          plog(`Extract: slice ${slice.id} threw (${String(e)}) — marking blocked and continuing`)
+        }
+        slice.artifacts = {
+          factsPath: sliceState.factsPath || null,
+          useCasePath: sliceState.useCasePath || null,
+          designPath: sliceState.designPath || null,
+          archPath: sliceState.archPath || null,
+          requirementsPath: sliceState.requirementsPath || null,
+          auditPath: sliceState.auditPath || null,
+          issuesPath: sliceState.issuesPath || null,
+          reviewed: !!sliceState._reviewedDesign,
+        }
+        slice.status = outcome.status === 'done' ? 'done' : 'blocked'
+        if (outcome.status !== 'done') {
+          slice.blockedGate = outcome.gate
+          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — continuing with remaining slices`)
+        } else {
+          plog(`Extract: slice ${slice.id} done`)
+        }
+        if (!single) {
+          // Slice-local pipeline-state.json: a design-shaped result so /tune-feature <sliceDir>
+          // and /design-feature --resume <sliceDir> can consume the slice as a baseline.
+          sliceState.designReady = outcome.status === 'done'
+          await flushPipelineState(slice.planDir, sliceState, {
+            mode: 'design',
+            profile: config.profile,
+            useChunker: false,
+          })
+        }
+        stateCheckpoint('Extract Slice', slice.status)
+        await flushPipelineState(planDir, result, config)
+      }
+
+      // Gate X8: system overview (multi-slice only, non-blocking).
+      if (multiSlice && !result.overviewPath) {
+        phase('System Overview')
+        await writeSystemOverview({ parentPlanDir: planDir, queue: result.extractQueue, task, result })
+        stateCheckpoint('System Overview', 'done')
+      }
+
+      // Publish + persist tails (reuse the design-terminal pattern; both non-blocking).
+      try {
+        if (usePublish && !result.published) {
+          phase('Publish')
+          plog('Extract: publishing extracted design docs')
+          await publishDesign(result, result.overviewPath || result.archPath || result.scopeManifestPath, task)
+          stateCheckpoint('Publish', 'done')
+        }
+        if (useKnowledgePersist && !result.persist) {
+          phase('Persist')
+          plog('Extract: persisting findings')
+          await persistFindings(result)
+          stateCheckpoint('Persist', 'done')
+        }
+      } catch (e) {
+        plog('Extract: non-blocking Publish/Persist threw — caught, continuing to terminal. ' + String(e))
+      }
+
+      // Extract terminal: verify each done slice's mandated artifacts actually exist, then
+      // advertise extractReady. designReady is set ONLY for a single-slice run (the parent
+      // state must not claim one design for N slices — slice-local states carry per-slice
+      // designReady for the multi-slice layout).
+      const doneSlices = result.extractQueue.filter((s) => s.status === 'done')
+      const failedArtifactChecks = []
+      for (const entry of doneSlices) {
+        const mandated = [
+          { key: 'codebase-facts', path: entry.artifacts && entry.artifacts.factsPath, flag: true },
+          { key: 'e2e-use-cases', path: entry.artifacts && entry.artifacts.useCasePath, flag: config.useE2eUsecase },
+          { key: 'detailed-design', path: entry.artifacts && entry.artifacts.designPath, flag: config.useDetailedDesign },
+          { key: 'architecture', path: entry.artifacts && entry.artifacts.archPath, flag: config.useArchDesign },
+        ]
+        for (const artifact of mandated.filter((a) => a.flag && a.path)) {
+          const checked = await verifyArtifactPresence({ path: artifact.path, gate: `Extract:${entry.id}`, expectedHeadings: ['#'], result })
+          if (!checked.exists || checked.sizeBytes <= 0 || checked.hasExpectedHeadings === false) {
+            failedArtifactChecks.push({ slice: entry.id, key: artifact.key, path: artifact.path, summary: checked.summary })
+          }
+        }
+        const missing = mandated.filter((a) => a.flag && !a.path)
+        for (const artifact of missing) {
+          failedArtifactChecks.push({ slice: entry.id, key: artifact.key, path: null, summary: 'gate produced no path' })
+        }
+      }
+      if (failedArtifactChecks.length || !doneSlices.length) {
+        result.blockedAt = 'artifact-missing'
+        result.artifactChecks = failedArtifactChecks
+        result.handoff = {
+          from: 'extract',
+          message: doneSlices.length
+            ? `Extraction artifact verification failed for ${failedArtifactChecks.length} artifact(s). Inspect them, then resume: /extract-design --resume ${planDir}`
+            : `No slice completed extraction (${result.extractQueue.filter((s) => s.status === 'blocked').length} blocked). Inspect pipeline.log, then resume: /extract-design --resume ${planDir}`,
+          nextMode: 'extract',
+          planDir,
+        }
+        plog(`Extract: terminal verification failed — doneSlices=${doneSlices.length}; failedChecks=${failedArtifactChecks.length}`)
+        stateCheckpoint('Extract', 'blocked')
+        await consolidate(slug, result, config)
+        return result
+      }
+
+      phase('Extract')
+      result.extractReady = true
+      if (!multiSlice) result.designReady = true
+      const blockedCount = result.extractQueue.filter((s) => s.status === 'blocked').length
+      const skippedCount = result.extractQueue.filter((s) => s.status === 'skipped').length
+      result.handoff = {
+        from: 'extract',
+        nextMode: 'tune',
+        planDir,
+        slices: result.extractQueue.map((s) => ({ id: s.id, name: s.name, planDir: s.planDir, status: s.status })),
+        message: multiSlice
+          ? `Extraction complete: ${doneSlices.length} slice(s) documented under ${planDir}slices/ (overview: ${result.overviewPath || '(none)'})${blockedCount ? `; ${blockedCount} blocked` : ''}${skippedCount ? `; ${skippedCount} skipped — resume later with --slices` : ''}. Per slice: audit findings are in issues-and-improvements.md — run /tune-feature <sliceDir> to fix, or /design-feature --resume <sliceDir> to build on the baseline.`
+          : `Extraction complete. As-is design docs are in ${planDir}. Audit findings (if any) are in issues-and-improvements.md — run /tune-feature ${planDir} to fix them, or /design-feature --resume ${planDir} to build on the baseline.`,
+      }
+      stateCheckpoint('Extract', 'done')
+      plog(`Extract: extractReady=true — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+      await consolidate(slug, result, config)
+      return result
     }
 
     // ===== Phase E4: state-machine loop =========================================
@@ -4191,6 +5095,10 @@ single-lane execution). If the work is not cleanly separable, emit exactly ONE l
       result._plan = plan
       result.lanes = plan.lanes || null
       result.planned = true
+      // Restore result.planPath if a resume repair nulled it (missing plan file): consolidate
+      // gates its state/log flush on result.planPath, so leaving it null would silently stop
+      // persistence for the rest of the run.
+      if (!result.planPath) result.planPath = plan.planPath || planPath
       plog(`Plan: plan written to ${plan.planPath}; lanes=${(plan.lanes || []).length}`)
     }
     stateCheckpoint('Plan', 'done')

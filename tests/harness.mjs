@@ -62,6 +62,12 @@ const CANDIDATES = [
   'normalizeGateTarget',
   'resetStageForRerun',
   'applyApprovalDecision',
+  'seedExtractQueue',
+  'nextPendingSlice',
+  'SCOPE_VERDICT',
+  'DECOMPOSE_VERDICT',
+  'AUDIT_VERDICT',
+  'OVERVIEW_VERDICT',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)
