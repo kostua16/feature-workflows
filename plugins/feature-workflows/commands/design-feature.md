@@ -14,8 +14,11 @@ pre-execute documents + the plan + plan STAGE files, then stops before any code 
 - Plugin engine version: !`grep -m1 "engine-version:" "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" 2>/dev/null || echo unknown`
 
 If the engine is MISSING: tell the user to run `/feature-workflows:setup` first and STOP — do not
-call the Workflow tool. If the two versions differ: warn that the installed engine is outdated and
-recommend re-running `/feature-workflows:setup`, then proceed with the user's request.
+call the Workflow tool. If the two versions differ: STOP before calling the Workflow tool — an
+outdated installed engine's agent/gate contract may not match the plugin's registered agents and
+would fail mid-pipeline instead of at preflight. Ask the user (AskUserQuestion) to either re-run
+`/feature-workflows:setup` first (recommended) or explicitly proceed with the outdated engine;
+only call the Workflow tool after setup has been re-run or the user explicitly chose to proceed.
 
 Parse `$ARGUMENTS` into:
 - `task`: everything except the flags (required, UNLESS `--resume` is given)

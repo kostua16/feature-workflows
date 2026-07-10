@@ -28,10 +28,15 @@ Run these steps via Bash. Stop and report on any failure.
    ```
    Exit 0 with no output = pass. On failure: report the SyntaxError, delete the three copied
    files, and stop.
-4. Report the installed engine version:
+4. Report the installed engine version and sanity-check it against the plugin manifest:
    ```
    grep -m1 "engine-version:" .claude/workflows/feature-pipeline.js
+   grep '"version"' "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json"
    ```
+   The two versions must match (the repo's CI enforces this lockstep at release time via
+   `scripts/validate-plugin-versions.mjs`). If they differ here, the installed plugin package
+   is internally inconsistent — report it as a plugin packaging bug and recommend
+   `/plugin update feature-workflows`, but keep the installed files.
 5. If the project's `.gitignore` does not cover `.claude/workflows/`, suggest (do not apply
    unasked) adding it — the installed copy is derived from the plugin, not a source of truth.
 

@@ -34,5 +34,10 @@ Keep these three in lockstep when releasing:
 2. `workflows/feature-pipeline.js` → `// engine-version:` header comment
 3. `workflows/feature-pipeline.js` → `meta.version`
 
-The setup command reports the installed version; command preflights compare installed vs
-bundled and warn on mismatch.
+Enforcement:
+
+- CI runs `scripts/validate-plugin-versions.mjs` (repo root), which fails the build unless all
+  three markers agree, plus the ESM syntax check on the engine.
+- `setup` reports the installed version and sanity-checks it against the plugin manifest.
+- Pipeline-command preflights compare installed vs bundled engine versions and **stop** on
+  mismatch (the user must re-run setup or explicitly confirm running the outdated engine).
