@@ -6,7 +6,7 @@ This project shall be a claude code plugin\marketplace app that allows users to 
 
 ## Mandatory rules for all agents (FOLLOW THESE RULES STRICTLY WITHOUT EXCEPTIONS)
 
-- Always activate the Serena project named `log_analysis` (path: "$CWD") using the Serena `feature-workflows` tool before any code exploration or edits.
+- Always activate the Serena project named `feature_workflows` (path: "$CWD") using the Serena `activate-project` tool before any code exploration or edits.
 - Always read `mem:core` to load the current roadmap and project invariants.
 - Always read `mem:handoff` to load the current project state and next recommended actions.
 - Always read `mem:session_start` to load the current handoff and roadmap context.
