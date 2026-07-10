@@ -6,9 +6,10 @@ allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 
 Run the `feature-pipeline` workflow in **tune mode** — the FIX flow that consumes
 `issues-and-improvements.md` (written by a prior `/implement-feature` upstream-defect handoff —
-from a goalkeeper loop-back or from blocker-severity code-review findings classified as upstream),
-derives a minimal design-gate revisit plan, refines only those gates in place, preserves completed
-plan stages, then re-enables `designReady` so you can re-run `/implement-feature`.
+from a goalkeeper loop-back or from blocker-severity code-review findings classified as upstream —
+or by an `/extract-design` as-is design audit), derives a minimal design-gate revisit plan, refines
+only those gates in place, preserves completed plan stages, then re-enables `designReady` so you
+can re-run `/implement-feature`.
 
 ## Preflight — engine must be installed
 
@@ -23,9 +24,10 @@ would fail mid-pipeline instead of at preflight. Ask the user (AskUserQuestion) 
 `/feature-workflows:setup` first (recommended) or explicitly proceed with the outdated engine;
 only call the Workflow tool after setup has been re-run or the user explicitly chose to proceed.
 
-This command REQUIRES a `<planDir>` positional arg (the planDir from your `/implement-feature` handoff)
-and a prior `/implement-feature` run that hit `blockedAt === 'issues-handoff'` (so
-`issues-and-improvements.md` exists at `<planDir>`).
+This command REQUIRES a `<planDir>` positional arg and an `issues-and-improvements.md` at that dir.
+The issues file comes from either a prior `/implement-feature` run that hit
+`blockedAt === 'issues-handoff'`, or an `/extract-design` run whose design audit recorded findings
+(in the multi-slice layout, pass the slice dir: `<planDir>/slices/<id>`).
 
 Parse `$ARGUMENTS` into:
 - `<planDir>` (positional, REQUIRED): → `resume: <planDir>`. The first bare token (not a flag and
