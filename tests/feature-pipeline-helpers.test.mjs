@@ -229,6 +229,10 @@ test('verdictContradiction rejects internally inconsistent verdicts', () => {
   assert.equal(verdictContradiction({ passed: true, summary: '3 failed, exit 1' }), 'passed=true while test summary/command reports failure')
   assert.equal(verdictContradiction({ decision: 'retry', reasoning: 'we should stop now' }), 'decision=retry while reasoning says stop')
   assert.equal(verdictContradiction({ decision: 'retry', reasoning: 'do not stop; retry is still useful' }), '')
+  assert.equal(verdictContradiction({ decision: 'retry', reasoning: "will not stop while retries remain" }), '')
+  assert.equal(verdictContradiction({ decision: 'retry', reasoning: "can't stop because recovery is possible" }), '')
+  assert.equal(verdictContradiction({ decision: 'retry', reasoning: 'do not ever stop before retrying' }), '')
+  assert.equal(verdictContradiction({ decision: 'retry', reasoning: 'do not stop, halt now instead' }), 'decision=retry while reasoning says stop')
   assert.equal(verdictContradiction({ accepted: true, blockers: [] }), '')
 })
 
@@ -312,5 +316,15 @@ test('repairJsonText does not quote keys or literals inside JSON string values',
   assert.deepEqual(extractJson('{summary: "keep retry: True and status: open", fixed: False,}'), {
     summary: 'keep retry: True and status: open',
     fixed: false,
+  })
+})
+
+test('repairJsonText preserves single-quoted escape sequences', () => {
+  const extractJson = loadFunction('extractJson')
+
+  assert.deepEqual(extractJson("{summary: 'line1\\nline2', tabbed: 'a\\tb', unicode: '\\u2713'}"), {
+    summary: 'line1\\nline2',
+    tabbed: 'a\\tb',
+    unicode: '\\u2713',
   })
 })

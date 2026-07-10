@@ -1784,10 +1784,24 @@ function countItems(value) {
 
 function reasoningSaysStop(text) {
   const lowered = String(text || '').toLowerCase()
-  const stopMatch = lowered.match(/\b(stop|halt|cancel|give up)\b/)
-  if (!stopMatch) return false
-  const before = lowered.slice(Math.max(0, stopMatch.index - 20), stopMatch.index)
-  return !/(do\s+not|don't|dont|never|should\s+not|must\s+not|not\s+to)\s+$/.test(before)
+  const stopPattern = /\b(stop|halt|cancel|give up)\b/g
+  let stopMatch
+  while ((stopMatch = stopPattern.exec(lowered)) !== null) {
+    const before = lowered.slice(0, stopMatch.index)
+    const clauseStart = Math.max(
+      before.lastIndexOf('.'),
+      before.lastIndexOf(';'),
+      before.lastIndexOf(':'),
+      before.lastIndexOf('!'),
+      before.lastIndexOf('?'),
+      before.lastIndexOf(','),
+      before.lastIndexOf('\n')
+    )
+    const clauseBeforeStop = before.slice(clauseStart + 1)
+    const negated = /\b(do\s+not|don't|dont|never|should\s+not|must\s+not|not\s+to|will\s+not|won't|cannot|can't|can\s+not)\b/.test(clauseBeforeStop)
+    if (!negated) return true
+  }
+  return false
 }
 
 function extractJson(raw) {
@@ -1955,7 +1969,7 @@ function normalizeSingleQuotedStrings(text) {
     for (; i < text.length; i++) {
       const inner = text[i]
       if (inner === '\\' && i + 1 < text.length) {
-        value += text[i + 1]
+        value += `\\${text[i + 1]}`
         i += 1
       } else if (inner === "'") {
         break
