@@ -1,11 +1,11 @@
 ---
-description: DO flow — execute stages -> test -> code-review -> decide -> commit. On upstream defect writes issues-and-improvements.md and stops (run /tune-feature). Requires prior /design-feature.
-argument-hint: <planDir> [--target=TEST_TARGET] [--test-cmd=CMD] [--test-framework=NAME] [--profile=full|standard|light] [--fresh-budget] [--auto-commit] [--no-issues] [--no-gsd-debug] [--no-publish] [--no-persist] [--no-goalkeeper] [--no-quick-decider] [--no-enhancer] [--no-parallel] [--decision-cap=N] [--retries=N] [--debug-retries=N] [--gsd-quick]
+description: DO flow — author tests -> execute stages -> test -> code-review -> decide -> commit. On upstream defect writes issues-and-improvements.md and stops (run /tune-feature). Requires prior /design-feature.
+argument-hint: <planDir> [--target=TEST_TARGET] [--test-cmd=CMD] [--test-framework=NAME] [--profile=full|standard|light] [--fresh-budget] [--auto-commit] [--no-test-writer] [--no-issues] [--no-gsd-debug] [--no-publish] [--no-persist] [--no-goalkeeper] [--no-quick-decider] [--no-enhancer] [--no-parallel] [--decision-cap=N] [--retries=N] [--debug-retries=N] [--gsd-quick]
 allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
-Run the `feature-pipeline` workflow in **implement mode** — the DO flow that executes the design
-stage files, runs tests, code-reviews, decides commit-vs-issues-handoff, and commits. Requires a
+Run the `feature-pipeline` workflow in **implement mode** — the DO flow that writes/validates tests,
+executes the design stage files, runs tests, code-reviews, decides commit-vs-issues-handoff, and commits. Requires a
 prior `/design-feature` run (it asserts `designReady`).
 
 ## Preflight — engine must be installed
@@ -35,6 +35,7 @@ Parse `$ARGUMENTS` into:
 - `--profile=full|standard|light`: → `profile` (preset defaults for the gate-control flags; individual `--no-*` flags still override. `light` drops the opus review/enhancer/quick-decider loops + extra design gates for small tasks. Default `full`.)
 - `--fresh-budget`: if present → `freshBudget: true` (reset the retry + decision budgets on resume; default carries the used counters across `--resume` so a spinning loop can't be resumed into a full fresh budget)
 - `--auto-commit`: if present → `autoCommit: true` (commit on success; default `false` — leaves changes staged-and-uncommitted)
+- `--no-test-writer`: if present → `useTestWriter: false` (skip the pre-execute test-authoring gate; default enabled)
 - `--no-issues`: if present → `useIssues: false` (on an upstream-defect goalkeeper verdict, do NOT write `issues-and-improvements.md`; degrade to a plain block. Default **enabled** — writes the issues file + stops for `/tune-feature`)
 - `--no-gsd-debug`: → `useGsdDebug: false` (disable gsd-debug recovery on test failure)
 - `--no-publish`: → `usePublish: false` (skip docs-architecture-publisher)
@@ -48,7 +49,7 @@ Parse `$ARGUMENTS` into:
 - `--debug-retries=N`: → `maxDebugRetries` (default 20)
 - `--gsd-quick`: if present → `gsdQuick: true` (force the gsd-quick alternate executor instead of stage execution)
 
-Note: implement mode does NOT re-run design gates (define/requirements/arch/design/plan/review). Those are skipped via the mode guard; only the DO gates (execute stages → test → code-review → goalkeeper → publish → persist → commit) run.
+Note: implement mode does NOT re-run design gates (define/requirements/arch/design/plan/review). Those are skipped via the mode guard; only the DO gates (test-authoring → execute stages → test → code-review → goalkeeper → publish → persist → commit) run.
 
 Then call the Workflow tool:
 
@@ -64,6 +65,7 @@ Workflow({
     profile: <"full"|"standard"|"light">,
     freshBudget: <bool>,
     autoCommit: <bool>,
+    useTestWriter: <bool>,
     useIssues: <bool>,
     useGsdDebug: <bool>,
     usePublish: <bool>,
@@ -84,6 +86,7 @@ When the workflow returns its result JSON, report it concisely:
 - Always print `result.planDir` first.
 - If `ready === true` (all stages done, tests green, code-review clean): state "Implementation complete." Show `testsPassed`, `testSummary`, code-review issue count, stage progress (`result.stages`: count done/total + each `id`/`status`), and whether committed (`committed` / `commitHash`) or that `autoCommit` was off so changes are staged-and-uncommitted. Note `lanesUsed` and `persist`/`published` results.
 - If `blockedAt === 'design-not-ready'`: design was not run. Print `result.handoff.message` and stop — the user must run `/design-feature` first.
+- If `blockedAt === 'test-authoring'`: the test-writer gate could not write or confirm the required tests. Show `result.testWriterSummary` and re-run after fixing the blocker.
 - If `blockedAt === 'execute'`: a stage failed. Show `result._execute._failedStage` (which `stageNN`) + the executor summary. Re-run: `/implement-feature <planDir>` (done stages are skipped; the failed stage re-runs).
 - If `blockedAt === 'test'`: tests failing after gsd-debug. Show `result.testSummary` + `debugRetries`. The user may fix manually then re-run.
 - If `blockedAt === 'code-review'`: blocker-severity findings. Show `result.codeReview.blockers`. Fix + re-run.

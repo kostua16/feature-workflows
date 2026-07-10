@@ -61,7 +61,7 @@ All three modes share `<planDir>/pipeline-state.json` — the resumable contract
 - **The plugin copy is the source of truth.** The project copy at `.claude/workflows/` is derived
   (installed by `/feature-workflows:setup`, version-checked by every pipeline command's preflight).
 - **No build manifest** (no `package.json` / `pyproject.toml`). Node 25 / Python 3.14 are available;
-  `pytest-runner` is the test gate for target projects the pipeline operates on.
+  `test-runner` is the stack-agnostic test gate for target projects the pipeline operates on.
 
 ## Editing the engine
 

@@ -1,6 +1,6 @@
 ---
 description: Convenience alias — runs /design-feature then instructs /implement-feature (split engine). Design THINK flow only by default; add --auto-implement to chain into the DO flow (implies --auto-commit off unless --auto-commit).
-argument-hint: <task description> [--auto-implement] [--auto-commit] [--target=TEST_TARGET] [--plan=PLAN_PATH] [--definition=DEF_PATH] [--gsd-quick] [--no-chunker] [--no-gsd-debug] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-publish] [--no-persist] [--no-interview] [--no-parallel] [--no-translator] [--no-categorizer] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-goalkeeper] [--no-quick-decider] [--decision-cap=N] [--timestamp=TS] [--retries=N] [--debug-retries=N] [--max-reconcile-iterations=N] [--resume <planDir>]
+argument-hint: <task description> [--auto-implement] [--auto-commit] [--target=TEST_TARGET] [--plan=PLAN_PATH] [--definition=DEF_PATH] [--gsd-quick] [--no-chunker] [--no-gsd-debug] [--no-test-writer] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-publish] [--no-persist] [--no-interview] [--no-parallel] [--no-translator] [--no-categorizer] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-goalkeeper] [--no-quick-decider] [--decision-cap=N] [--timestamp=TS] [--retries=N] [--debug-retries=N] [--max-reconcile-iterations=N] [--resume <planDir>]
 allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
@@ -27,12 +27,13 @@ Parse `$ARGUMENTS` into:
 - `--resume <planDir>`: → `resume: <planDir>` (hydrate persisted pipeline state at `<planDir>/pipeline-state.json` and re-run from the first incomplete gate; `task` is optional here — it is resolved from the persisted state). `<planDir>` is the ORIGINAL RUN's plan dir (e.g. `docs/parser/feature/add-retry-layer`), exactly what `result.planDir` printed at run end. A bare `plan.md` path is also accepted (the `/plan.md` suffix is stripped). The dynamic planDir is NOT re-derived on resume (the categorizer is non-deterministic); the persisted `planPath` is reused verbatim. Slug-only resume is no longer supported — the path is the sole resume format. Note: if source files changed since the original run, persisted artifact paths may be stale.
 - `--auto-implement`: if present → `autoImplement: true` (after design sets `designReady`, CHAIN into implement mode automatically via `Workflow resume`. Default `false` — design stops pre-execute and instructs the user to run `/implement-feature <planDir>`).
 - `--auto-commit`: if present anywhere → `autoCommit: true` (default `false`; only meaningful when `--auto-implement` chains into implement)
-- `--target=PATH`: → `testTarget` (optional pytest target)
+- `--target=PATH`: → `testTarget` (optional test target/path scope)
 - `--plan=PATH`: → `planPath` (**OPTIONAL — do NOT pass a default**). Only set when the user typed `--plan=<PATH>`. When ABSENT, pass `planPath: ""` (empty) so the workflow runs the Gate -2 `feature-categorizer` to derive the dynamic planDir `docs/{category}/{sub-category}/feature/{leaf}/`. Passing a hardcoded default defeats the categorizer (it treats any truthy planPath as an explicit override). **Ignored on `--resume`** (the resume path supplies the planDir).
 - `--definition=PATH`: → `definitionPath` (optional; default: plan dir /idea.md)
 - `--gsd-quick`: if present → `gsdQuick: true` (force gsd-quick fast-path; default false, but define gate may still recommend it)
 - `--no-chunker`: if present → `useChunker: false` (skip plan-chunker; plan stays a single implicit `stage01`; default **enabled** — splits plan into `stageNN.md` dependency-ordered stage files)
 - `--no-gsd-debug`: if present → `useGsdDebug: false` (disable gsd-debug recovery on test failure; default enabled)
+- `--no-test-writer`: if present → `useTestWriter: false` (skip the pre-execute test-authoring gate when `--auto-implement` chains into implement mode; default enabled)
 - `--no-knowledge`: if present → `useKnowledgeConsult: false` (skip Gate 0.1 project-knowledge-consultant; default enabled, full path only)
 - `--no-arch`: if present → `useArchDesign: false` (skip Gate 0.5 architecture design; default enabled, full path only)
 - `--no-design`: if present → `useDetailedDesign: false` (skip Gate 0.6 detailed design; default enabled, full path only)
@@ -77,6 +78,7 @@ Workflow({
     gsdQuick: <bool>,
     useChunker: <bool>,
     useGsdDebug: <bool>,
+    useTestWriter: <bool>,
     useArchDesign: <bool>,
     useDetailedDesign: <bool>,
     useTddEnforce: <bool>,

@@ -39,6 +39,7 @@ const CANDIDATES = [
   'writeChunkedFile',
   'detectTestCommand',
   'resolveProfile',
+  'resolveUseTestWriter',
   'PROFILES',
   'hydrateBudget',
   'validatePipelineState',

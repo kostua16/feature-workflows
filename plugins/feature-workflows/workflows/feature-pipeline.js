@@ -1,9 +1,6 @@
 // feature-pipeline.js
 // engine-version: 1.1.0
 // Gate-enforcing pipeline for new features / bug-fixes.
-// Encodes CLAUDE.md agent rules as a deterministic gate sequence:
-//   task-definition-architect -> plan-architect -> [review/refine loop] ->
-//   plan-executor -> pytest-runner -> critical-reviewer(code) -> [git-ops]
 //
 // Enhancements:
 //   - Per-gate todo-store checkpoints: each gate writes a compact note
@@ -45,6 +42,7 @@ export const meta = {
     { title: 'Reconcile' },
     { title: 'Review/Refine' },
     { title: 'Chunk Plan' },
+    { title: 'Test Authoring' },
     { title: 'Execute' },
     { title: 'Test' },
     { title: 'Code Review' },
@@ -260,6 +258,31 @@ const TEST_VERDICT = {
     passed: { type: 'boolean', description: 'true if the test run exited 0' },
     summary: { type: 'string', description: 'Short result line, e.g. "12 passed"' },
     command: { type: 'string', description: 'The exact test command that was run' },
+  },
+}
+
+const TEST_AUTHORING_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['written', 'summary'],
+  properties: {
+    written: { type: 'boolean', description: 'true if the planned RED/coverage tests were written or already existed' },
+    summary: { type: 'string', description: 'Short summary of tests authored or confirmed' },
+    files: {
+      type: 'array',
+      description: 'Test files created or updated',
+      items: { type: 'string' },
+    },
+    redTests: {
+      type: 'array',
+      description: 'RED tests added before implementation',
+      items: { type: 'string' },
+    },
+    evidence: {
+      type: 'array',
+      description: 'Concrete evidence such as test names, commands, or existing coverage refs',
+      items: { type: 'string' },
+    },
   },
 }
 
@@ -821,7 +844,7 @@ const IDENTICAL_FAILURE_LIMIT = 3
 const GATE_FALLBACKS = {
   'quick-decider': { decision: 'stop', reasoning: 'fallback after unavailable verdict' },
   'complex-decision-analyst': { decision: 'commit', targetPhase: 'none', reasoning: 'fallback after unavailable verdict', trueDefects: [] },
-  'pytest-runner': { passed: false, summary: 'fallback after unavailable test verdict' },
+  'test-runner': { passed: false, summary: 'fallback after unavailable test verdict' },
   'prompt-enhancer': null,
 }
 
@@ -848,7 +871,8 @@ const MODEL_DEFAULTS = {
   execute: 'sonnet',  // plan-executor
   gsdQuick: 'sonnet', // gsd-quick skill
   gsdDebug: 'opus',   // gsd-debug root-cause
-  test: 'sonnet',     // pytest-runner
+  testWriter: 'opus',
+  test: 'sonnet',
   codeReview: 'opus', // critical-reviewer (code)
   e2eUsecase: 'opus', // e2e-usecase-extractor (Gate 0.7)
   knowledgeConsult: 'sonnet', // project-knowledge-consultant (Gate 0.1)
@@ -894,6 +918,23 @@ const PROFILES = {
 // Resolve a profile name to its flag-default overrides. Pure; unknown => 'full'.
 function resolveProfile(name) {
   return PROFILES[name] ? PROFILES[name] : PROFILES.full
+}
+
+function resolveConfigFlag(argVal, persistedVal, defaultVal) {
+  return argVal === false ? false : (persistedVal !== undefined ? persistedVal : defaultVal)
+}
+
+function profileDefault(profile, key, defaultVal) {
+  return profile && profile[key] !== undefined ? profile[key] : defaultVal
+}
+
+function resolveUseTestWriter(args, persistedConfig) {
+  const profile = resolveProfile(args && args.profile)
+  return resolveConfigFlag(
+    args && args.useTestWriter,
+    persistedConfig && persistedConfig.useTestWriter,
+    profileDefault(profile, 'useTestWriter', true),
+  )
 }
 
 // Shared retry budget state. Both the refine loop and the debug loop draw from
@@ -1561,7 +1602,6 @@ ${task || r.task || '(none)'}`,
   }
 }
 
-// Run the pytest gate. Returns a TEST_VERDICT object (or null on agent failure).
 // IM-4: this is a general-purpose marketplace plugin, so the test gate must be
 // stack-agnostic instead of hardcoding pytest. Map a framework name (+ optional
 // target) to a concrete command. Pure + testable; returns null for an unknown
@@ -2804,15 +2844,14 @@ async function main() {
   // then the persisted value, then this default — so --resume is unaffected and any
   // individual --no-* flag still overrides the profile.
   const profile = resolveProfile(args && args.profile)
-  const pdef = (key, dflt) => (profile[key] !== undefined ? profile[key] : dflt)
+  const pdef = (key, dflt) => profileDefault(profile, key, dflt)
 
   // Resolve the full config ONCE so every consolidate() boundary (success + each
   // hard-block exit) can flush pipeline-state.json with the run's flag set. On
   // --resume the persisted config is the base; an explicit disabling arg still
   // wins, otherwise the persisted value (if any) is honored.
   const persistedConfig = resumed && resumed.config ? resumed.config : {}
-  const cfgFlag = (argVal, persistedVal, defaultVal) =>
-    argVal === false ? false : (persistedVal !== undefined ? persistedVal : defaultVal)
+  const cfgFlag = resolveConfigFlag
   const config = {
     profile: (args && args.profile) || persistedConfig.profile || 'full',
     useTranslator: cfgFlag(args && args.useTranslator, persistedConfig.useTranslator, pdef('useTranslator', true)),
@@ -2831,6 +2870,7 @@ async function main() {
     useInterview: cfgFlag(args && args.useInterview, persistedConfig.useInterview, pdef('useInterview', true)),
     useGoalkeeper: cfgFlag(args && args.useGoalkeeper, persistedConfig.useGoalkeeper, pdef('useGoalkeeper', true)),
     useQuickDecider: cfgFlag(args && args.useQuickDecider, persistedConfig.useQuickDecider, pdef('useQuickDecider', true)),
+    useTestWriter: resolveUseTestWriter(args, persistedConfig),
     decisionCap: decisionCap,
     allowParallelExecute: cfgFlag(args && args.allowParallelExecute, persistedConfig.allowParallelExecute, pdef('allowParallelExecute', true)),
     gsdQuick,
@@ -2878,6 +2918,7 @@ async function main() {
   const useInterview = config.useInterview
   const useGoalkeeper = config.useGoalkeeper
   const useQuickDecider = config.useQuickDecider
+  const useTestWriter = config.useTestWriter
   const allowParallelExecute = config.allowParallelExecute
   // Phase F-K: pipeline-split modes + their sub-flags.
   const mode = config.mode
@@ -3040,6 +3081,9 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       retryUsed: 0,
       executed: false,
       gsdQuick: false,
+      testsWritten: false,
+      testWriterSummary: null,
+      _testWriter: null,
       debugRetries: 0,
       testsPassed: false,
       testSummary: null,
@@ -3378,46 +3422,7 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
   // mode (which runs later via /implement-feature) can still take it.
   const useQuickPath = isImplementMode && (gsdQuick || result.recommendedPath === 'gsd-quick')
 
-  if (useQuickPath) {
-    // --- gsd-quick fast-path (alternate executor; our gates stay authoritative) ---
-    result.gsdQuick = true
-    result.planAccepted = true // gsd-quick authors its own plan internally
-    if (result.executed) {
-      plog('resume: skip gsd-quick fast-path (executed set)')
-    } else {
-      phase('Execute')
-      plog('gsd-quick fast-path: implementing via gsd-quick skill')
-      const gsdRun = await safeAgent(
-        `You are running inside feature-pipeline. Invoke the "gsd-quick" skill via your Skill tool
-to implement this task end-to-end (plan + execute + test):
-
-Task:
-${task}
-
-Definition doc: ${result.definitionPath || definitionPath}
-Plan dir: ${planPath.replace(/plan\.md$/, '')}
-
-Adhere to the pass gates in the definition doc. Do NOT commit. Do NOT weaken tests.
-If the gsd-quick skill or the Skill tool is unavailable, implement directly following
-the definition pass gates and set usedFallback=true. Report what was implemented and the
-test outcome you observed.`,
-        { label: 'gsd-quick', phase: 'Execute', schema: GSD_RUN_VERDICT, model: gm('gsdQuick') },
-        result
-      )
-      if (!gsdRun || !gsdRun.ran) {
-        result.blockedAt = 'gsd-quick'
-        stateCheckpoint('Execute', 'blocked')
-        await consolidate(slug, result, config)
-        return result
-      }
-      result.executed = true
-      result._gsdRun = gsdRun
-      plog(`gsd-quick: ran=${gsdRun.ran}; summary=${gsdRun.summary || '(none)'}${gsdRun.usedFallback ? ' (used fallback)' : ''}`)
-    }
-    stateCheckpoint('Execute', result.executed ? 'done' : 'blocked')
-
-    // Fall through to our own Test (Gate 4), Code Review (Gate 5), Persist (5.5).
-  } else {
+  {
     // --- Full path: Knowledge -> Architecture -> Detailed Design -> E2E -> Plan -> TDD -> Reconcile -> Review/Refine -> Execute ---
 
     // Gate 0.1: Knowledge Consult (adopted agent, non-blocking) ------------
@@ -4353,13 +4358,94 @@ malformed output.`
       return result
     }
 
+    if (isImplementMode && useTestWriter) {
+      if (result.testsWritten) {
+        plog('resume: skip Test Authoring (testsWritten set)')
+      } else {
+        phase('Test Authoring')
+        plog('Authoring tests before implementation')
+        const authored = await safeAgent(
+          `You are the test-writer agent. Write the RED/coverage tests required before implementation.
+
+Task:
+${task}
+
+Artifacts:
+- Definition: ${result.definitionPath || '(none)'}
+- Requirements: ${result.requirementsPath || '(none)'}
+- E2E use cases: ${result.useCasePath || '(none)'}
+- Architecture: ${result.archPath || '(none)'}
+- Detailed design: ${result.designPath || '(none)'}
+- Plan: ${planPath}
+- Stages: ${compactList((result.stages || []).map((stage) => `${stage.id}: ${stage.file}`), 12)}
+
+Use the target project's existing test framework and conventions. Prefer RED tests that fail for the
+missing behavior; if equivalent coverage already exists, report it as evidence instead of duplicating.
+Do NOT weaken, skip, or delete existing tests. Do NOT commit. Return written=true only when the needed
+tests were created or existing coverage was verified.`,
+          { label: 'test-writer', phase: 'Test Authoring', schema: TEST_AUTHORING_VERDICT, model: gm('testWriter') },
+          result
+        )
+        if (!authored || !authored.written) {
+          result.blockedAt = 'test-authoring'
+          result._testWriter = authored
+          result.testWriterSummary = authored && authored.summary
+          stateCheckpoint('Test Authoring', 'blocked')
+          await consolidate(slug, result, config)
+          return result
+        }
+        result.testsWritten = true
+        result._testWriter = authored
+        result.testWriterSummary = authored.summary
+        plog(`Test Authoring: written=${authored.written}; files=${(authored.files || []).length}; summary=${authored.summary || '(none)'}`)
+      }
+      stateCheckpoint('Test Authoring', 'done')
+    } else if (isImplementMode && !useTestWriter) {
+      stateCheckpoint('Test Authoring', 'skipped')
+    }
+
     // Gate 3: Execute (plan-driven stages — parallel when file-disjoint) ----
     // Phase I: stages are the progress unit. We execute each non-done stage in dependency order,
     // ticking stageNN.md status (pending -> in-progress -> done) + result.stages[i].status. Intra-stage
     // parallelism reuses the lane fan-out, scoped to ONE stage's files. Design mode never reaches here
     // (its terminal gate returned pre-execute). On resume, done stages are skipped via their status.
     // A single implicit stage (--no-chunker, or pre-chunker runs) keeps the legacy whole-plan execute.
-    if (gateDone('executed')) {
+    if (useQuickPath) {
+      result.gsdQuick = true
+      result.planAccepted = true
+      if (result.executed) {
+        plog('resume: skip gsd-quick fast-path (executed set)')
+      } else {
+        phase('Execute')
+        plog('gsd-quick fast-path: implementing via gsd-quick skill')
+        const gsdRun = await safeAgent(
+          `You are running inside feature-pipeline. Invoke the "gsd-quick" skill via your Skill tool
+to implement this task end-to-end (plan + execute + test):
+
+Task:
+${task}
+
+Definition doc: ${result.definitionPath || definitionPath}
+Plan dir: ${planPath.replace(/plan\.md$/, '')}
+
+Adhere to the pass gates in the definition doc. Do NOT commit. Do NOT weaken tests.
+If the gsd-quick skill or the Skill tool is unavailable, implement directly following
+the definition pass gates and set usedFallback=true. Report what was implemented and the
+test outcome you observed.`,
+          { label: 'gsd-quick', phase: 'Execute', schema: GSD_RUN_VERDICT, model: gm('gsdQuick') },
+          result
+        )
+        if (!gsdRun || !gsdRun.ran) {
+          result.blockedAt = 'gsd-quick'
+          stateCheckpoint('Execute', 'blocked')
+          await consolidate(slug, result, config)
+          return result
+        }
+        result.executed = true
+        result._gsdRun = gsdRun
+        plog(`gsd-quick: ran=${gsdRun.ran}; summary=${gsdRun.summary || '(none)'}${gsdRun.usedFallback ? ' (used fallback)' : ''}`)
+      }
+    } else if (gateDone('executed')) {
       // skip — executed already set
     } else {
       phase('Execute')
