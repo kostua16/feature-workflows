@@ -193,7 +193,7 @@ deterministic guards → recovery policy.
 
 ### A. Agent-call hardening
 
-#### DONE RB-1. One hardened call path for ALL agent calls — CRITICAL
+#### ✅ DONE (v1.1.0) RB-1. One hardened call path for ALL agent calls — CRITICAL
 - Today three tiers coexist: raw `agent()` (throws escape to the safety net → hard-block),
   `safeAgent` (throw → null, no JSON fallback), `flexibleAgent` (schema fallback +
   plain-text JSON parse). Critical calls still use raw `agent()`: gsd-quick `:2572`,
@@ -204,7 +204,7 @@ deterministic guards → recovery policy.
   every schema-gated call; `safeAgent` becomes a thin alias. Per-call opt-out only where a
   throw is genuinely desired (none today).
 
-#### DONE RB-2. JSON repair layer in `extractJson`
+#### ✅ DONE (v1.1.0) RB-2. JSON repair layer in `extractJson`
 - `:1470-1487` handles fences and first-`{}` only. Weak models also emit: trailing commas,
   single quotes, unescaped newlines in strings, `True/False/None`, truncated objects,
   multiple candidate blocks, prose before/after.
@@ -212,7 +212,7 @@ deterministic guards → recovery policy.
   mapping, best-effort brace balancing for truncation) and try ALL fenced/brace candidates,
   not just the first. Pure function — unit-test heavily (ties into EN-1).
 
-#### DONE RB-3. Enum/field normalization before schema validation
+#### ✅ DONE (v1.1.0) RB-3. Enum/field normalization before schema validation
 - Weak models return `"Retry"`, `"STOP"`, severity `"Critical"`, gate `"Plan"`,
   `"true"`(string) for booleans. Forced schema rejects all of these outright.
 - Fix: a `normalizeVerdict(schema, obj)` pre-pass: lowercase enum candidates, map synonyms
@@ -220,7 +220,7 @@ deterministic guards → recovery policy.
   strings, wrap bare strings into `{text}` where object items are expected (review gaps
   already handle both — generalize the pattern). Only then validate.
 
-#### DONE RB-4. Model-tier-aware prompt hardening
+#### ✅ DONE (v1.1.0) RB-4. Model-tier-aware prompt hardening
 - Prompts are written for Claude-level instruction following. For weaker tiers, append a
   deterministic "output contract" footer automatically when the gate's resolved model is
   not a known-strong tier: 1-shot literal JSON example matching the schema, field-by-field
@@ -229,7 +229,7 @@ deterministic guards → recovery policy.
   (RB-1); keep the example generated from the schema so it never drifts. The existing
   prompt-enhancer stays for *retry* hardening; this is *first-attempt* hardening.
 
-#### DONE RB-5. Per-call timeout / output-size watchdog
+#### ✅ DONE (v1.1.0) RB-5. Per-call timeout / output-size watchdog
 - Weak models ramble or loop; a hung/limitless agent call stalls the whole pipeline with no
   budget spent. Add per-agent-call timeout (if the Workflow host exposes one; else instruct
   + cap via harness) and treat timeout exactly like a null verdict (retryable, logged).
@@ -237,7 +237,7 @@ deterministic guards → recovery policy.
 
 ### B. Verdict validation (schema-valid ≠ true)
 
-#### DONE RB-6. Semantic contradiction guards on every verdict
+#### ✅ DONE (v1.1.0) RB-6. Semantic contradiction guards on every verdict
 - Weak models produce internally contradictory verdicts that pass schema:
   `accepted=true` with non-empty blockers; `accepted=false` with zero blockers AND zero
   gaps; `completed=true` with `stepsDone=0` and empty files; `fixed=true` with no changes;
@@ -247,7 +247,7 @@ deterministic guards → recovery policy.
   corrective retry ("your verdict contradicts itself: X vs Y — restate consistently"),
   then fall to the gate's documented default (RB-11).
 
-#### DONE RB-7. Artifact existence verification after every doc-writing gate — CRITICAL
+#### ✅ DONE (v1.1.0) RB-7. Artifact existence verification after every doc-writing gate — CRITICAL
 - Define/Requirements/Arch/Design/Plan/Chunker mark their flag done purely because the
   verdict contains a path. Weak models hallucinate "written to <path>" without writing.
   I14 (`:3462-3475`) only checks the path *string* is populated, not the file.
@@ -256,13 +256,13 @@ deterministic guards → recovery policy.
   contains expected headings. Missing → one retry with "the file was NOT written — actually
   write it", then hard-block that gate (do NOT fail-forward on a phantom artifact).
 
-#### DONE RB-8. Pretend-work detection on Execute
+#### ✅ DONE (v1.1.0) RB-8. Pretend-work detection on Execute
 - Executor returns `completed=true` but wrote nothing. Deterministic check after each
   stage: `git status --porcelain` diff non-empty and intersecting the stage's declared
   files. Empty diff + completed=true → corrective retry, then block the stage. (Complements
   EN-5 which checks the *opposite* — touching files outside the lane.)
 
-#### DONE RB-9. Test-verdict cross-check
+#### ✅ DONE (v1.1.0) RB-9. Test-verdict cross-check
 - pytest-runner asserts `passed` honestly, but a weak model may report passed=true on a
   red run (or invent a summary). Run the test command's exit code through a deterministic
   channel where possible (Bash gate in the runner agent's allowed-tools; require the exact
@@ -271,7 +271,7 @@ deterministic guards → recovery policy.
 
 ### C. Deterministic guards
 
-#### DONE RB-10. Resume-state vs filesystem cross-validation
+#### ✅ DONE (v1.1.0) RB-10. Resume-state vs filesystem cross-validation
 - Hydration (`:2157-2183`) trusts every flag in `pipeline-state.json`. A weak-model run can
   persist poisoned state (designReady=true, plan.md never written; stage done, file absent).
 - Fix: on resume, verify flag→artifact pairs (designReady→plan.md + stages files exist;
@@ -279,7 +279,7 @@ deterministic guards → recovery policy.
   `resume-repair: cleared X (artifact missing)`, and let the idempotent gate re-run.
   Extends EN-2 (schema validation) with ground-truth validation.
 
-#### DONE RB-11. Centralized per-gate fallback ladder (GATE_FALLBACKS table)
+#### ✅ DONE (v1.1.0) RB-11. Centralized per-gate fallback ladder (GATE_FALLBACKS table)
 - Safe defaults exist but are scattered and ad hoc: reviews fail-forward, quick-decider
   null→stop `:1740`, goalkeeper null→commit `:1792`, executors block. Document + encode
   ONE table: for each gate, `schema-fail → plain-JSON → normalized → default verdict` and
@@ -287,7 +287,7 @@ deterministic guards → recovery policy.
   auditable and prevents a future gate from silently inventing a dangerous default
   (e.g. force-accept on a null escalation — already guarded `:3359`, keep it that way).
 
-#### DONE RB-12. Identical-failure circuit breaker
+#### ✅ DONE (v1.1.0) RB-12. Identical-failure circuit breaker
 - Budgets bound *count*, not *futility*: a deterministic failure (missing dep, syntax error
   in an unowned file) reproduces byte-identical N times while the loop burns budget and
   quick-decider (itself an LLM, itself fallible) keeps saying retry.
@@ -295,7 +295,7 @@ deterministic guards → recovery policy.
   loop; identical signature K times in a row (K=2–3) → deterministic stop overriding the
   quick-decider, log `circuit-breaker: identical failure xK`. Cheap, pure, testable.
 
-#### DONE RB-13. Output-language guard
+#### ✅ DONE (v1.1.0) RB-13. Output-language guard
 - The translator gate normalizes *input* only. Weak models sometimes emit non-English
   verdict summaries/docs, which then poison downstream prompts and docs.
 - Fix: run `detectNonEnglish` on verdict text fields and written-artifact spot-checks;
@@ -304,13 +304,13 @@ deterministic guards → recovery policy.
 
 ### D. Recovery policy
 
-#### DONE RB-14. Model-escalation ladder on repeated gate failure
+#### ✅ DONE (v1.1.0) RB-14. Model-escalation ladder on repeated gate failure
 - Before hard-blocking a gate after schema/verdict retries, retry ONCE with the next model
   tier up (haiku→sonnet→opus) for that single call. A weak default tier (e.g. categorizer
   haiku, executor sonnet) shouldn't doom the run when a stronger tier would pass. Bound by
   a per-run escalation budget; record escalations in the final report.
 
-#### DONE RB-15. Degradation telemetry + honest final report
+#### ✅ DONE (v1.1.0) RB-15. Degradation telemetry + honest final report
 - Every fallback taken (plain-JSON parse, normalization, corrective retry, fail-forward,
   circuit-break, model escalation, timeout) increments a `result.degradations[]` entry.
   Surface the list at every terminal gate and in `/pipeline-status` (FT-1) so users of weak
