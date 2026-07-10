@@ -631,8 +631,12 @@ This workflow is an **ES module** (`export const meta`) with no `package.json ty
 Syntax-checking requires ESM mode — plain `node --check` parses as CommonJS and **silently passes
 invalid ESM** (verified: a missing colon returns exit 0).
 
+The canonical source lives in the plugin repo at `plugins/feature-workflows/workflows/`; the
+project copy at `.claude/workflows/` is installed by `/feature-workflows:setup`. Edit the plugin
+source and re-run setup — the recipes below work from whichever directory holds the copy you edited.
+
 ```bash
-cd .claude/workflows
+cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
 sed 's/^return final$/\/\/ __sandbox_return__ final/' feature-pipeline.js \
   | node --input-type=module --check
 ```
@@ -654,7 +658,7 @@ or a chunker re-using a design label) silently collides the progress-tree groupi
 and mislabels the pipeline log. Catch this at CI time:
 
 ```bash
-cd .claude/workflows
+cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
 # 1. labels actually emitted by the script (phase('...') + stateCheckpoint('...', ...))
 grep -oE "(phase|stateCheckpoint)\('[^']+'" feature-pipeline.js \
   | sed -E "s/.*'([^']+)'/\1/" | sort -u > /tmp/used.txt

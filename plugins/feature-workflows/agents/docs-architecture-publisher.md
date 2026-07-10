@@ -63,7 +63,7 @@ Publish to:
 - Cross-references (relative links) connecting related docs.
 
 ### 4. Publish
-- **Local files**: use file-writing tools or spawn `file-writer` agent.
+- **Local files**: use file-writing tools or spawn `feature-workflows:file-writer` agent.
 - **External storages**: use available MCP tools/skills/agents.
  - Check MCP servers with wiki/doc publishing capabilities.
  - If `document-specialist` agent exists, delegate external publishing.
@@ -115,9 +115,9 @@ Publish to:
 ## AGENT COLLABORATION
 
 Leverage when available:
-- `file-writer` — local doc files
+- `feature-workflows:file-writer` — local doc files
 - `document-specialist` — repo docs or external storage
-- `knowledge-persist` — persist published-doc knowledge into project memory
+- `feature-workflows:knowledge-persist` — persist published-doc knowledge into project memory
 
 Agents unavailable → write directly. Publishing reliability is top priority.
 
