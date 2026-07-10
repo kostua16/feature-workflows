@@ -23,9 +23,9 @@ installs the engine there. Re-run it after plugin updates. See [docs/QUICKSTART.
 |------|-----------|
 | `.claude-plugin/marketplace.json` | Marketplace manifest (this repo is the marketplace). |
 | `plugins/feature-workflows/` | The plugin. See its [README](plugins/feature-workflows/README.md). |
-| `plugins/feature-workflows/workflows/feature-pipeline.js` | The engine — a ~5k-line **ES-module** dynamic workflow. ONE engine, FOUR modes. |
+| `plugins/feature-workflows/workflows/feature-pipeline.js` | The engine — a ~5k-line **ES-module** dynamic workflow. ONE engine, FIVE modes. |
 | `plugins/feature-workflows/workflows/feature-pipeline.md` | Full reference: gates, inputs, outputs, model tiers, validation. |
-| `plugins/feature-workflows/commands/` | 6 slash commands: `setup` + the 4 pipeline drivers + `pipeline-status`. |
+| `plugins/feature-workflows/commands/` | 7 slash commands: `setup` + the 5 pipeline drivers + `pipeline-status`. |
 | `plugins/feature-workflows/agents/` | 31 sub-agents (task-definition, arch-design, plan-architect, critical-reviewer, executor, …). |
 | `plugins/feature-workflows/skills/compress-md/` | In-session markdown caveman-compression skill (Node `.mjs` scripts). |
 | `docs/QUICKSTART.md` | End-user install & usage guide. |
@@ -33,7 +33,7 @@ installs the engine there. Re-run it after plugin updates. See [docs/QUICKSTART.
 | `docs/claude-marketplace.md` | Marketplace/plugin repo best practices (RU). |
 | `CLAUDE.md` | Mandatory agent-orchestration rules for developing this repo. |
 
-## The pipeline — ONE engine, FOUR modes
+## The pipeline — ONE engine, FIVE modes
 
 Installed commands are namespaced under the plugin (`/feature-workflows:<command>`):
 
@@ -47,6 +47,9 @@ Installed commands are namespaced under the plugin (`/feature-workflows:<command
                                                                --stage / --from-gate re-run parts selectively.
 /feature-workflows:tune-feature     <planDir>   mode:tune      FIX — consume issues-and-improvements.md → revisit
                                                                only the mapped design gates → re-enable designReady.
+/feature-workflows:extract-design   <scope>     mode:extract   REVERSE — explore existing code → extract as-is
+                                                               design docs (facts → e2e → detailed design → arch →
+                                                               requirements) + design-debt audit, slice by slice.
 /feature-workflows:pipeline-status  <planDir>   mode:status    READ-ONLY — gates/stages/budgets/telemetry report
                                                                + the exact next command. Writes nothing.
 /feature-workflows:feature-pipeline <task>      alias          design (stop); --auto-implement chains into DO
@@ -54,6 +57,9 @@ Installed commands are namespaced under the plugin (`/feature-workflows:<command
 ```
 
 All modes share `<planDir>/pipeline-state.json` — the resumable contract (`--resume <planDir>`).
+Extract runs land under `docs/{cat}/{sub}/extract/{leaf}/` and reuse the forward pipeline's artifact
+names, so an extracted docset is a ready baseline for `/tune-feature` (fix audit findings) and
+`/design-feature --resume` (design on top of the as-is docs).
 
 ## Key invariants
 

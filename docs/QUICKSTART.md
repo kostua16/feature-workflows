@@ -71,6 +71,19 @@ At any point, inspect a run without touching it:
 Read-only report: mode, gates done/blocked, stage table, budgets used, per-gate telemetry,
 open questions, and the exact next command to run.
 
+### Brownfield entry point: extract the design of existing code
+
+```
+/feature-workflows:extract-design the authentication flow in src/auth/
+```
+
+REVERSE: explores the existing code and extracts as-is design docs (code facts, observable e2e
+use cases, detailed design, architecture, reverse-derived requirements) plus a design-debt audit
+into `docs/.../extract/<leaf>/`. You confirm the resolved scope once, then it runs autonomously;
+wide scopes are split into per-subsystem slices. The output dir is a ready baseline:
+`/feature-workflows:tune-feature <dir>` fixes the audit findings, and
+`/feature-workflows:design-feature --resume <dir>` designs new work on top of the as-is docs.
+
 ## 4. Updating
 
 ```

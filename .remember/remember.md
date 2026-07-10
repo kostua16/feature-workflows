@@ -1,45 +1,40 @@
-# Handoff — 2026-07-11 (branch claude/ft-todos-implementation-plan-a6603a)
+# Handoff — 2026-07-11 (branch claude/code-design-extraction-190541)
 
 ## What happened this session
-Implemented ALL remaining `docs/TODOs.md` items — features FT-1..FT-5 — as engine **v1.2.0**
-(plan approved by user at `~/.claude/plans/check-all-ft-from-fuzzy-goose.md`):
+Designed and implemented **extract mode** (engine v1.3.0 after rebase on main's v1.2.0) —
+the fifth pipeline mode: reverse design extraction from existing code. `/extract-design
+<scope>` resolves hybrid input (free text / paths / entry points) into a scope manifest,
+pauses for a **command-layer** scope confirmation (KEY CONSTRAINT, user-confirmed:
+subagents inside the workflow CANNOT AskUserQuestion — the engine returns
+`handoff.status='awaiting-scope-confirm'` and the command re-invokes with transient
+`scopeConfirmed`/`scopeFiles`/`slices` args; same stop/re-invoke pattern main's v1.2.0
+adopted for tune-confirm + the approval gate), then per slice climbs the ladder in
+reverse: deep code facts → observable e2e use cases → detailed design *as built* →
+architecture *as built* → optional fidelity reviews / reverse-derived requirements /
+as-is design audit (findings append to `issues-and-improvements.md` in the
+tune-consumable format). Wide scopes decompose into a resumable slice queue
+(`slices/<id>/` docsets + slice-local design-shaped state files); multi-slice runs
+synthesize `system-overview.md`. Artifact names reuse the forward pipeline's, so extract
+dirs are `/tune-feature` + `/design-feature --resume` baselines.
 
-- **FT-4 per-gate telemetry**: `bumpGateTelemetry` hooked into `flexibleAgent`/`recordAgentFailure`;
-  `renderTelemetrySummary` printed via `logTelemetrySummary()` at every terminal exit;
-  `result.gateTelemetry` persisted.
-- **FT-1 `/pipeline-status`**: new engine `status` mode (read-only early exit in `main()`, never
-  consolidates) + pure `summarizeGates`/`deriveNextCommand`/`renderStatusReport` + new command
-  `plugins/feature-workflows/commands/pipeline-status.md` (6th command).
-- **FT-2**: blocker-severity code-review findings now run through `classifyAndRecordIssue`;
-  upstream ones exit at `issues-handoff` → `/tune-feature` (shared `buildIssuesHandoff`,
-  also used by the goalkeeper path). Legacy hard-block preserved for non-upstream/`--no-issues`.
-- **FT-3**: `--stage=stageNN` (`resetStageForRerun`) + `--from-gate=<gate>`
-  (`normalizeGateTarget`, new `LOOPBACK_FLAG_MAP.execute`); one-shot args, invalid →
-  `blockedAt='bad-args'` with no persistence.
-- **FT-5**: user confirmed **subagents CANNOT use AskUserQuestion** (Q3 resolved) → command-level
-  two-phase approval: design-stop exits `awaiting-approval` (`--approval` / `useApproval`),
-  `/design-feature` asks + re-invokes with `approveDesign`/`stageEdits`/`rejectToPlan`
-  (`applyApprovalDecision`); implement blocks `design-not-approved`. tune-confirm converted to the
-  same pattern (`tune-awaiting-confirm` + `confirmTune`/`finalGates`/`cancelTune`).
-  `/feature-pipeline --auto-implement` now approval-gated by default; `--yes` skips.
-
-Docs/version sweep: lockstep 1.2.0 (plugin.json, engine header, meta.version), marketplace.json
-"6 commands", both READMEs, QUICKSTART, engine reference (What's new, Inputs, Outputs/blockedAt,
-Modes incl. `status`), TODOs.md all marked done + Q3 resolved (note: user-interviewer gate still
-carries the subagent-AskUserQuestion assumption — future conversion candidate).
-
-## Verification (all green)
-- `node --test "tests/**/*.test.mjs"` — 132 pass (5 new test files: telemetry, status-mode,
-  issues-handoff, selective-execution, approval; harness CANDIDATES extended; loadFunction dep
-  list in feature-pipeline-helpers.test.mjs gained bumpGateTelemetry).
-- `validate-plugin-versions.mjs` OK 1.2.0; `validate-agent-registry.mjs` OK; ESM check OK;
-  phase-label validation 0 undeclared.
+- Engine: `resolveMode`/`gateModeActive` extended; extract branch after Translate;
+  4 new verdict schemas (SCOPE/DECOMPOSE/AUDIT/OVERVIEW); pure helpers
+  `seedExtractQueue`/`nextPendingSlice`; planDir segment `extract/`; version 1.3.0 lockstep.
+- Fixed en passant: `repairResumeArtifactFlags` now skips the Plan artifact for
+  extract-mode state (would null `result.planPath` and kill consolidate flushing), and the
+  Plan gate restores `result.planPath` after a resume repair nulled it.
+- Rebased on main (v1.2.0: status mode, telemetry, --stage/--from-gate, approval gate,
+  tune-confirm→stop/re-invoke, test-writer gate, pytest-runner removed). Merged: 5 modes,
+  FT-6 recorded in TODOs status table; dropped my obsolete FT-7 (main already fixed
+  tune-confirm).
+- Tests green post-rebase; validators green; PR #8 open.
 
 ## State
-All changes UNCOMMITTED on worktree branch `claude/ft-todos-implementation-plan-a6603a`
-(15 modified + 6 new files, +707/−134). Not committed — awaiting user go-ahead.
+- Worktree branch `claude/code-design-extraction-190541`, rebased on origin/main,
+  force-pushed; PR https://github.com/kostua16/feature-workflows/pull/8.
 
 ## Next
-- Commit + open PR against main when user asks.
-- Manual smoke (needs live run in a scratch project): design --approval loop, /pipeline-status
-  against a v1.1.0 state file, --stage re-run, code-review→issues handoff.
+- Dogfood: `/feature-workflows:setup` then `/extract-design plugins/feature-workflows/workflows/feature-pipeline.js — the pipeline engine`; verify docset + `/design-feature --resume` baseline compat.
+- Candidate follow-up (from main's Q3 note): convert the user-interviewer Define-clarification
+  gate to the stop/re-invoke pattern too.
+- Known residue (pre-existing): Gate 0.2 facts prompt hardcodes Serena project "log_analysis".

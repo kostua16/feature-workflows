@@ -1,13 +1,14 @@
 # feature-workflows plugin
 
 Gate-enforced feature-development pipeline for Claude Code: **THINK** (`design`) → **DO**
-(`implement`) → **FIX** (`tune`), driven by one dynamic-workflow engine.
+(`implement`) → **FIX** (`tune`), plus **EXTRACT** (`extract` — reverse-engineer as-is design
+docs from existing code), driven by one dynamic-workflow engine.
 
 ## Components
 
 | Component | Count | Notes |
 |---|---|---|
-| Commands | 6 | `/feature-workflows:setup`, `:design-feature`, `:implement-feature`, `:tune-feature`, `:feature-pipeline`, `:pipeline-status` |
+| Commands | 7 | `/feature-workflows:setup`, `:design-feature`, `:implement-feature`, `:tune-feature`, `:extract-design`, `:feature-pipeline`, `:pipeline-status` |
 | Agents | 31 | Spawned as `feature-workflows:<agent>` (e.g. `feature-workflows:plan-architect`) |
 | Skills | 1 | `compress-md` — in-session markdown caveman compression |
 | Engine asset | `workflows/` | `feature-pipeline.js` + reference docs — **not** auto-loaded; installed per-project by `setup` |
