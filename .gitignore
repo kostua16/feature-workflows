@@ -12,6 +12,10 @@ __pycache__/
 .claude/worktrees/
 .claude/agent-memory/
 
+# Local engine copy installed by /feature-workflows:setup
+# (source of truth: plugins/feature-workflows/workflows/)
+.claude/workflows/
+
 # Local debug / scratch artifacts
 progress_debug*.py
 progress_debug*.jsonl
