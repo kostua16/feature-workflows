@@ -1,6 +1,6 @@
 ---
 description: DO flow — execute stages -> test -> code-review -> decide -> commit. On upstream defect writes issues-and-improvements.md and stops (run /tune-feature). Requires prior /design-feature.
-argument-hint: <planDir> [--target=TEST_TARGET] [--auto-commit] [--no-issues] [--no-gsd-debug] [--no-publish] [--no-persist] [--no-goalkeeper] [--no-quick-decider] [--no-enhancer] [--no-parallel] [--decision-cap=N] [--retries=N] [--debug-retries=N] [--gsd-quick]
+argument-hint: <planDir> [--target=TEST_TARGET] [--test-cmd=CMD] [--test-framework=NAME] [--profile=full|standard|light] [--fresh-budget] [--auto-commit] [--no-issues] [--no-gsd-debug] [--no-publish] [--no-persist] [--no-goalkeeper] [--no-quick-decider] [--no-enhancer] [--no-parallel] [--decision-cap=N] [--retries=N] [--debug-retries=N] [--gsd-quick]
 allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
@@ -29,7 +29,11 @@ Parse `$ARGUMENTS` into:
   `<planDir>` = the design run's plan dir (e.g. `docs/parser/feature/add-retry-layer`), exactly the
   `result.planDir` printed by `/design-feature`. A bare `plan.md` path also accepted (`/plan.md`
   suffix stripped). `task` is optional — resolved from the persisted state.
-- `--target=PATH`: → `testTarget` (optional pytest target)
+- `--target=PATH`: → `testTarget` (optional test target/path scope)
+- `--test-cmd="<cmd>"`: → `testCmd` (run this EXACT test command, stack-agnostic; overrides auto-detect)
+- `--test-framework=<name>`: → `testFramework` (mapped template: `pytest`|`npm`|`jest`|`vitest`|`node`|`go`|`cargo`|`make`; used when `--test-cmd` is absent). With neither set, the runner auto-detects the project's test command.
+- `--profile=full|standard|light`: → `profile` (preset defaults for the gate-control flags; individual `--no-*` flags still override. `light` drops the opus review/enhancer/quick-decider loops + extra design gates for small tasks. Default `full`.)
+- `--fresh-budget`: if present → `freshBudget: true` (reset the retry + decision budgets on resume; default carries the used counters across `--resume` so a spinning loop can't be resumed into a full fresh budget)
 - `--auto-commit`: if present → `autoCommit: true` (commit on success; default `false` — leaves changes staged-and-uncommitted)
 - `--no-issues`: if present → `useIssues: false` (on an upstream-defect goalkeeper verdict, do NOT write `issues-and-improvements.md`; degrade to a plain block. Default **enabled** — writes the issues file + stops for `/tune-feature`)
 - `--no-gsd-debug`: → `useGsdDebug: false` (disable gsd-debug recovery on test failure)
@@ -55,6 +59,10 @@ Workflow({
     mode: "implement",
     resume: <planDir>,
     testTarget: <PATH or "">,
+    testCmd: <"exact test command" or "">,
+    testFramework: <"pytest|npm|go|cargo|…" or "">,
+    profile: <"full"|"standard"|"light">,
+    freshBudget: <bool>,
     autoCommit: <bool>,
     useIssues: <bool>,
     useGsdDebug: <bool>,

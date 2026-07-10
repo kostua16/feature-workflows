@@ -15,6 +15,10 @@ jobs:
           node-version: '22'
       - name: Engine version lockstep (plugin.json / engine-version header / meta.version)
         run: node scripts/validate-plugin-versions.mjs
+      - name: Agent registry (engine agent references resolve to agents/*.md)
+        run: node scripts/validate-agent-registry.mjs
+      - name: Engine unit tests (pure logic)
+        run: node --test "tests/**/*.test.mjs"
       - name: Engine ESM syntax check
         working-directory: plugins/feature-workflows/workflows
         run: |

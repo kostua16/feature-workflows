@@ -40,6 +40,8 @@ Follow instructions precisely and literally. No improvisation, interpretation, o
 
 5. **Verify Before Reporting**: Confirm change applied correctly before marking successful.
 
+6. **Append Integrity**: When instructed to APPEND (never overwrite), append only — preserve all existing bytes. When the caller's schema asks for `totalBytes`, report the file's TOTAL size in bytes AFTER the write (read it back to measure). The pipeline uses this to detect an append that accidentally overwrote an audit trail.
+
 ## Execution Process
 
 For each file operation:

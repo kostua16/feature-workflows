@@ -1,5 +1,5 @@
 // feature-pipeline.js
-// engine-version: 1.0.0
+// engine-version: 1.1.0
 // Gate-enforcing pipeline for new features / bug-fixes.
 // Encodes CLAUDE.md agent rules as a deterministic gate sequence:
 //   task-definition-architect -> plan-architect -> [review/refine loop] ->
@@ -23,7 +23,7 @@
 
 export const meta = {
   name: 'feature-pipeline',
-  version: '1.0.0',
+  version: '1.1.0',
   description: '1 engine + 3 modes (design/implement/tune) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). Durable cross-mode state via pipeline-state.json.',
   phases: [
     { title: 'Categorize' },
@@ -257,9 +257,9 @@ const TEST_VERDICT = {
   additionalProperties: false,
   required: ['passed', 'summary', 'command'],
   properties: {
-    passed: { type: 'boolean', description: 'true if the pytest run exited 0' },
+    passed: { type: 'boolean', description: 'true if the test run exited 0' },
     summary: { type: 'string', description: 'Short result line, e.g. "12 passed"' },
-    command: { type: 'string', description: 'The pytest command that was run' },
+    command: { type: 'string', description: 'The exact test command that was run' },
   },
 }
 
@@ -293,6 +293,7 @@ const FILE_ACK = {
   properties: {
     ok: { type: 'boolean', description: 'true if the file write succeeded' },
     path: { type: 'string', description: 'Path the file was written to' },
+    totalBytes: { type: 'number', description: 'EN-4: total size of the file in bytes AFTER the write (used to verify append-only files grew and were not overwritten). Report it for append operations.' },
   },
 }
 
@@ -696,6 +697,7 @@ const PIPELINE_STATE = {
     planPath: { type: 'string' },
     planDir: { type: 'string' },
     lastGate: { type: 'string', description: 'Most recent gate reached' },
+    checksum: { type: 'string', description: 'IM-1: djb2 hash of JSON.stringify(result), verified on resume (validatePipelineState) to detect a truncated chunked write. Optional — pre-checksum state files still resume.' },
     result: { type: 'object', description: 'Full pipeline result object (verbatim). Phase F-K split adds optional fields inside result: mode (design|implement|tune), stages[], designReady, issuesPath, tunePlan, handoff. All default so pre-split state still hydrates.' },
     config: { type: 'object', description: 'args-derived flags, so resume re-derives without re-parsing. Gains mode/useChunker/useIssues/useTuneConfirm (Phase F-K).' },
   },
@@ -864,6 +866,36 @@ const MODEL_DEFAULTS = {
   tunePlanner: 'opus',    // derives minimal gate-revisit plan from issues file
 }
 
+// Config profiles: a named preset for the gate-control flag zoo. Individual --no-*
+// flags still override the profile (see cfgFlag wiring in main()). A profile only
+// supplies the DEFAULT for a flag the user did not set explicitly, so on --resume the
+// persisted per-run flags still win. Unknown names fall back to 'full' (all gates on).
+//   full     = every adopted gate ON (the historical default; backward-compatible).
+//   standard = drops the two heaviest optional context gates for mid-size tasks.
+//   light    = small-task preset: drops the opus review/enhancer/quick-decider loops and
+//              the extra design gates so a tiny fix does not pay for the full THINK stack.
+const PROFILES = {
+  full: {},
+  standard: {
+    useE2eUsecase: false,
+    useKnowledgeConsult: false,
+  },
+  light: {
+    useEnhancer: false,
+    useQuickDecider: false,
+    useArchDesign: false,
+    useDetailedDesign: false,
+    useReconcile: false,
+    useE2eUsecase: false,
+    useKnowledgeConsult: false,
+    useInterview: false,
+  },
+}
+// Resolve a profile name to its flag-default overrides. Pure; unknown => 'full'.
+function resolveProfile(name) {
+  return PROFILES[name] ? PROFILES[name] : PROFILES.full
+}
+
 // Shared retry budget state. Both the refine loop and the debug loop draw from
 // and increment this single counter so the pipeline has one global "stop" point.
 const retryState = { used: 0 }
@@ -872,6 +904,19 @@ function budgetExhausted(budget) {
 }
 function spendRetry(n) {
   retryState.used += n
+}
+
+// IM-2: budget carry-over across --resume. By default a resume grants a FULL new
+// budget (retryState/decisionState both re-zeroed), so a run that hard-blocked on a
+// spinning loop can be resumed straight back into the same spin indefinitely. Persist
+// the used counters in state and resume from them unless --fresh-budget is passed.
+// Pure: reads persisted counters off the hydrated result; returns the seed values.
+function hydrateBudget(resumedResult, args) {
+  if (args && args.freshBudget) return { retryUsed: 0, decisionUsed: 0 }
+  const r = resumedResult || {}
+  const retryUsed = Number.isFinite(r.retryUsed) ? r.retryUsed : 0
+  const decisionUsed = Number.isFinite(r.decisionUsed) ? r.decisionUsed : 0
+  return { retryUsed: Math.max(0, retryUsed), decisionUsed: Math.max(0, decisionUsed) }
 }
 
 // Decision budget (Phase E1): authoritative decision-agents (quick-decider + goalkeeper)
@@ -976,6 +1021,13 @@ function detectNonEnglish(text) {
 // success and once per hard-block exit. Prior context is passed between gates
 // in-prompt from the in-memory `result`, not via todo-store reads.
 async function consolidate(slug, result, config) {
+  // IM-2: stamp BOTH live budget counters at the single persist boundary so every
+  // consolidate captures them, independent of where they were last spent. retryUsed is
+  // also set ad hoc at each gate, but decisionUsed was only touched at the two decision
+  // spend sites — centralizing here guarantees a --resume that never spent a decision
+  // (or spent one long before the exit) still round-trips the true decision budget.
+  result.retryUsed = retryState.used
+  result.decisionUsed = decisionState.used
   // R5/R6: flush the in-memory pipeline log to <planDir>/pipeline.log AND the
   // durable pipeline-state.json alongside the todo-store write, so every
   // consolidate point (success + each hard-block exit) persists the run log and
@@ -1056,6 +1108,47 @@ async function flushPipelineLog(planDir, result) {
     (n, max) => `pipeline.log flushed in ${n} chunks (>${max} chars)`)
 }
 
+// IM-1: deterministic integrity check for pipeline-state.json. The state file is
+// written through an LLM file-writer in ~12k-char chunks, so a failed middle chunk
+// can leave a file that still parses as JSON but silently drops fields. We can't
+// checksum on the host (the engine has no FS), so we embed a self-describing checksum
+// over the serialized `result` and re-verify it on resume. djb2 is a small, pure,
+// dependency-free string hash — enough to catch truncation/corruption, not a security MAC.
+function stateChecksum(str) {
+  const s = String(str == null ? '' : str)
+  let h = 5381
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0 // h * 33 + c, kept unsigned
+  }
+  return h.toString(16)
+}
+
+// EN-2: structural validation of a hydrated pipeline-state.json before resume trusts
+// it. `loadPipelineState` hydrates whatever the reader returns into 25+ result flags, so
+// a corrupt/truncated file (IM-1) would poison the run. Pure: returns {ok, errors[]}.
+// Also verifies the IM-1 checksum when present (older state files without it still pass
+// the structural check — the checksum is advisory, not required, for backward-compat).
+function validatePipelineState(state) {
+  const errors = []
+  if (!state || typeof state !== 'object') {
+    return { ok: false, errors: ['state is not an object'] }
+  }
+  for (const key of ['task', 'slug', 'planPath', 'planDir']) {
+    if (typeof state[key] !== 'string' || !state[key]) errors.push(`missing/invalid ${key}`)
+  }
+  if (!state.result || typeof state.result !== 'object') {
+    errors.push('missing/invalid result object')
+  }
+  if (state.config !== undefined && (typeof state.config !== 'object' || state.config === null)) {
+    errors.push('config present but not an object')
+  }
+  if (typeof state.checksum === 'string' && state.result) {
+    const actual = stateChecksum(JSON.stringify(state.result))
+    if (actual !== state.checksum) errors.push(`checksum mismatch (state file may be truncated/corrupt): expected ${state.checksum}, got ${actual}`)
+  }
+  return { ok: errors.length === 0, errors }
+}
+
 // R6: persist the durable pipeline-state JSON to <planDir>/pipeline-state.json
 // via the file-writer agent. This is the --resume substrate: every consolidate
 // boundary (success + each hard-block exit) flushes the latest result + config
@@ -1069,6 +1162,9 @@ async function flushPipelineState(planDir, result, config) {
     planPath: result.planPath,
     planDir,
     lastGate: (result._state && result._state.lastGate) || null,
+    // IM-1: integrity checksum over the serialized result, verified by
+    // validatePipelineState() on resume to detect a truncated chunked write.
+    checksum: stateChecksum(JSON.stringify(result)),
     result,
     config,
   }
@@ -1231,16 +1327,20 @@ code), and give a concrete suggested fix.`,
     '',
   ].join('\n')
   try {
-    await safeAgent(
+    const ack = await safeAgent(
       `You are a file-writer agent. APPEND the markdown section below to ${issuesPath}.
 If the file does not exist, create it with a "# Issues & Improvements" header first, then the section.
-Do NOT overwrite existing content — append only. Return ok=true after appending.
+Do NOT overwrite existing content — append only. Return ok=true and totalBytes = the file's total
+size in bytes AFTER appending.
 
 ${section}`,
       { label: 'file-writer(issues)', phase: 'Goalkeeper', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
       result
     )
     result.issuesPath = issuesPath
+    // EN-4: the tune handoff depends on this trail — verify the append grew it.
+    const growth = verifyAppendGrowth(result, issuesPath, ack)
+    if (growth && growth.ok === false) plogFromResult(result, `issue-classifier: issues-and-improvements.md DID NOT grow (possible overwrite): ${issuesPath} ${growth.prev}->${growth.now}`)
     plogFromResult(result, `issue-classifier: UPSTREAM issue recorded → ${issuesPath} (gate=${verdict.gate})`)
   } catch (e) {
     plogFromResult(result, `issue-classifier: issues-and-improvements.md append failed (non-blocking): ${String(e)}`)
@@ -1462,15 +1562,55 @@ ${task || r.task || '(none)'}`,
 }
 
 // Run the pytest gate. Returns a TEST_VERDICT object (or null on agent failure).
-async function runTests(testTarget) {
+// IM-4: this is a general-purpose marketplace plugin, so the test gate must be
+// stack-agnostic instead of hardcoding pytest. Map a framework name (+ optional
+// target) to a concrete command. Pure + testable; returns null for an unknown
+// framework so the caller can fall back to agent auto-detection.
+const TEST_COMMAND_TEMPLATES = {
+  pytest: (t) => (t ? `python -m pytest -v --tb=short ${t}` : 'python -m pytest -v --tb=short'),
+  npm: (t) => (t ? `npm test -- ${t}` : 'npm test'),
+  jest: (t) => (t ? `npx jest ${t}` : 'npx jest'),
+  vitest: (t) => (t ? `npx vitest run ${t}` : 'npx vitest run'),
+  node: (t) => (t ? `node --test ${t}` : 'node --test'),
+  go: (t) => (t ? `go test ${t}` : 'go test ./...'),
+  cargo: (t) => (t ? `cargo test ${t}` : 'cargo test'),
+  make: () => 'make test',
+}
+function detectTestCommand(framework, target) {
+  const t = target && String(target).trim() ? String(target).trim() : ''
+  const tmpl = framework ? TEST_COMMAND_TEMPLATES[String(framework).toLowerCase()] : null
+  return tmpl ? tmpl(t) : null
+}
+
+// Run the test gate. Command resolution precedence (all stack-agnostic):
+//   1. explicit --test-cmd "<cmd>"      -> run verbatim
+//   2. --test-framework <name> [+target] -> mapped template (pytest/npm/go/cargo/…)
+//   3. neither                          -> the runner agent auto-detects the project's
+//      test command (pytest / npm test / go test / cargo test) from its manifests.
+async function runTests(testTarget, testCmd, testFramework) {
   const target = testTarget && testTarget.trim() ? testTarget.trim() : ''
-  const pytestCmd = target ? `python -m pytest -v --tb=short ${target}` : 'python -m pytest -v --tb=short'
-  log(`Running tests: ${pytestCmd}`)
-  return safeAgent(
-    `You are the pytest-runner agent. Run this exact pytest command and report whether it passed:
-${pytestCmd}
+  const explicit = testCmd && String(testCmd).trim() ? String(testCmd).trim() : null
+  const mapped = explicit ? null : detectTestCommand(testFramework, target)
+  const cmd = explicit || mapped
+  if (cmd) {
+    log(`Running tests: ${cmd}`)
+    return safeAgent(
+      `You are the test-runner agent. Run this exact command and report whether it passed:
+${cmd}
 Report the exit status honestly (passed=true only on exit 0). Do NOT modify code or tests.`,
-    { label: 'pytest-runner', phase: 'Test', schema: TEST_VERDICT, model: gm('test') },
+      { label: 'test-runner', phase: 'Test', schema: TEST_VERDICT, model: gm('test') },
+      null
+    )
+  }
+  // Auto-detect: no command was pinned. Let the runner discover the stack.
+  log('Running tests: auto-detect project test command')
+  return safeAgent(
+    `You are the test-runner agent. Detect this project's test command from its manifests
+(pytest/tox.ini/pyproject for Python, package.json "test" script for Node, go.mod for Go,
+Cargo.toml for Rust, Makefile "test" target, etc.) and run it${target ? ` scoped to: ${target}` : ''}.
+Report the exact command you ran in the "command" field and the exit status honestly
+(passed=true only on exit 0). Do NOT modify code or tests.`,
+    { label: 'test-runner', phase: 'Test', schema: TEST_VERDICT, model: gm('test') },
     null
   )
 }
@@ -2016,7 +2156,7 @@ function rewriteOutsideStrings(text, rewriteSegment) {
 // Append a review verdict to <planDir>/review-history.md (Phase C2 persistence). Non-blocking.
 // Writes one compact markdown section per iteration so resume + audit have the full review trail.
 // Uses APPEND (never overwrite) so the history accumulates across iterations + gates.
-async function appendReviewHistory(planDir, phaseLabel, iteration, verdict, acceptancePath) {
+async function appendReviewHistory(planDir, phaseLabel, iteration, verdict, acceptancePath, result) {
   const historyPath = planDir.replace(/\/$/, '') + '/review-history.md'
   const blockers = (verdict && verdict.blockers) || []
   const gaps = (verdict && verdict.gaps) || []
@@ -2040,15 +2180,18 @@ async function appendReviewHistory(planDir, phaseLabel, iteration, verdict, acce
     '',
   ].join('\n')
   try {
-    await safeAgent(
+    const ack = await safeAgent(
       `You are a file-writer agent. APPEND the section below to the file at ${historyPath}.
 Create the file (and parent dirs) if it does not exist. Do NOT overwrite existing content — append only.
-Return ok=true after appending.
+Return ok=true and totalBytes = the file's total size in bytes AFTER appending.
 
 ${section}`,
       { label: `review-history(${phaseLabel}#${iteration})`, phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
-      null
+      result
     )
+    // EN-4: verify the append-only trail actually grew (writer reports totalBytes).
+    const growth = verifyAppendGrowth(result, historyPath, ack)
+    if (growth && growth.ok === false) log(`review-history append DID NOT grow (possible overwrite): ${historyPath} ${growth.prev}->${growth.now}`)
   } catch (e) {
     log(`review-history append failed (${phaseLabel}#${iteration}): ${String(e)}`)
   }
@@ -2100,11 +2243,11 @@ async function reviewLoop({
       { label: `critical-reviewer(${artifactName})`, phase: phaseLabel, schema: DESIGN_REVIEW_VERDICT, model: reviewerModel },
       result
     )
-    await appendReviewHistory(planDir, phaseLabel, iterations, review)
+    await appendReviewHistory(planDir, phaseLabel, iterations, review, null, result)
     if (!review) {
       // Reviewer agent failed — fail-forward (treat as accepted) so a flaky reviewer doesn't block.
       plogFromResult(result, `${phaseLabel}: reviewer returned null — fail-forward (accepted)`)
-      await appendReviewHistory(planDir, phaseLabel, iterations, null, 'fail-forward (reviewer-null)')
+      await appendReviewHistory(planDir, phaseLabel, iterations, null, 'fail-forward (reviewer-null)', result)
       return { accepted: true, iterations, lastVerdict: null, failForward: true, acceptancePath: 'fail-forward (reviewer-null)' }
     }
     lastVerdict = review
@@ -2121,7 +2264,7 @@ async function reviewLoop({
     if (review.accepted && !(review.blockers && review.blockers.length) && !blockingGaps.length) {
       const acceptTag = iterations === 1 ? 'clean' : `revised-${iterations}`
       plogFromResult(result, `${phaseLabel}: accepted after ${iterations} iteration(s)${nonBlockingGaps ? ` (${nonBlockingGaps} non-blocking gap(s) deferred)` : ''}`)
-      await appendReviewHistory(planDir, phaseLabel, iterations, review, acceptTag)
+      await appendReviewHistory(planDir, phaseLabel, iterations, review, acceptTag, result)
       return { accepted: true, iterations, lastVerdict: review, acceptancePath: acceptTag }
     }
     plogFromResult(result, `${phaseLabel}: iteration ${iterations} not accepted — blockers=${(review.blockers || []).length}, blockingGaps=${blockingGaps.length}, nonBlockingGaps=${nonBlockingGaps}`)
@@ -2145,14 +2288,14 @@ async function reviewLoop({
     )
     if (!revise || !revise.artifactPath) {
       plogFromResult(result, `${phaseLabel}: reviser returned null — fail-forward (accepted)`)
-      await appendReviewHistory(planDir, phaseLabel, iterations, review, 'fail-forward (reviser-null)')
+      await appendReviewHistory(planDir, phaseLabel, iterations, review, 'fail-forward (reviser-null)', result)
       return { accepted: true, iterations, lastVerdict: review, failForward: true, acceptancePath: 'fail-forward (reviser-null)' }
     }
     plogFromResult(result, `${phaseLabel}: revised (${(revise.changesApplied || []).length} changes)`)
   }
   // Sub-cap exhausted without acceptance — fail-forward (non-terminal like the plan convergence gate).
   plogFromResult(result, `${phaseLabel}: sub-cap (${refineSubcap}) reached without acceptance — fail-forward`)
-  await appendReviewHistory(planDir, phaseLabel, iterations, lastVerdict, 'fail-forward (sub-cap)')
+  await appendReviewHistory(planDir, phaseLabel, iterations, lastVerdict, 'fail-forward (sub-cap)', result)
   return { accepted: true, iterations, lastVerdict, failForward: true, acceptancePath: 'fail-forward (sub-cap)' }
 }
 
@@ -2309,7 +2452,8 @@ Detailed design: ${result.designPath || '(none)'}
 Requirements: ${result.requirementsPath || '(none)'}
 Code review: issues=${(result.codeReview && result.codeReview.issues) || 0}, blockers=${(result.codeReview && result.codeReview.blockers && result.codeReview.blockers.length) || 0}
 Tests: ${result.testSummary || '(none)'}
-Carried blockers (from force-accept): ${JSON.stringify(result.carriedBlockers || [])}
+Carried blockers (from force-accept):
+${compactList(result.carriedBlockers || [], 8)}
 Goalkeeper pass: ${pass}/${maxPasses}
 
 decision='commit' if the work is genuinely complete (green tests, clean review, requirements met).
@@ -2336,16 +2480,20 @@ async function appendDecisionLog(planDir, entry, result) {
   if (!planDir) return
   const path = planDir.replace(/\/$/, '') + '/decisions.md'
   try {
-    await safeAgent(
+    const ack = await safeAgent(
       `You are a file-writer agent. APPEND the markdown entry below to ${path}.
 If the file does not exist, create it with a "# Decision Log" header first, then the entry.
-Do NOT overwrite existing content. Entry to append:
+Do NOT overwrite existing content. Return ok=true and totalBytes = the file's total size in
+bytes AFTER appending. Entry to append:
 
 ${entry}`,
-      { label: 'file-writer(decisions)', phase: 'Goalkeeper' },
+      { label: 'file-writer(decisions)', phase: 'Goalkeeper', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
       result
     )
     if (result) result.decisionsPath = path
+    // EN-4: verify the append-only decision log grew and was not overwritten.
+    const growth = verifyAppendGrowth(result, path, ack)
+    if (growth && growth.ok === false) log(`decisions.md append DID NOT grow (possible overwrite): ${path} ${growth.prev}->${growth.now}`)
   } catch (e) {
     log('appendDecisionLog failed (non-blocking): ' + String(e))
   }
@@ -2437,6 +2585,87 @@ function clearGateAndDownstream(result, targetPhase) {
   if ('testsPassed' in result) result.testsPassed = false
 }
 
+// EN-4: append-only audit trail guard. The audit files (review-history.md, decisions.md,
+// issues-and-improvements.md) are appended through an LLM file-writer told "do NOT
+// overwrite". One agent mistake wipes the whole trail. We can't stat on the host, so the
+// writer reports the file's post-append size (FILE_ACK.totalBytes) and we assert it grew
+// vs the last size we recorded for that path. Pure: mutates result._appendSizes + returns
+// {ok, shrank, prev, now, unknown}. A non-growing size ⇒ the append was really an
+// overwrite (or a no-op) — recorded as a warning so the run surfaces the lost trail.
+function verifyAppendGrowth(result, path, ack) {
+  if (!result) return { ok: true, unknown: true }
+  if (!result._appendSizes) result._appendSizes = {}
+  const now = ack && Number.isFinite(ack.totalBytes) ? ack.totalBytes : null
+  if (now == null) return { ok: true, unknown: true } // writer didn't report a size — can't check
+  const prev = Number.isFinite(result._appendSizes[path]) ? result._appendSizes[path] : null
+  result._appendSizes[path] = now
+  if (prev == null) return { ok: true, prev: null, now } // first write to this path this run
+  const ok = now > prev
+  const outcome = { ok, shrank: now < prev, prev, now }
+  if (!ok) {
+    if (!result.appendWarnings) result.appendWarnings = []
+    result.appendWarnings.push(`append-only file did not grow (possible overwrite): ${path} (${prev} -> ${now} bytes)`)
+  }
+  return outcome
+}
+
+// Canonicalize a file path for comparison. Declared plan paths and an LLM executor's
+// self-reported touched paths routinely differ in PURELY COSMETIC ways (leading "./",
+// repeated or trailing slashes, backslashes on Windows-style output). We normalize only
+// those — never anything that changes WHICH file is referenced. In particular we do NOT
+// strip leading "../": `../a.js` is a genuinely different file from `a.js`, so collapsing
+// it would miss real out-of-lane touches and falsely merge two distinct files under one
+// key. Conservative on case too: we DON'T lowercase, because the pipeline can run on a
+// case-sensitive FS where "Foo.js" and "foo.js" are genuinely different. Pure + testable.
+function normalizePath(p) {
+  let s = String(p == null ? '' : p).trim().replace(/\\/g, '/')
+  s = s.replace(/\/{2,}/g, '/')          // collapse repeated slashes
+  s = s.replace(/^\.\//, '')             // drop a single leading ./ (same file)
+  s = s.replace(/\/+$/, '')              // drop trailing slashes
+  return s
+}
+
+// EN-5: lane/stage file-ownership enforcement AFTER execute. Disjointness is checked only
+// on DECLARED lane files pre-fanout; parallel executors can still clobber each other or
+// stray outside their lane. Given each work unit's declared owned files and the files it
+// actually reported touching, return the violations. Both sides are normalizePath'd first
+// so surface-form differences don't fabricate violations. Pure + testable.
+//   units: [{ name, owned: string[], touched: string[] }]
+//   -> { outOfLane: [{unit,file}], crossOverlap: [{file, units:[...]}] }
+// A unit with an empty `owned` set is skipped for outOfLane (no ownership declared to
+// enforce), but its touches still count toward crossOverlap detection.
+function detectOwnershipViolations(units) {
+  const outOfLane = []
+  const touchedBy = new Map()
+  for (const u of units || []) {
+    const owned = new Set((u.owned || []).map(normalizePath))
+    for (const f of (u.touched || []).map(normalizePath)) {
+      if (owned.size && !owned.has(f)) outOfLane.push({ unit: u.name, file: f })
+      const seen = touchedBy.get(f) || []
+      if (!seen.includes(u.name)) seen.push(u.name)
+      touchedBy.set(f, seen)
+    }
+  }
+  const crossOverlap = []
+  for (const [file, names] of touchedBy) {
+    if (names.length > 1) crossOverlap.push({ file, units: names })
+  }
+  return { outOfLane, crossOverlap }
+}
+
+// IM-3: prompt-size hygiene. Gate prompts interpolate raw, growing JSON blobs
+// (carriedBlockers, findings, blockers) into every downstream prompt. The on-disk
+// artifacts are the real payload; the prompt only needs a compact reference. compactList
+// renders at most `max` items (stringified) with a "+K more" tail so a long blocker list
+// can't balloon a prompt. Pure + testable.
+function compactList(items, max = 5) {
+  const arr = Array.isArray(items) ? items : (items == null ? [] : [items])
+  const shown = arr.slice(0, max).map((x) => (typeof x === 'string' ? x : JSON.stringify(x)))
+  const extra = arr.length - shown.length
+  const body = shown.map((s) => `- ${s}`).join('\n')
+  return extra > 0 ? `${body}\n- (+${extra} more — see the on-disk artifact)` : (body || '- (none)')
+}
+
 // ---- Script body -----------------------------------------------------------
 
 async function main() {
@@ -2491,6 +2720,30 @@ async function main() {
       }
       return block
     }
+    // EN-2: validate the hydrated state BEFORE trusting it into 25+ result flags. A
+    // corrupt/truncated pipeline-state.json (a failed chunked write, IM-1) that still
+    // parses as JSON must block with a clear message rather than hydrate garbage. Same
+    // pre-try-block constraint as above: return a clean blocked result, never throw.
+    const validation = validatePipelineState(resumed)
+    if (!validation.ok) {
+      const detail = validation.errors.join('; ')
+      log(`main: --resume state failed validation at ${resumeDir}: ${detail}`)
+      await writeFailedLaunch(resumeDir.replace(/[\/]+$/, '').split(/[\/]/).pop(), 'resume-invalid-state', detail, Object.keys(args || {}))
+      return {
+        task: (resumed && resumed.task) || '',
+        mode: resolveMode(args, (resumed && resumed.config) || {}, resumed),
+        planDir: resumeDir,
+        ready: false,
+        blockedAt: 'resume-invalid-state',
+        handoff: {
+          from: resolveMode(args, (resumed && resumed.config) || {}, resumed),
+          message: `pipeline-state.json at ${resumeDir} is invalid or corrupt (${detail}). It may be a truncated write — inspect the file, or run /design-feature to start fresh.`,
+          nextMode: 'design',
+          planDir: resumeDir,
+        },
+        logLines: [`main: resume blocked — invalid pipeline-state.json at ${resumeDir}: ${detail}`],
+      }
+    }
     // The persisted planPath is authoritative on resume — we never re-categorize or
     // re-derive the dynamic planDir (the categorizer is non-deterministic).
     explicitPlanPath = resumed.planPath || (resumeDir + 'plan.md')
@@ -2536,10 +2789,22 @@ async function main() {
   const decisionCap = (args && args.decisionCap) || DECISION_CAP_DEFAULT
   const autoCommit = !!(args && args.autoCommit)
   const testTarget = (args && args.testTarget) || '' // empty => whole suite
+  // IM-4: stack-agnostic test gate. --test-cmd pins an exact command; --test-framework
+  // selects a mapped template (pytest/npm/go/cargo/…). Neither set => runner auto-detects.
+  const testCmd = (args && args.testCmd) || ''
+  const testFramework = (args && args.testFramework) || ''
 
   // GSD integration options.
   const gsdQuick = !!(args && args.gsdQuick) // force the gsd-quick fast-path
   const useGsdDebug = args && args.useGsdDebug === false ? false : true // default true
+
+  // IM-5: profile presets supply the DEFAULT for each gate-control flag. `pdef` returns
+  // the profile's value for a flag if the profile sets it, else the historical default
+  // (true). Profiles are a fresh-run convenience only: cfgFlag prefers an explicit arg,
+  // then the persisted value, then this default — so --resume is unaffected and any
+  // individual --no-* flag still overrides the profile.
+  const profile = resolveProfile(args && args.profile)
+  const pdef = (key, dflt) => (profile[key] !== undefined ? profile[key] : dflt)
 
   // Resolve the full config ONCE so every consolidate() boundary (success + each
   // hard-block exit) can flush pipeline-state.json with the run's flag set. On
@@ -2549,24 +2814,25 @@ async function main() {
   const cfgFlag = (argVal, persistedVal, defaultVal) =>
     argVal === false ? false : (persistedVal !== undefined ? persistedVal : defaultVal)
   const config = {
-    useTranslator: cfgFlag(args && args.useTranslator, persistedConfig.useTranslator, true),
-    useCategorizer: cfgFlag(args && args.useCategorizer, persistedConfig.useCategorizer, true),
-    useEnhancer: cfgFlag(args && args.useEnhancer, persistedConfig.useEnhancer, true),
-    useExplorer: cfgFlag(args && args.useExplorer, persistedConfig.useExplorer, true),
-    useRequirements: cfgFlag(args && args.useRequirements, persistedConfig.useRequirements, true),
-    useArchDesign: cfgFlag(args && args.useArchDesign, persistedConfig.useArchDesign, true),
-    useDetailedDesign: cfgFlag(args && args.useDetailedDesign, persistedConfig.useDetailedDesign, true),
-    useTddEnforce: cfgFlag(args && args.useTddEnforce, persistedConfig.useTddEnforce, true),
-    useKnowledgePersist: cfgFlag(args && args.useKnowledgePersist, persistedConfig.useKnowledgePersist, true),
-    useE2eUsecase: cfgFlag(args && args.useE2eUsecase, persistedConfig.useE2eUsecase, true),
-    useKnowledgeConsult: cfgFlag(args && args.useKnowledgeConsult, persistedConfig.useKnowledgeConsult, true),
-    useReconcile: cfgFlag(args && args.useReconcile, persistedConfig.useReconcile, true),
-    usePublish: cfgFlag(args && args.usePublish, persistedConfig.usePublish, true),
-    useInterview: cfgFlag(args && args.useInterview, persistedConfig.useInterview, true),
-    useGoalkeeper: cfgFlag(args && args.useGoalkeeper, persistedConfig.useGoalkeeper, true),
-    useQuickDecider: cfgFlag(args && args.useQuickDecider, persistedConfig.useQuickDecider, true),
+    profile: (args && args.profile) || persistedConfig.profile || 'full',
+    useTranslator: cfgFlag(args && args.useTranslator, persistedConfig.useTranslator, pdef('useTranslator', true)),
+    useCategorizer: cfgFlag(args && args.useCategorizer, persistedConfig.useCategorizer, pdef('useCategorizer', true)),
+    useEnhancer: cfgFlag(args && args.useEnhancer, persistedConfig.useEnhancer, pdef('useEnhancer', true)),
+    useExplorer: cfgFlag(args && args.useExplorer, persistedConfig.useExplorer, pdef('useExplorer', true)),
+    useRequirements: cfgFlag(args && args.useRequirements, persistedConfig.useRequirements, pdef('useRequirements', true)),
+    useArchDesign: cfgFlag(args && args.useArchDesign, persistedConfig.useArchDesign, pdef('useArchDesign', true)),
+    useDetailedDesign: cfgFlag(args && args.useDetailedDesign, persistedConfig.useDetailedDesign, pdef('useDetailedDesign', true)),
+    useTddEnforce: cfgFlag(args && args.useTddEnforce, persistedConfig.useTddEnforce, pdef('useTddEnforce', true)),
+    useKnowledgePersist: cfgFlag(args && args.useKnowledgePersist, persistedConfig.useKnowledgePersist, pdef('useKnowledgePersist', true)),
+    useE2eUsecase: cfgFlag(args && args.useE2eUsecase, persistedConfig.useE2eUsecase, pdef('useE2eUsecase', true)),
+    useKnowledgeConsult: cfgFlag(args && args.useKnowledgeConsult, persistedConfig.useKnowledgeConsult, pdef('useKnowledgeConsult', true)),
+    useReconcile: cfgFlag(args && args.useReconcile, persistedConfig.useReconcile, pdef('useReconcile', true)),
+    usePublish: cfgFlag(args && args.usePublish, persistedConfig.usePublish, pdef('usePublish', true)),
+    useInterview: cfgFlag(args && args.useInterview, persistedConfig.useInterview, pdef('useInterview', true)),
+    useGoalkeeper: cfgFlag(args && args.useGoalkeeper, persistedConfig.useGoalkeeper, pdef('useGoalkeeper', true)),
+    useQuickDecider: cfgFlag(args && args.useQuickDecider, persistedConfig.useQuickDecider, pdef('useQuickDecider', true)),
     decisionCap: decisionCap,
-    allowParallelExecute: cfgFlag(args && args.allowParallelExecute, persistedConfig.allowParallelExecute, true),
+    allowParallelExecute: cfgFlag(args && args.allowParallelExecute, persistedConfig.allowParallelExecute, pdef('allowParallelExecute', true)),
     gsdQuick,
     useGsdDebug,
     retryBudget,
@@ -2575,6 +2841,8 @@ async function main() {
     debugSubcap,
     autoCommit,
     testTarget,
+    testCmd,
+    testFramework,
     // Phase F-K: pipeline-split modes. ONE engine, 3 invocations:
     //   design   = THINK gates only (define ... review/refine); stops pre-execute.
     //   implement = DO gates (execute stages ... commit); upstream defect -> issues file + stop.
@@ -2700,8 +2968,13 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     // A prior block is re-evaluated by the gate that's re-entered; clear it so a
     // now-passing gate doesn't report a stale block in the final result.
     result.blockedAt = null
-    // Reset the global retry budget so the resumed run gets a fresh allocation.
-    retryState.used = 0
+    // IM-2: carry the retry + decision budgets used so far across resume so a run that
+    // hard-blocked on a spinning loop cannot be resumed straight back into the same spin
+    // with a full fresh budget. --fresh-budget opts back into the old reset-to-zero.
+    const seededBudget = hydrateBudget(resumed.result, args)
+    retryState.used = seededBudget.retryUsed
+    decisionState.used = seededBudget.decisionUsed
+    plog(`--resume: seeded budgets retryUsed=${retryState.used} decisionUsed=${decisionState.used}${args && args.freshBudget ? ' (--fresh-budget)' : ''}`)
     // Phase F-K: stamp the resolved mode onto the hydrated result. The resolved mode
     // (explicit arg > persisted > default) reflects THIS invocation, so design->implement
     // or implement->tune transitions are visible on the result the gates read.
@@ -4093,9 +4366,13 @@ malformed output.`
       const stages = result.stages && result.stages.length
         ? result.stages
         : [{ id: 'stage01', file: planDir + 'stage01.md', name: 'Whole plan', status: 'pending', files: (result.lanes || []).flatMap((l) => l.files || []) }]
+      // BF-4: when falling back to the implicit single stage, assign it back so stage
+      // status is persisted (the result.stages[si] syncs below aren't silently skipped).
       if (!result.stages || !result.stages.length) result.stages = stages
+      // IM-3: compact the (potentially long) carried-blocker list instead of dumping the
+      // full JSON into every executor prompt. The on-disk decisions.md holds the full record.
       const carriedBlockersLine = result.carriedBlockers && result.carriedBlockers.length
-        ? `Carried-forward blockers from force-accept (address specifically): ${JSON.stringify(result.carriedBlockers)}`
+        ? `Carried-forward blockers from force-accept (address specifically):\n${compactList(result.carriedBlockers, 8)}`
         : ''
 
       const aggregate = { completed: true, stepsDone: 0, files: [], laneOutcomes: [], lanesUsed: 0 }
@@ -4201,6 +4478,25 @@ declaring completion. ${carriedBlockersLine}`,
         aggregate.stepsDone += exec.stepsDone || 0
         aggregate.files = aggregate.files.concat(exec.files || [])
         if (exec._laneVerdicts) aggregate.laneOutcomes = aggregate.laneOutcomes.concat(exec._laneVerdicts)
+        // EN-5: enforce lane/stage ownership on ACTUAL touched files (not just declared
+        // disjointness). Build the work units — parallel lanes if fanned out, else the whole
+        // stage — from the files each unit reported touching vs the files it owns, and record
+        // any strays (touched outside ownership) or cross-lane clobbers. Non-blocking: the
+        // executor's file list is self-reported, so we surface overlaps as warnings rather than
+        // hard-fail (a git-status-backed hard gate is deferred — see RB-8).
+        const ownershipUnits = useLanes
+          ? scopedLanes.map((lane) => {
+              const outcome = (exec._laneVerdicts || []).find((o) => o.lane === lane.name)
+              return { name: `${stage.id}:${lane.name}`, owned: lane.files || [], touched: (outcome && outcome.files) || [] }
+            })
+          : [{ name: stage.id, owned: stage.files || [], touched: exec.files || [] }]
+        const violations = detectOwnershipViolations(ownershipUnits)
+        if (violations.outOfLane.length || violations.crossOverlap.length) {
+          if (!result.ownershipWarnings) result.ownershipWarnings = []
+          for (const v of violations.outOfLane) result.ownershipWarnings.push(`stage ${stage.id}: unit ${v.unit} touched out-of-lane file ${v.file}`)
+          for (const v of violations.crossOverlap) result.ownershipWarnings.push(`stage ${stage.id}: file ${v.file} touched by ${v.units.join(' + ')} (clobber risk)`)
+          plog(`Execute: stage ${stage.id} — OWNERSHIP WARNING: ${violations.outOfLane.length} out-of-lane, ${violations.crossOverlap.length} cross-lane overlap(s)`)
+        }
         stage.status = 'done'
         if (result.stages[si]) result.stages[si].status = 'done'
         await tickStageFile({ stage, status: 'done', planDir, result, note: `Stage ${stage.id} ("${stage.name}") complete. Files: ${((exec.files || []).join(', ')) || '(none)'}.` })
@@ -4238,7 +4534,7 @@ declaring completion. ${carriedBlockersLine}`,
   if (result.testsPassed) {
     plog('resume: skip Test (testsPassed set)')
   } else {
-    let test = await runTests(testTarget)
+    let test = await runTests(testTarget, testCmd, testFramework)
     let attempts = 0
 
     while ((!test || !test.passed) && useGsdDebug && attempts < debugSubcap && !budgetExhausted(retryBudget)) {
@@ -4301,7 +4597,7 @@ resolves the failures, plus a change summary.`
         break // gsd-debug could not fix -> stop retrying
       }
       phase('Test')
-      test = await runTests(testTarget)
+      test = await runTests(testTarget, testCmd, testFramework)
     }
 
     if (!test || !test.passed) {
