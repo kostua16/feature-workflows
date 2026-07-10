@@ -83,10 +83,15 @@ test('summarizeGates: maps completion flags to done/pending', () => {
   assert.equal(byGate.execute, 'pending')
 })
 
-test('summarizeGates: attributes blockedAt to the matching gate (prefix tolerant)', () => {
+test('summarizeGates: attributes blockedAt to the matching gate (substring tolerant)', () => {
   const rows = summarizeGates({ blockedAt: 'test' })
   const tests = rows.find((r) => r.gate === 'tests')
   assert.equal(tests.status, 'blocked')
+})
+
+test('summarizeGates: compound block reasons hit the owning gate row', () => {
+  const design = summarizeGates({ blockedAt: 'detailed-design' }).find((r) => r.gate === 'design')
+  assert.equal(design.status, 'blocked')
 })
 
 test('summarizeGates: tolerates an empty/undefined result', () => {

@@ -1195,9 +1195,10 @@ function validatePipelineState(state) {
 // must render best-effort, never throw.
 
 // Map the result's completion flags onto a gate list with done/pending/blocked status.
-// `blocked` is attributed by prefix-matching result.blockedAt against the gate name
-// (covers e.g. blockedAt='test' vs gate 'tests'); non-gate block reasons (issues-handoff,
-// uncaught-throw, …) surface in the report header instead.
+// `blocked` is attributed by substring-matching result.blockedAt against the gate name
+// (covers blockedAt='test' vs gate 'tests' AND compound names like 'detailed-design' vs
+// gate 'design'); non-gate block reasons (issues-handoff, uncaught-throw, …) surface in
+// the report header instead.
 function summarizeGates(result) {
   const r = result || {}
   const rows = [
@@ -1220,7 +1221,7 @@ function summarizeGates(result) {
   const blockedAt = String(r.blockedAt || '')
   return rows.map(([gate, done]) => {
     if (done) return { gate, status: 'done' }
-    const blocked = blockedAt && (blockedAt === gate || gate.indexOf(blockedAt) === 0 || blockedAt.indexOf(gate) === 0)
+    const blocked = blockedAt && (blockedAt === gate || gate.includes(blockedAt) || blockedAt.includes(gate))
     return { gate, status: blocked ? 'blocked' : 'pending' }
   })
 }
