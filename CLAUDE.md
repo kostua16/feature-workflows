@@ -1,5 +1,9 @@
 # Claude Code Project Instructions
 
+## Idea
+
+This project shall be a claude code plugin\marketplace app that allows users to run created dynamic workflows created in this project.
+
 ## Mandatory rules for all agents (FOLLOW THESE RULES STRICTLY WITHOUT EXCEPTIONS)
 
 - Always activate the Serena project named `log_analysis` (path: "$CWD") using the Serena `feature-workflows` tool before any code exploration or edits.
