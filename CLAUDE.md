@@ -2,10 +2,16 @@
 
 ## Idea
 
-This project shall be a claude code plugin\marketplace app that allows users to run created dynamic workflows created in this project.
+This repo IS a Claude Code plugin marketplace (`.claude-plugin/marketplace.json`) shipping the
+`feature-workflows` plugin (`plugins/feature-workflows/`): dynamic-workflow-driven feature
+pipeline (commands + agents + engine + skill) that end users install and run in their own projects.
 
 ## Mandatory rules for all agents (FOLLOW THESE RULES STRICTLY WITHOUT EXCEPTIONS)
 
+- The agents named below ship in the `feature-workflows` plugin (for local dogfooding:
+  `/plugin marketplace add ./` then `/plugin install feature-workflows@feature-workflows`).
+  Spawn them by their namespaced name `feature-workflows:<agent>`; the bare names below are
+  shorthand for the namespaced agents.
 - Always activate the Serena project named `feature_workflows` (path: "$CWD") using the Serena `activate-project` tool before any code exploration or edits.
 - Always read `mem:core` to load the current roadmap and project invariants.
 - Always read `mem:handoff` to load the current project state and next recommended actions.

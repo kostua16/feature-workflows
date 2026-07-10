@@ -4,7 +4,7 @@ description: >
   Compress natural-language memory/doc files (CLAUDE.md, todos, notes) into
   caveman format in-session to cut input tokens (~46%), preserving all code,
   URLs, paths, headings, and frontmatter. Like caveman-compress, but the LLM
-  work runs in the CURRENT session via a dedicated `compress-agent` subagent
+  work runs in the CURRENT session via a dedicated `feature-workflows:compress-agent` subagent
   (no out-of-session `claude --print` / API call) and multiple files compress
   IN PARALLEL (one agent per file). Deterministic detection, validation, backup,
   and frontmatter handling stay in local stdlib Node.js (ESM `.mjs`).
@@ -20,7 +20,7 @@ Compressed version overwrites the original. Human-readable backup saved out of
 tree as `<stem>.original.md` under `~/.local/share/caveman-compress/backups/`.
 
 Difference from `caveman-compress`: LLM compression runs **in-session** through
-the `compress-agent` subagent (shares current model/tools/context), and **N files
+the `feature-workflows:compress-agent` subagent (shares current model/tools/context), and **N files
 run in parallel** (N agents in one message). No external `claude` CLI / API call.
 
 ## Trigger
@@ -33,9 +33,9 @@ memory/documentation file(s).
 | Stage | Where | Tokens? |
 |---|---|---|
 | detect file type, guards, backup, frontmatter split | Node `prepare.mjs` | no |
-| compress prose → caveman | `compress-agent` subagent | yes (in-session) |
+| compress prose → caveman | `feature-workflows:compress-agent` subagent | yes (in-session) |
 | reassemble + validate + commit | Node `finalize.mjs` | no |
-| fix only listed errors (≤2 retries) | `compress-agent` subagent | yes (in-session) |
+| fix only listed errors (≤2 retries) | `feature-workflows:compress-agent` subagent | yes (in-session) |
 
 The Node helpers live in `scripts/` adjacent to this SKILL.md. Run them from
 the **skill directory** (the parent of `scripts/`):
@@ -54,8 +54,9 @@ The helpers are next to this SKILL.md. From the skill directory run:
 node scripts/prepare.mjs <abspath>
 ```
 
-If you are unsure of the skill directory path, locate it by finding this
-SKILL.md (search for `compress-md/SKILL.md` under `.claude/skills/`).
+If you are unsure of the skill directory path, it is
+`${CLAUDE_PLUGIN_ROOT}/skills/compress-md` (the skill ships inside the
+feature-workflows plugin; locate this SKILL.md there).
 
 ### 2. Validate + prepare each file (Node, no tokens)
 
@@ -97,7 +98,7 @@ form to one canonical shape):
 
 ### 3. Spawn compress-agents IN PARALLEL (the win)
 
-If more than one file is OK, spawn **one `compress-agent` per file in a single
+If more than one file is OK, spawn **one `feature-workflows:compress-agent` per file in a single
 message** (multiple Agent tool calls in one response) so they run concurrently.
 For each file, build the agent prompt:
 
@@ -137,7 +138,7 @@ Parse output:
 
 ### 5. Fix loop (≤2 retries, per failed file)
 
-For each `INVALID` file, spawn another `compress-agent` (can batch all failed
+For each `INVALID` file, spawn another `feature-workflows:compress-agent` (can batch all failed
 files in one parallel message) with `MODE: FIX`, passing:
 
 - ORIGINAL body (the uncompressed body from step 2)

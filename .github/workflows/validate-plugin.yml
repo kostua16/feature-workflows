@@ -1,0 +1,30 @@
+name: validate-plugin
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Engine version lockstep (plugin.json / engine-version header / meta.version)
+        run: node scripts/validate-plugin-versions.mjs
+      - name: Engine ESM syntax check
+        working-directory: plugins/feature-workflows/workflows
+        run: |
+          # Plain `node --check` parses CommonJS and silently passes invalid ESM.
+          # The sed neutralizes the sandbox-only top-level `return final`.
+          sed 's/^return final$/\/\/ __sandbox_return__ final/' feature-pipeline.js \
+            | node --input-type=module --check
+      - name: Bogus-injection trap (the ESM check itself must be able to fail)
+        run: |
+          if printf 'export const meta={name:"x"}\nNOTVALID ESM !!@#' | node --input-type=module --check 2>/dev/null; then
+            echo "ESM check accepted invalid input — validation recipe is broken" >&2
+            exit 1
+          fi
