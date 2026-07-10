@@ -1,0 +1,19 @@
+# Ignore sample log data (large, not part of source)
+samples/
+
+# Tool artifacts
+.coverage
+*.egg-info
+__pycache__/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Local debug / scratch artifacts
+progress_debug*.py
+progress_debug*.jsonl
+parse_counts.json
+*.Zone.Identifier
+.omc/
+*.zip
