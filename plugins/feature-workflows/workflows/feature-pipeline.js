@@ -1969,7 +1969,8 @@ function normalizeSingleQuotedStrings(text) {
     for (; i < text.length; i++) {
       const inner = text[i]
       if (inner === '\\' && i + 1 < text.length) {
-        value += `\\${text[i + 1]}`
+        const escapedChar = text[i + 1]
+        value += (escapedChar === "'" || escapedChar === '"') ? escapedChar : `\\${escapedChar}`
         i += 1
       } else if (inner === "'") {
         break

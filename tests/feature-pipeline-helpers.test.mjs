@@ -328,3 +328,12 @@ test('repairJsonText preserves single-quoted escape sequences', () => {
     unicode: '\\u2713',
   })
 })
+
+test('repairJsonText unescapes quotes inside single-quoted strings', () => {
+  const extractJson = loadFunction('extractJson')
+
+  assert.deepEqual(extractJson("{summary: 'don\\'t stop', quote: 'say \\\"retry\\\"'}"), {
+    summary: "don't stop",
+    quote: 'say "retry"',
+  })
+})
