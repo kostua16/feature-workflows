@@ -652,16 +652,22 @@ Run this after editing the script (before invoking the Workflow) to confirm it s
 
 ### Phase-label validation (I7)
 
-Every `phase('X')` / `stateCheckpoint('X', …)` title should map to a `meta.phases`
-entry — a stray label (e.g. two distinct gates both emitting `'Detailed Design'`,
-or a chunker re-using a design label) silently collides the progress-tree grouping
-and mislabels the pipeline log. Catch this at CI time:
+Every `phase('X')` / `stateCheckpoint('X', …)` title — and every literal
+`phase: 'X'` option on an `agent()` call (cross-cutting groups like `Enhance`,
+`Checkpoint`, `Decide` are attributed to the progress tree only this way) —
+should map to a `meta.phases` entry. A stray label (e.g. two distinct gates both
+emitting `'Detailed Design'`, or a chunker re-using a design label) silently
+collides the progress-tree grouping and mislabels the pipeline log. Catch this
+at CI time:
 
 ```bash
 cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
-# 1. labels actually emitted by the script (phase('...') + stateCheckpoint('...', ...))
-grep -oE "(phase|stateCheckpoint)\('[^']+'" feature-pipeline.js \
-  | sed -E "s/.*'([^']+)'/\1/" | sort -u > /tmp/used.txt
+# 1. labels actually emitted by the script:
+#    phase('...') + stateCheckpoint('...', ...) calls AND literal phase: '...' agent() opts
+{ grep -oE "(phase|stateCheckpoint)\('[^']+'" feature-pipeline.js \
+    | sed -E "s/.*'([^']+)'/\1/"
+  grep -oE "\bphase: *'[^']+'" feature-pipeline.js \
+    | sed -E "s/.*'([^']+)'/\1/"; } | sort -u > /tmp/used.txt
 # 2. titles declared in meta.phases
 sed -n "/^  phases:/,/^  }/p" feature-pipeline.js \
   | grep -oE "title: *'[^']+'" | sed -E "s/.*'([^']+)'/\1/" | sort -u > /tmp/declared.txt

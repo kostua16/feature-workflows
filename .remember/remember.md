@@ -1,25 +1,31 @@
-# Handoff — 2026-07-10
+# Handoff — 2026-07-10 (branch claude/busy-maxwell-9e40dc)
 
 ## What happened this session
-Project initialization / onboarding for `feature-workflows` (a Claude Code
-workflow-orchestration framework, not an app).
+Fixed the phase-label validation gap for the 'Enhance' phase in the
+feature-pipeline workflow engine (`plugins/feature-workflows/workflows/`,
+the canonical source after main's plugin-layout migration):
 
-Created:
-- `README.md` — describes the repo (engine, modes, invariants, edit/validate flow).
-- 7 Serena memories (the set `CLAUDE.md` reads on startup): `core`, `handoff`,
-  `session_start`, `task_completion`, `suggested_commands`, `memory_maintenance`, `conventions`.
+- `feature-pipeline.md` — extended the "Phase-label validation (I7)" recipe to
+  also collect literal `phase: '...'` opts on `agent()` calls (previously it
+  only grepped `phase('...')`/`stateCheckpoint('...')`, so 'Enhance' looked
+  declared-but-unused).
+- `feature-pipeline.js` — the extended check surfaced 'Checkpoint' and 'Decide'
+  as used-but-undeclared; added both to `meta.phases`.
+- Verified: ESM check recipe passes; phase-label check is clean in BOTH
+  directions (undeclared=0, declared-but-unused=0).
+
+Branch also carries earlier plugin-layout migration prep (AGENT_NS/nsAgent
+namespacing, meta.version, docs path updates to plugins/feature-workflows/...).
 
 ## State
-- Fresh repo, single commit. Worktree branch `claude/project-initialization-442534`.
-- Nothing committed this session (README + memories are uncommitted / memories live in
-  `.serena/memories/`).
+- All changes committed on `claude/busy-maxwell-9e40dc`; PR opened to main
+  (see gh for URL). Merged latest main (plugin-marketplace-layout migration,
+  PR #1) into this branch to resolve conflicts — only real conflict was in
+  `plugins/feature-workflows/workflows/feature-pipeline.md` (same section
+  edited both sides); kept the fixed recipe. Everything else auto-merged via
+  git rename detection since main moved `.claude/workflows/*` and
+  `.claude/agents|commands|skills/*` into `plugins/feature-workflows/`.
 
-## Open items (not blocking)
-1. `CLAUDE.md` has stale references — a `log_analysis` Serena project name and a nonexistent
-   log-analysis Python app. Reconciling edits user-authored mandatory rules → confirm with the
-   user before changing.
-2. If continuing from the main checkout (not this worktree), re-verify the Serena memories are
-   visible there.
-
-## Next
-- Await user direction. Optional: reconcile CLAUDE.md; commit README; add `docs/` doc suite.
+## Open items (carried over, not blocking)
+1. `CLAUDE.md` stale refs (`log_analysis` Serena project, nonexistent Python
+   app) — user-authored rules, confirm before editing.
