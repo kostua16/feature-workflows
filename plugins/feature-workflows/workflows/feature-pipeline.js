@@ -1,5 +1,5 @@
 // feature-pipeline.js
-// engine-version: 1.1.0
+// engine-version: 1.2.0
 // Gate-enforcing pipeline for new features / bug-fixes.
 //
 // Enhancements:
@@ -20,8 +20,8 @@
 
 export const meta = {
   name: 'feature-pipeline',
-  version: '1.1.0',
-  description: '1 engine + 3 modes (design/implement/tune) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). Durable cross-mode state via pipeline-state.json.',
+  version: '1.2.0',
+  description: '1 engine + 4 modes (design/implement/tune/status) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). Durable cross-mode state via pipeline-state.json; status mode renders it read-only.',
   phases: [
     { title: 'Categorize' },
     { title: 'Translate' },
@@ -721,8 +721,8 @@ const PIPELINE_STATE = {
     planDir: { type: 'string' },
     lastGate: { type: 'string', description: 'Most recent gate reached' },
     checksum: { type: 'string', description: 'IM-1: djb2 hash of JSON.stringify(result), verified on resume (validatePipelineState) to detect a truncated chunked write. Optional — pre-checksum state files still resume.' },
-    result: { type: 'object', description: 'Full pipeline result object (verbatim). Phase F-K split adds optional fields inside result: mode (design|implement|tune), stages[], designReady, issuesPath, tunePlan, handoff. All default so pre-split state still hydrates.' },
-    config: { type: 'object', description: 'args-derived flags, so resume re-derives without re-parsing. Gains mode/useChunker/useIssues/useTuneConfirm (Phase F-K).' },
+    result: { type: 'object', description: 'Full pipeline result object (verbatim). Phase F-K split adds optional fields inside result: mode (design|implement|tune), stages[], designReady, issuesPath, tunePlan, handoff. v1.2.0 adds gateTelemetry (per-gate agent-call counters), designApproved + approvalPending (human design-approval checkpoint). All default so older state still hydrates.' },
+    config: { type: 'object', description: 'args-derived flags, so resume re-derives without re-parsing. Gains mode/useChunker/useIssues/useTuneConfirm (Phase F-K); useApproval (v1.2.0).' },
   },
 }
 
@@ -987,7 +987,7 @@ function gm(key) {
 // On --resume with an explicit different mode (e.g. implement after design), the explicit
 // arg wins so the user can drive the design->implement->tune cycle from the command line.
 function resolveMode(args, persistedConfig, resumed) {
-  const VALID = { design: true, implement: true, tune: true }
+  const VALID = { design: true, implement: true, tune: true, status: true }
   if (args && args.mode && VALID[args.mode]) return args.mode
   if (persistedConfig && persistedConfig.mode && VALID[persistedConfig.mode]) return persistedConfig.mode
   if (resumed && resumed.result && resumed.result.mode && VALID[resumed.result.mode]) return resumed.result.mode
@@ -1190,6 +1190,108 @@ function validatePipelineState(state) {
   return { ok: errors.length === 0, errors }
 }
 
+// Status-report helpers (status mode). All three are pure and defensive against results
+// hydrated from older pipeline-state.json files (any flag may be absent) — a status query
+// must render best-effort, never throw.
+
+// Map the result's completion flags onto a gate list with done/pending/blocked status.
+// `blocked` is attributed by prefix-matching result.blockedAt against the gate name
+// (covers e.g. blockedAt='test' vs gate 'tests'); non-gate block reasons (issues-handoff,
+// uncaught-throw, …) surface in the report header instead.
+function summarizeGates(result) {
+  const r = result || {}
+  const rows = [
+    ['define', !!r.definitionPath],
+    ['requirements', !!r.requirementsPath],
+    ['architecture', !!r.archPath],
+    ['design', !!r.designPath],
+    ['plan', !!(r.planned || r.planAccepted)],
+    ['tdd', !!r.tddEnforced],
+    ['reconcile', !!r.reconcile],
+    ['chunker', !!(Array.isArray(r.stages) && r.stages.length)],
+    ['design-ready', !!r.designReady],
+    ['execute', !!r.executed],
+    ['tests', !!r.testsPassed],
+    ['code-review', !!r.codeReview],
+    ['goalkeeper', !!r._goalkeeper],
+    ['ready', !!r.ready],
+    ['commit', !!r.committed],
+  ]
+  const blockedAt = String(r.blockedAt || '')
+  return rows.map(([gate, done]) => {
+    if (done) return { gate, status: 'done' }
+    const blocked = blockedAt && (blockedAt === gate || gate.indexOf(blockedAt) === 0 || blockedAt.indexOf(gate) === 0)
+    return { gate, status: blocked ? 'blocked' : 'pending' }
+  })
+}
+
+// Derive the exact next command for a persisted run. Precedence: a committed run needs
+// nothing; an explicit handoff (set at every mode boundary) is the most precise directive;
+// then readiness, block state, and design progress in that order.
+function deriveNextCommand(state) {
+  const s = state || {}
+  const r = s.result || {}
+  const planDir = s.planDir || r.planDir || '<planDir>'
+  if (r.committed) return { command: '(none)', reason: 'run committed — pipeline complete' }
+  const handoff = r.handoff
+  if (handoff && handoff.nextMode) {
+    const dir = handoff.planDir || planDir
+    const command = handoff.nextMode === 'implement' ? `/implement-feature ${dir}`
+      : handoff.nextMode === 'tune' ? `/tune-feature ${dir}`
+      : `/design-feature --resume ${dir}`
+    return { command, reason: handoff.message || `handoff from ${handoff.from || 'pipeline'}` }
+  }
+  if (r.ready) return { command: `/implement-feature ${planDir} --auto-commit`, reason: 'implementation ready; commit pending' }
+  if (r.blockedAt) {
+    const mode = r.mode || (s.config && s.config.mode) || 'design'
+    const command = mode === 'implement' ? `/implement-feature ${planDir}`
+      : mode === 'tune' ? `/tune-feature ${planDir}`
+      : `/design-feature --resume ${planDir}`
+    return { command, reason: `blocked at ${r.blockedAt} — resume after addressing it` }
+  }
+  if (r.designReady && !r.executed) return { command: `/implement-feature ${planDir}`, reason: 'design ready; implementation not started' }
+  return { command: `/design-feature --resume ${planDir}`, reason: 'design incomplete — resume design' }
+}
+
+// Render the full human-readable status report for a persisted run: header, gate table,
+// stage table, budgets, telemetry, open questions/issues, and the exact next command.
+// `validation` (optional, from validatePipelineState) downgrades to a warning line —
+// inspecting a corrupt/stuck run is exactly when a status report is most needed.
+function renderStatusReport(state, validation) {
+  const s = state || {}
+  const r = s.result || {}
+  const c = s.config || {}
+  const lines = []
+  lines.push(`Pipeline status — ${s.planDir || r.planDir || '(unknown planDir)'}`)
+  if (validation && validation.ok === false) {
+    lines.push(`WARNING: pipeline-state.json failed validation (${(validation.errors || []).join('; ')}) — report is best-effort`)
+  }
+  const task = String(s.task || r.task || '(unknown task)')
+  lines.push(`Task: ${task.length > 200 ? task.slice(0, 200) + '…' : task}`)
+  const cursor = r._state || {}
+  lines.push(`Mode: ${r.mode || c.mode || '(unknown)'} | profile: ${c.profile || 'full'} | lastGate: ${cursor.lastGate || s.lastGate || '(none)'}${cursor.status ? ` (${cursor.status})` : ''} | blockedAt: ${r.blockedAt || '(none)'}`)
+  lines.push('Gates:')
+  for (const g of summarizeGates(r)) {
+    lines.push(`  ${g.status === 'done' ? '[x]' : g.status === 'blocked' ? '[!]' : '[ ]'} ${g.gate}`)
+  }
+  const stages = Array.isArray(r.stages) ? r.stages : []
+  if (stages.length) {
+    lines.push('Stages:')
+    for (const st of stages) {
+      lines.push(`  ${(st && st.id) || '(?)'} [${(st && st.status) || 'pending'}] ${(st && st.name) || ''} — ${((st && st.files) || []).length} file(s)`)
+    }
+  }
+  lines.push(`Budgets: retries ${r.retryUsed || 0}/${c.retryBudget || '?'}, decisions ${r.decisionUsed || 0}/${c.decisionCap || '?'}`)
+  for (const line of renderTelemetrySummary(r.gateTelemetry, r.degradationTelemetry)) lines.push(line)
+  if (r.openQuestionsPath) lines.push(`Open questions: ${r.openQuestionsPath}`)
+  if (r.needsClarification) lines.push('Needs clarification: yes (unresolved interview answers)')
+  if (r.issuesPath) lines.push(`Issues file: ${r.issuesPath}`)
+  if (r._uncaughtError) lines.push(`Last error: ${r._uncaughtError}`)
+  const next = deriveNextCommand(s)
+  lines.push(`Next: ${next.command} — ${next.reason}`)
+  return lines.join('\n')
+}
+
 // R6: persist the durable pipeline-state JSON to <planDir>/pipeline-state.json
 // via the file-writer agent. This is the --resume substrate: every consolidate
 // boundary (success + each hard-block exit) flushes the latest result + config
@@ -1290,6 +1392,11 @@ async function chunkPlanIntoStages({ planPath, planDir, task, result, lanes }) {
   const laneHint = lanes && lanes.length
     ? `The plan already declares these file-disjoint lanes (collapse each lane INTO a stage, or group file-disjoint lanes into one stage): ${JSON.stringify(lanes.map((l) => ({ name: l.name, files: l.files || [] })))}`
     : 'No lanes declared — chunk by dependency boundaries.'
+  // A pending stage-boundary edit request (user answer from the design-approval
+  // checkpoint) steers the re-chunk; consumed on success so it applies exactly once.
+  const editHint = result && result._stageEditRequest
+    ? `\n\nUSER STAGE-BOUNDARY EDITS (a human reviewed the previous stage split and requested these changes — apply them when decomposing):\n${result._stageEditRequest}`
+    : ''
   const chunk = await safeAgent(
     `You are the plan-chunker agent. Decompose the plan at ${planPath} into smaller, dependency-aware
 execution stages so each stage fits one implement pass. Write each stage as a separate stageNN.md file
@@ -1299,7 +1406,7 @@ references pointing to the created stage files (do not duplicate the stage bodie
 Task:
 ${task}
 
-${laneHint}
+${laneHint}${editHint}
 
 Each stage file must state: its name, the ordered steps it owns (verbatim from the plan), the exact
 source files it will touch, dependencies on earlier stages, and its own exit criteria / tests.
@@ -1312,6 +1419,7 @@ and the source files it owns.`,
     result
   )
   if (chunk && chunk.stages && chunk.stages.length) {
+    if (result && result._stageEditRequest) result._stageEditRequest = null
     plogFromResult(result, `plan-chunker: ${chunk.stages.length} stage(s) written under ${planDir}`)
     return chunk.stages
   }
@@ -1324,6 +1432,29 @@ and the source files it owns.`,
     status: 'pending',
     files: (lanes || []).flatMap((l) => l.files || []),
   }]
+}
+
+// Blocking subset of code-review findings: only blocker/high severity blocks the run
+// (medium/low findings are informational and never gate).
+function selectBlockingFindings(blockers) {
+  return (Array.isArray(blockers) ? blockers : []).filter(
+    (b) => b && (b.severity === 'blocker' || b.severity === 'high')
+  )
+}
+
+// The issues-handoff directive shown when upstream-rooted findings were recorded for
+// /tune-feature. `from` names the source gate (goalkeeper loop-back or code-review
+// blockers) — single source of truth for the /tune-feature hint text.
+function buildIssuesHandoff(planDir, upstreamCount, from) {
+  return {
+    from: 'implement',
+    message: upstreamCount > 0
+      ? `Upstream defect found by ${from} (${upstreamCount} upstream issue(s) written to ${planDir}issues-and-improvements.md). Run: /tune-feature ${planDir}`
+      : `Upstream-flagged defect recorded by ${from} but none classified upstream. Review the findings; re-run /implement-feature ${planDir} after fixing, or /tune-feature ${planDir} to revisit design.`,
+    nextMode: 'tune',
+    planDir,
+    upstreamCount,
+  }
 }
 
 // classifyAndRecordIssue (Phase I, implement): classify ONE code-review/goalkeeper finding as
@@ -1678,6 +1809,8 @@ async function flexibleAgent(prompt, opts, result) {
     }
     return fallbackForAgent(callOpts)
   }
+  bumpGateTelemetry(result, callOpts, 'call', callOpts && callOpts.model)
+  if (callOpts && callOpts.escalatedFrom) bumpGateTelemetry(result, callOpts, 'escalation')
   const effectivePrompt = hardenForModel(prompt, callOpts && callOpts.schema, callOpts && callOpts.model)
   let out = null
   let schemaFailed = false
@@ -1717,6 +1850,7 @@ async function flexibleAgent(prompt, opts, result) {
   }
 
   const jsonPrompt = `${effectivePrompt}\n\nIMPORTANT: Return ONLY a single JSON object matching the expected structure. Do NOT include markdown fences, explanations, or prose. The JSON must be parseable by JSON.parse().`
+  bumpGateTelemetry(result, callOpts, 'retry')
   try {
     // Strip the schema property entirely so the fallback call is treated as plain text.
     const { schema: _unused, ...plainOpts } = callOpts
@@ -1791,6 +1925,7 @@ function recordAgentFailure(result, opts, reason) {
   result.agentFailures[key] = current
   if (!result.degradationTelemetry) result.degradationTelemetry = { fallbacks: 0, escalations: 0, languageViolations: 0, circuitBreakers: 0 }
   result.degradationTelemetry.fallbacks += 1
+  bumpGateTelemetry(result, opts, 'fallback')
   if (reason === 'non-English verdict') result.degradationTelemetry.languageViolations += 1
   if (current.count === 2) result.degradationTelemetry.escalations += 1
   if (current.circuitOpen) result.degradationTelemetry.circuitBreakers += 1
@@ -1802,6 +1937,52 @@ function recordAgentFailure(result, opts, reason) {
 
 function agentFailureKey(opts) {
   return `${(opts && opts.phase) || 'unknown'}:${(opts && opts.label) || 'agent'}`
+}
+
+// Per-gate telemetry: counts agent calls, plain-JSON retries, model escalations, and
+// fallback verdicts under the gate (opts.phase) that made the call, plus a per-model call
+// histogram. Turns "the pipeline is slow/expensive" into per-gate data. Buckets are created
+// lazily so results hydrated from older pipeline-state.json files (no gateTelemetry field)
+// pick up counting mid-run without a migration.
+function bumpGateTelemetry(result, opts, event, model) {
+  if (!result) return
+  if (!result.gateTelemetry || typeof result.gateTelemetry !== 'object') result.gateTelemetry = {}
+  const gate = (opts && opts.phase) || 'unknown'
+  const bucket = result.gateTelemetry[gate] || { calls: 0, retries: 0, escalations: 0, fallbacks: 0, models: {} }
+  if (event === 'call') {
+    bucket.calls += 1
+    const modelName = String(model || '(default)')
+    if (!bucket.models || typeof bucket.models !== 'object') bucket.models = {}
+    bucket.models[modelName] = (bucket.models[modelName] || 0) + 1
+  } else if (event === 'retry') {
+    bucket.retries += 1
+  } else if (event === 'escalation') {
+    bucket.escalations += 1
+  } else if (event === 'fallback') {
+    bucket.fallbacks += 1
+  }
+  result.gateTelemetry[gate] = bucket
+}
+
+// Render per-gate telemetry as log lines plus a degradation trailer (degradationTelemetry
+// counters were previously recorded but never surfaced). Returns [] when nothing was
+// recorded so call sites can print unconditionally.
+function renderTelemetrySummary(gateTelemetry, degradationTelemetry) {
+  const lines = []
+  const gates = Object.keys(gateTelemetry || {})
+  if (gates.length) {
+    lines.push('Telemetry (per gate):')
+    for (const gate of gates) {
+      const b = gateTelemetry[gate] || {}
+      const models = Object.keys(b.models || {}).map((m) => `${m} x${b.models[m]}`).join(', ') || '(default)'
+      lines.push(`  ${gate}: calls=${b.calls || 0} retries=${b.retries || 0} escalations=${b.escalations || 0} fallbacks=${b.fallbacks || 0} models=[${models}]`)
+    }
+  }
+  const d = degradationTelemetry
+  if (d && ((d.fallbacks || 0) + (d.escalations || 0) + (d.languageViolations || 0) + (d.circuitBreakers || 0) > 0)) {
+    lines.push(`Degradations: fallbacks=${d.fallbacks || 0} escalations=${d.escalations || 0} languageViolations=${d.languageViolations || 0} circuitBreakers=${d.circuitBreakers || 0}`)
+  }
+  return lines
 }
 
 function outputLanguageViolation(value) {
@@ -2610,6 +2791,7 @@ const LOOPBACK_FLAG_MAP = {
   design: ['designPath', '_design', '_reviewedDesign', 'planned', '_plan', 'tddEnforced', 'reconcile', '_reviewedPlan', 'planAccepted', 'forceAccepted', 'carriedBlockers', 'executed', 'testsPassed', 'ready', 'codeReview', '_goalkeeper', '_loopBack'],
   plan: ['planned', '_plan', 'tddEnforced', 'reconcile', '_reviewedPlan', 'planAccepted', 'forceAccepted', 'carriedBlockers', 'executed', 'testsPassed', 'ready', 'codeReview', '_goalkeeper', '_loopBack'],
   tests: ['testsPassed', 'ready', 'codeReview', '_goalkeeper', '_loopBack'],
+  execute: ['executed', 'testsPassed', 'ready', 'codeReview', '_goalkeeper', '_loopBack'],
 }
 function clearGateAndDownstream(result, targetPhase) {
   if (!result) return
@@ -2623,6 +2805,61 @@ function clearGateAndDownstream(result, targetPhase) {
   // Reset post-execute state so re-run is faithful.
   result.ready = false
   if ('testsPassed' in result) result.testsPassed = false
+}
+
+// Canonicalize a user-supplied --from-gate target onto a LOOPBACK_FLAG_MAP key.
+// Accepts common shorthands; returns null for anything unknown so the caller can
+// reject with the valid-key list instead of silently clearing nothing.
+function normalizeGateTarget(name) {
+  const raw = String(name || '').trim().toLowerCase()
+  if (!raw) return null
+  const aliases = { arch: 'architecture', test: 'tests', 'detailed-design': 'design', exec: 'execute' }
+  const key = aliases[raw] || raw
+  return LOOPBACK_FLAG_MAP[key] ? key : null
+}
+
+// Re-arm ONE stage for re-execution (--stage): flip it back to pending and clear the
+// post-execute result flags — a re-run of any stage stales the whole-run test/review/
+// goalkeeper verdicts, which must be re-earned over the fresh diff. Other stages keep
+// their done status (the execute loop skips them). Returns false on an unknown stage id.
+function resetStageForRerun(result, stageId) {
+  if (!result || !Array.isArray(result.stages)) return false
+  const target = result.stages.find((st) => st && st.id === stageId)
+  if (!target) return false
+  target.status = 'pending'
+  for (const flag of ['executed', 'testsPassed', 'ready', 'codeReview', '_goalkeeper', '_loopBack']) {
+    if (flag in result) result[flag] = null
+  }
+  result.ready = false
+  result.testsPassed = false
+  return true
+}
+
+// Apply a user's design-approval decision. Workflow subagents cannot use AskUserQuestion,
+// so the engine only STOPS at the approval checkpoint; the /design-feature command (a
+// top-level prompt, which can ask the user) collects the decision and re-invokes with
+// approveDesign / stageEdits / rejectToPlan. This helper mutates only the approval fields;
+// the caller performs the impure follow-ups (gate clearing, chunker re-run). Returns the
+// action the caller must take, or null when no decision was supplied. Idempotent: a repeat
+// approve on an already-approved result is harmless.
+function applyApprovalDecision(result, decision) {
+  if (!result || !decision) return null
+  if (decision.approve) {
+    result.designApproved = { approved: true, by: 'user', seq: (result._state && result._state.seq) || 0 }
+    result.approvalPending = false
+    return 'approved'
+  }
+  if (decision.rejectToPlan) {
+    result.designApproved = null
+    result.approvalPending = false
+    return 'rerun-plan'
+  }
+  if (decision.stageEdits) {
+    result.designApproved = null
+    result.approvalPending = false
+    return 'edit-stages'
+  }
+  return null
 }
 
 // EN-4: append-only audit trail guard. The audit files (review-history.md, decisions.md,
@@ -2726,6 +2963,43 @@ async function main() {
   // When set, args.task is optional (resolved from the persisted state). Slug-only resume
   // is no longer supported — the path is the sole resume format.
   const resumeArg = args && args.resume
+
+  // Status mode: read-only inspection of a persisted run. Loads + validates the state,
+  // renders a report, and returns WITHOUT consolidate/stateCheckpoint/failed-launch
+  // writes — a status query must never mutate (or even touch) the run it inspects.
+  // Only an explicit args.mode can select it (status is never persisted into config).
+  if (args && args.mode === 'status') {
+    if (!resumeArg) {
+      return {
+        mode: 'status',
+        ready: false,
+        blockedAt: 'missing-plan-dir',
+        statusReport: 'status mode requires a <planDir>. Usage: /pipeline-status <planDir>',
+        logLines: ['main: status mode invoked without a planDir'],
+      }
+    }
+    const statusDir = resumeArg.replace(/(^|\/)plan\.md$/, '$1').replace(/\/$/, '') + '/'
+    const loaded = await loadPipelineState(statusDir)
+    const state = loaded && loaded.state
+    if (!state) {
+      return {
+        mode: 'status',
+        planDir: statusDir,
+        ready: false,
+        blockedAt: 'resume-no-state',
+        statusReport: `No pipeline-state.json at ${statusDir} — nothing to report. Run /design-feature to start a run.`,
+        logLines: [`main: status mode found no pipeline-state.json at ${statusDir}`],
+      }
+    }
+    const validation = validatePipelineState(state)
+    return {
+      mode: 'status',
+      planDir: statusDir,
+      ready: true,
+      statusReport: renderStatusReport(state, validation),
+      logLines: [`main: status report rendered for ${statusDir}${validation.ok ? '' : ' (state failed validation — best-effort)'}`],
+    }
+  }
 
   // An explicit --plan is authoritative on fresh runs only. On resume the planDir comes
   // from args.resume itself; --plan is ignored on resume.
@@ -2893,8 +3167,11 @@ async function main() {
     useChunker: cfgFlag(args && args.useChunker, persistedConfig.useChunker, true),
     // Phase I: issues-and-improvements.md handoff (implement -> tune). --no-issues = hard-block instead.
     useIssues: cfgFlag(args && args.useIssues, persistedConfig.useIssues, true),
-    // Phase J: tune AskUserQuestion confirmation. --no-confirm runs the derived plan directly.
+    // Phase J: tune confirmation checkpoint. --no-confirm runs the derived plan directly.
     useTuneConfirm: cfgFlag(args && args.useTuneConfirm, persistedConfig.useTuneConfirm, true),
+    // Human design-approval checkpoint at the design-stop. Opt-in (--approval); persisted
+    // so the implement run of an approval-gated design honors it too.
+    useApproval: cfgFlag(args && args.useApproval, persistedConfig.useApproval, false),
   }
 
   // R4 adopted-agent gates (full path only; default ON, disable via flags).
@@ -2925,6 +3202,7 @@ async function main() {
   const useChunker = config.useChunker
   const useIssues = config.useIssues
   const useTuneConfirm = config.useTuneConfirm
+  const useApproval = config.useApproval
   const isDesignMode = mode === 'design'
   const isImplementMode = mode === 'implement'
   const isTuneMode = mode === 'tune'
@@ -3026,6 +3304,8 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (result.issuesPath === undefined) result.issuesPath = null
     if (result.tunePlan === undefined) result.tunePlan = null
     if (result.handoff === undefined) result.handoff = null
+    if (result.designApproved === undefined) result.designApproved = null
+    if (result.approvalPending === undefined) result.approvalPending = false
     if (!result.logLines) result.logLines = []
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
     const resumeRepairs = await repairResumeArtifactFlags(result)
@@ -3093,6 +3373,7 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       committed: false,
       commitHash: null,
       blockedAt: null,
+      gateTelemetry: {}, // per-gate agent-call counters {gate: {calls,retries,escalations,fallbacks,models}}
       logLines: [], // R5: in-memory pipeline log; flushed to <planDir>/pipeline.log at consolidate points
       // Phase F-K (pipeline split): the 3-mode shared contract. All optional/default so
       // pre-split pipeline-state.json hydrates without breakage (backward-compat).
@@ -3102,6 +3383,8 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       issuesPath: null, // implement sets on upstream-defect handoff; tune consumes
       tunePlan: null, // tune: derived minimal gate-revisit plan (TUNE_PLAN_VERDICT)
       handoff: null, // handoff directive shown to user at mode boundaries (design->implement, implement->tune)
+      designApproved: null, // human sign-off {approved,by,seq} recorded at the design-approval checkpoint
+      approvalPending: false, // design stopped awaiting the human decision (--approval)
     }
   }
 
@@ -3118,6 +3401,106 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
   // gateDone: resume self-skip helper. Returns true (and logs) if the gate's
   // completion flag is already set, so the gate body can skip its agent call.
   const gateDone = (flag) => { if (result[flag]) { plog(`resume: skip gate (${flag} set)`); return true } return false }
+
+  // Surface the per-gate agent-call telemetry at terminal exits so users can see where a
+  // run spent its calls/retries/escalations (and how much rode on fallbacks) without
+  // reading raw pipeline-state.json.
+  const logTelemetrySummary = () => {
+    for (const line of renderTelemetrySummary(result.gateTelemetry, result.degradationTelemetry)) plog(line)
+  }
+
+  // Deterministic user-driven rewinds. Both are ONE-SHOT args — read from args only,
+  // never persisted into config — so a later plain --resume cannot silently re-clear.
+  //  - --from-gate: clear a gate + its downstream completion flags (same machinery as
+  //    the goalkeeper loop-back) so those gates re-run on this invocation.
+  //  - --stage: re-arm exactly one done stage (implement mode) after a manual edit.
+  // Invalid values block WITHOUT consolidate: nothing ran, so the persisted state must
+  // stay untouched.
+  const fromGateArg = (args && args.fromGate) || ''
+  if (fromGateArg) {
+    const target = normalizeGateTarget(fromGateArg)
+    const isDesignTarget = target === 'requirements' || target === 'architecture' || target === 'design' || target === 'plan'
+    if (!target) {
+      const valid = Object.keys(LOOPBACK_FLAG_MAP).join(', ')
+      plog(`--from-gate: unknown gate "${fromGateArg}" (valid: ${valid}) — nothing cleared, blocking`)
+      result.blockedAt = 'bad-args'
+      result.handoff = { from: mode, message: `--from-gate=${fromGateArg} is not a valid gate. Valid targets: ${valid}.`, nextMode: mode, planDir }
+      return result
+    }
+    if (isDesignTarget && isImplementMode) {
+      plog(`--from-gate=${target}: design-gate rewinds are not valid in implement mode — blocking`)
+      result.blockedAt = 'bad-args'
+      result.handoff = { from: mode, message: `--from-gate=${target} targets a design gate. Use /design-feature --resume ${planDir} --from-gate=${target} (or /tune-feature) — implement mode cannot re-run design gates.`, nextMode: 'design', planDir }
+      return result
+    }
+    clearGateAndDownstream(result, target)
+    if (isDesignTarget) result.designReady = false // the design-stop must be re-earned
+    plog(`--from-gate=${target}: cleared gate + downstream completion flags (deterministic rewind)`)
+  }
+  const stageArg = (args && args.stage) || ''
+  if (stageArg) {
+    if (!isImplementMode) {
+      plog(`--stage is only valid in implement mode (mode=${mode}) — blocking`)
+      result.blockedAt = 'bad-args'
+      result.handoff = { from: mode, message: `--stage=${stageArg} is only valid with /implement-feature <planDir>.`, nextMode: 'implement', planDir }
+      return result
+    }
+    if (!resetStageForRerun(result, stageArg)) {
+      const known = (Array.isArray(result.stages) ? result.stages : []).map((st) => st && st.id).filter(Boolean).join(', ') || '(none)'
+      plog(`--stage: unknown stage id "${stageArg}" (known: ${known}) — blocking`)
+      result.blockedAt = 'bad-args'
+      result.handoff = { from: mode, message: `--stage=${stageArg} does not match a stage. Known stage ids: ${known}.`, nextMode: 'implement', planDir }
+      return result
+    }
+    plog(`--stage=${stageArg}: stage re-armed (pending); post-execute verdicts cleared — tests/review/goalkeeper re-run over the fresh diff`)
+  }
+
+  // Design-approval decision args (one-shot). Supplied by the /design-feature command after
+  // it asked the user — the engine's awaiting-approval stop carries the re-invoke recipes.
+  if (isDesignMode) {
+    const approvalAction = applyApprovalDecision(result, {
+      approve: !!(args && args.approveDesign),
+      rejectToPlan: !!(args && args.rejectToPlan),
+      stageEdits: (args && args.stageEdits) || '',
+    })
+    if (approvalAction === 'approved') {
+      plog('Design approval: user approved the staged design')
+    } else if (approvalAction === 'rerun-plan') {
+      clearGateAndDownstream(result, 'plan')
+      result.stages = [] // the stage split derives from the plan — re-chunk after re-planning
+      result.designReady = false
+      plog('Design approval: user rejected back to Plan — plan + downstream gates and the stage split will re-run')
+    } else if (approvalAction === 'edit-stages') {
+      result._stageEditRequest = String(args.stageEdits)
+      result.stages = []
+      result.designReady = false
+      plog('Design approval: user requested stage-boundary edits — plan-chunker re-runs with the edit request')
+    }
+  }
+
+  // Tune-confirmation decision args (one-shot). Supplied by the /tune-feature command
+  // after it asked the user at the tune-awaiting-confirm stop.
+  if (isTuneMode && args && args.cancelTune) {
+    result.blockedAt = 'tune-cancelled'
+    result.handoff = {
+      from: 'tune',
+      message: `Tune cancelled by user. Re-run /tune-feature ${planDir} when ready.`,
+      nextMode: 'tune',
+      planDir,
+    }
+    plog('Tune: user cancelled the revisit plan — stopping')
+    stateCheckpoint('Tune', 'cancelled')
+    await consolidate(slug, result, config)
+    return result
+  }
+  if (isTuneMode && args && args.confirmTune) {
+    result.tuneConfirmed = true
+    const finalGates = Array.isArray(args.finalGates)
+      ? args.finalGates.filter((g) => LOOPBACK_FLAG_MAP[g] && g !== 'tests' && g !== 'execute')
+      : []
+    if (finalGates.length && result.tunePlan) result.tunePlan.planGates = finalGates
+    plog(`Tune: user confirmed the revisit plan${finalGates.length ? ` (finalGates=[${finalGates.join(', ')}])` : ''}`)
+  }
 
   // Safety net: wrap the entire pipeline body so ANY throw escaping a gate (beyond safeAgent's
   // coverage — e.g. a throw in non-agent code, or a future gate without the wrapper) still
@@ -3153,48 +3536,27 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       const gatesList = (tunePlan.planGates || []).join(', ')
       plog(`Tune: derived plan — gates=[${gatesList}]; preserveStages=${(tunePlan.preserveStages || []).join(', ')}`)
 
-      // Confirm the derived plan with the user (AskUserQuestion), unless disabled or already confirmed.
-      // useTuneConfirm default ON (--no-confirm runs directly). On resume with result.tuneConfirmed we
-      // skip re-confirming.
+      // Confirm the derived plan with the user, unless disabled or already confirmed.
+      // Workflow subagents cannot use AskUserQuestion, so the engine STOPS here with the
+      // re-invoke recipes; the /tune-feature command asks the user and re-invokes with
+      // confirmTune (optionally finalGates) or cancelTune — applied pre-gate in main().
+      // useTuneConfirm default ON (--no-confirm runs directly). On resume with
+      // result.tuneConfirmed set we skip re-confirming.
       if (useTuneConfirm && !result.tuneConfirmed) {
-        const confirmed = await safeAgent(
-          `You are the tune-confirmation agent. Confirm the following tune gate-revisit plan with the user
-via AskUserQuestion. Present the derived gates + preserved stages; offer to run as-is, edit (the user
-replies with a corrected gate set), or cancel.
-
-Derived gates to revisit (in order): ${gatesList}
-Issue refs: ${(tunePlan.issueRefs || []).join('; ') || '(none)'}
-Stages preserved (not invalidated): ${(tunePlan.preserveStages || []).join(', ') || '(none)'}
-Plan dir: ${planDir}
-
-If the user approves (as-is or edited), set confirmed=true and record the FINAL gate list in finalGates
-(defaults to the derived planGates if approved as-is). If cancelled, set confirmed=false.`,
-          { label: 'tune-confirm', phase: 'Tune', schema: {
-            type: 'object', additionalProperties: false,
-            required: ['confirmed'],
-            properties: {
-              confirmed: { type: 'boolean', description: 'true if the user approved the revisit plan' },
-              finalGates: { type: 'array', items: { type: 'string', enum: ['requirements', 'architecture', 'design', 'plan'] }, description: 'final approved gate list (may differ from derived)' },
-            },
-          }, model: gm('quickDecider') },
-          result
-        )
-        if (!confirmed || !confirmed.confirmed) {
-          result.blockedAt = 'tune-cancelled'
-          result.handoff = {
-            from: 'tune',
-            message: 'Tune cancelled by user. Re-run /tune-feature <planDir> when ready.',
-            nextMode: 'tune',
-            planDir,
-          }
-          plog('Tune: user cancelled the revisit plan — stopping')
-          stateCheckpoint('Tune', 'cancelled')
-          await consolidate(slug, result, config)
-          return result
+        result.blockedAt = 'tune-awaiting-confirm'
+        result.handoff = {
+          from: 'tune',
+          message: `Tune plan derived — awaiting your confirmation. Gates to revisit (in order): [${gatesList}]; issue refs: ${(tunePlan.issueRefs || []).join('; ') || '(none)'}; stages preserved: ${(tunePlan.preserveStages || []).join(', ') || '(none)'}. Options: run as-is → Workflow({name:'feature-pipeline', args:{mode:'tune', resume:'${planDir}', confirmTune:true}}); run an edited gate set → Workflow({name:'feature-pipeline', args:{mode:'tune', resume:'${planDir}', confirmTune:true, finalGates:['requirements'|'architecture'|'design'|'plan', …]}}); cancel → Workflow({name:'feature-pipeline', args:{mode:'tune', resume:'${planDir}', cancelTune:true}}).`,
+          nextMode: 'tune',
+          planDir,
+          planGates: tunePlan.planGates || [],
+          preserveStages: tunePlan.preserveStages || [],
         }
-        if (confirmed.finalGates && confirmed.finalGates.length) tunePlan.planGates = confirmed.finalGates
-        result.tuneConfirmed = true
-        plog(`Tune: plan confirmed — gates=[${(tunePlan.planGates || []).join(', ')}]`)
+        plog('Tune: awaiting user confirmation of the revisit plan — stopping (re-invoke with confirmTune/cancelTune)')
+        stateCheckpoint('Tune', 'awaiting-confirm')
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
       }
 
       // Revisit each gate in refine mode (ordered: requirements -> architecture -> design -> plan).
@@ -3253,6 +3615,7 @@ Task:\n${task}`,
       }
       stateCheckpoint('Tune', 'done')
       plog(`Tune: complete — designReady re-set; ${resetCount} stage(s) reset`)
+      logTelemetrySummary()
       await consolidate(slug, result, config)
       return result
     }
@@ -4326,16 +4689,42 @@ malformed output.`
         return result
       }
 
+      // Human design-approval checkpoint (--approval). Workflow subagents cannot use
+      // AskUserQuestion, so the engine stops here with the literal re-invoke recipes;
+      // the /design-feature command asks the user and re-invokes with the decision.
+      // No budget is spent on approval round-trips.
+      if (useApproval && !(result.designApproved && result.designApproved.approved)) {
+        phase('Design')
+        result.designReady = true // the artifacts ARE ready; only the human sign-off is pending
+        result.approvalPending = true
+        result.blockedAt = 'awaiting-approval'
+        const stageList = (result.stages || []).map((st) => `${st.id}: ${st.name}`).join('; ') || '(no stages)'
+        result.handoff = {
+          from: 'design',
+          message: `Design ready — awaiting your approval. Stages: ${stageList}. Options: approve as-is → Workflow({name:'feature-pipeline', args:{mode:'design', resume:'${planDir}', approveDesign:true}}); edit stage boundaries → Workflow({name:'feature-pipeline', args:{mode:'design', resume:'${planDir}', stageEdits:'<describe the boundary changes>'}}); reject back to Plan → Workflow({name:'feature-pipeline', args:{mode:'design', resume:'${planDir}', rejectToPlan:true}}).`,
+          nextMode: 'design',
+          planDir,
+          approvalOptions: ['approve', 'edit-stages', 'reject-to-plan'],
+          stages: (result.stages || []).map((st) => ({ id: st.id, name: st.name })),
+        }
+        stateCheckpoint('Design', 'awaiting-approval')
+        plog('Design mode: awaiting human approval (designReady=true, approvalPending=true) — stopping')
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
+
       phase('Design')
       result.designReady = true
       result.handoff = {
         from: 'design',
-        message: `Design ready. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}`,
+        message: `Design ready${result.designApproved && result.designApproved.approved ? ' (user-approved)' : ''}. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}`,
         nextMode: 'implement',
         planDir,
       }
       stateCheckpoint('Design', 'done')
       plog(`Design mode: designReady=true — stopping pre-execute (stages=${result.stages.length})`)
+      logTelemetrySummary()
       await consolidate(slug, result, config)
       return result
     }
@@ -4353,6 +4742,22 @@ malformed output.`
         planDir,
       }
       plog('Implement mode: designReady=false — blocking (run /design-feature first)')
+      stateCheckpoint('Execute', 'blocked')
+      await consolidate(slug, result, config)
+      return result
+    }
+    // Approval-gated designs (config.useApproval persisted from the design run) must be
+    // signed off before implement executes. Absent fields (state from a run without the
+    // approval checkpoint) leave this guard a no-op.
+    if (isImplementMode && useApproval && result.approvalPending) {
+      result.blockedAt = 'design-not-approved'
+      result.handoff = {
+        from: 'implement',
+        message: `Design awaits your approval. Run /design-feature --resume ${planDir} to answer the approval question (approve / edit stages / reject to plan), then re-run /implement-feature ${planDir}.`,
+        nextMode: 'design',
+        planDir,
+      }
+      plog('Implement mode: approvalPending=true — blocking (complete the design approval first)')
       stateCheckpoint('Execute', 'blocked')
       await consolidate(slug, result, config)
       return result
@@ -4726,6 +5131,7 @@ Do NOT include formatting nits unless they change meaning.`,
       result.retryUsed = retryState.used
       if (useKnowledgePersist) await persistFindings(result)
       stateCheckpoint('Code Review', 'blocked')
+      logTelemetrySummary()
       await consolidate(slug, result, config)
       return result
     }
@@ -4735,14 +5141,36 @@ Do NOT include formatting nits unless they change meaning.`,
       summary: codeReview.summary,
     }
     plog(`Code Review: issues=${codeReview.issues || 0}, blockers=${(codeReview.blockers || []).length}`)
-    const hasBlocker = (codeReview.blockers || []).some(
-      (b) => b.severity === 'blocker' || b.severity === 'high'
-    )
-    if (hasBlocker) {
+    const blocking = selectBlockingFindings(codeReview.blockers)
+    if (blocking.length) {
+      // Classify blocker findings so upstream-rooted ones flow to /tune-feature via the
+      // issues handoff instead of dead-ending in a plain block. Classification failure,
+      // --no-issues, and zero upstream findings all land on the legacy hard-block — a
+      // blocker NEVER lets the run proceed past code review.
+      let upstreamCount = 0
+      if (useIssues && isImplementMode) {
+        plog(`Code Review: ${blocking.length} blocker(s) — classifying for the issues handoff`)
+        for (const finding of blocking) {
+          const classified = await classifyAndRecordIssue({ finding, planDir, result })
+          if (classified && classified.isUpstream) upstreamCount += 1
+        }
+      }
+      if (upstreamCount > 0) {
+        result.blockedAt = 'issues-handoff'
+        result.retryUsed = retryState.used
+        result.handoff = buildIssuesHandoff(planDir, upstreamCount, 'code-review')
+        if (useKnowledgePersist) await persistFindings(result)
+        plog(`Code Review: issues-handoff — ${upstreamCount} upstream issue(s); blocking for tune`)
+        stateCheckpoint('Code Review', 'issues-handoff')
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
       result.blockedAt = 'code-review'
       result.retryUsed = retryState.used
       if (useKnowledgePersist) await persistFindings(result)
       stateCheckpoint('Code Review', 'blocked')
+      logTelemetrySummary()
       await consolidate(slug, result, config)
       return result
     }
@@ -4789,17 +5217,10 @@ Do NOT include formatting nits unless they change meaning.`,
       }
       result.blockedAt = 'issues-handoff'
       result.retryUsed = retryState.used
-      result.handoff = {
-        from: 'implement',
-        message: upstreamCount > 0
-          ? `Upstream defect found (${upstreamCount} upstream issue(s) written to ${planDir}issues-and-improvements.md). Run: /tune-feature ${planDir}`
-          : `Upstream-flagged defect recorded but none classified upstream. Review the code-review/goalkeeper findings; re-run /implement-feature ${planDir} after fixing, or /tune-feature ${planDir} to revisit design.`,
-        nextMode: 'tune',
-        planDir,
-        upstreamCount,
-      }
+      result.handoff = buildIssuesHandoff(planDir, upstreamCount, 'goalkeeper')
       plog(`Goalkeeper: issues-handoff — ${upstreamCount} upstream issue(s); blocking for tune`)
       stateCheckpoint('Goalkeeper', 'issues-handoff')
+      logTelemetrySummary()
       await consolidate(slug, result, config)
       return result
     } else if (goalkeeperDecision.decision === 'loop-back' && goalkeeperDecision.targetPhase && goalkeeperDecision.targetPhase !== 'none') {
@@ -4832,6 +5253,7 @@ Do NOT include formatting nits unless they change meaning.`,
       result._uncaughtError = `decision cap exhausted (${decisionState.used}/${decisionCap}) during a goalkeeper loop-back`
       plog(`Phase E4: decision cap exhausted during loop-back — hard-block (resumable via --resume)`)
       stateCheckpoint('Goalkeeper', 'blocked')
+      logTelemetrySummary()
       await consolidate(slug, result, config)
       return result
     }
@@ -4886,6 +5308,7 @@ Use a clear conventional-commit message. Return the commit hash.`,
     // so a committed run records committed=true (idempotent / resumable).
     stateCheckpoint(result.committed ? 'Commit' : 'Done', 'done')
     result.retryUsed = retryState.used
+    logTelemetrySummary()
     await consolidate(slug, result, config)
 
     return result

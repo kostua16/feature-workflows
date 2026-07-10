@@ -8,7 +8,7 @@
     {
       "name": "feature-workflows",
       "source": "./plugins/feature-workflows",
-      "description": "Gate-enforced feature pipeline: 5 commands, 32 sub-agents, the feature-pipeline dynamic-workflow engine, compress-md skill.",
+      "description": "Gate-enforced feature pipeline: 6 commands, 31 sub-agents, the feature-pipeline dynamic-workflow engine, compress-md skill.",
       "category": "workflows",
       "tags": ["pipeline", "tdd", "planning", "agents"],
       "strict": true

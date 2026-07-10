@@ -7,7 +7,7 @@ Gate-enforced feature-development pipeline for Claude Code: **THINK** (`design`)
 
 | Component | Count | Notes |
 |---|---|---|
-| Commands | 5 | `/feature-workflows:setup`, `:design-feature`, `:implement-feature`, `:tune-feature`, `:feature-pipeline` |
+| Commands | 6 | `/feature-workflows:setup`, `:design-feature`, `:implement-feature`, `:tune-feature`, `:feature-pipeline`, `:pipeline-status` |
 | Agents | 31 | Spawned as `feature-workflows:<agent>` (e.g. `feature-workflows:plan-architect`) |
 | Skills | 1 | `compress-md` — in-session markdown caveman compression |
 | Engine asset | `workflows/` | `feature-pipeline.js` + reference docs — **not** auto-loaded; installed per-project by `setup` |

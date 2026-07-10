@@ -52,6 +52,16 @@ const CANDIDATES = [
   'retryState',
   'decisionState',
   'MODEL_DEFAULTS',
+  'bumpGateTelemetry',
+  'renderTelemetrySummary',
+  'summarizeGates',
+  'deriveNextCommand',
+  'renderStatusReport',
+  'selectBlockingFindings',
+  'buildIssuesHandoff',
+  'normalizeGateTarget',
+  'resetStageForRerun',
+  'applyApprovalDecision',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

@@ -1,25 +1,45 @@
-# Handoff — 2026-07-11 (feature-workflows)
+# Handoff — 2026-07-11 (branch claude/ft-todos-implementation-plan-a6603a)
 
 ## What happened this session
-- Implemented the accepted "Embed Test Writer And Remove Pytest Runner" plan.
-- Added an implement-mode `Test Authoring` phase in `plugins/feature-workflows/workflows/feature-pipeline.js`.
-- Added the `test-writer` gate before implementation execution; it runs after `designReady` and before both staged `plan-executor` execution and the `gsd-quick` path.
-- Added persisted state/config fields: `useTestWriter`, `testsWritten`, `testWriterSummary`, and `_testWriter`.
-- Added `--no-test-writer` to `implement-feature` and `feature-pipeline` command docs.
-- Removed `plugins/feature-workflows/agents/pytest-runner.md`.
-- Updated docs and metadata from 32 to 31 agents, and replaced stale `pytest-runner` wording with the stack-agnostic `test-runner` persona.
-- Updated `test-writer` instructions to be stack-aware and to use the target project's existing test framework.
+Implemented ALL remaining `docs/TODOs.md` items — features FT-1..FT-5 — as engine **v1.2.0**
+(plan approved by user at `~/.claude/plans/check-all-ft-from-fuzzy-goose.md`):
 
-## Validation
-- `npm run validate:agents` — passed (`31 agents, 2 agentType refs, 30 persona refs`).
-- `npm test` — passed (`90` tests).
-- `npm run validate:versions` — passed (`version lockstep OK: 1.1.0`).
-- ESM syntax check for `plugins/feature-workflows/workflows/feature-pipeline.js` — passed.
-- Phase-label validation — passed (`undeclared_count=0`).
+- **FT-4 per-gate telemetry**: `bumpGateTelemetry` hooked into `flexibleAgent`/`recordAgentFailure`;
+  `renderTelemetrySummary` printed via `logTelemetrySummary()` at every terminal exit;
+  `result.gateTelemetry` persisted.
+- **FT-1 `/pipeline-status`**: new engine `status` mode (read-only early exit in `main()`, never
+  consolidates) + pure `summarizeGates`/`deriveNextCommand`/`renderStatusReport` + new command
+  `plugins/feature-workflows/commands/pipeline-status.md` (6th command).
+- **FT-2**: blocker-severity code-review findings now run through `classifyAndRecordIssue`;
+  upstream ones exit at `issues-handoff` → `/tune-feature` (shared `buildIssuesHandoff`,
+  also used by the goalkeeper path). Legacy hard-block preserved for non-upstream/`--no-issues`.
+- **FT-3**: `--stage=stageNN` (`resetStageForRerun`) + `--from-gate=<gate>`
+  (`normalizeGateTarget`, new `LOOPBACK_FLAG_MAP.execute`); one-shot args, invalid →
+  `blockedAt='bad-args'` with no persistence.
+- **FT-5**: user confirmed **subagents CANNOT use AskUserQuestion** (Q3 resolved) → command-level
+  two-phase approval: design-stop exits `awaiting-approval` (`--approval` / `useApproval`),
+  `/design-feature` asks + re-invokes with `approveDesign`/`stageEdits`/`rejectToPlan`
+  (`applyApprovalDecision`); implement blocks `design-not-approved`. tune-confirm converted to the
+  same pattern (`tune-awaiting-confirm` + `confirmTune`/`finalGates`/`cancelTune`).
+  `/feature-pipeline --auto-implement` now approval-gated by default; `--yes` skips.
 
-## Current state
-- Worktree has the implementation changes unstaged.
-- Unrelated `.codegraph/` remains untracked and should stay out of commits unless explicitly requested.
+Docs/version sweep: lockstep 1.2.0 (plugin.json, engine header, meta.version), marketplace.json
+"6 commands", both READMEs, QUICKSTART, engine reference (What's new, Inputs, Outputs/blockedAt,
+Modes incl. `status`), TODOs.md all marked done + Q3 resolved (note: user-interviewer gate still
+carries the subagent-AskUserQuestion assumption — future conversion candidate).
+
+## Verification (all green)
+- `node --test "tests/**/*.test.mjs"` — 132 pass (5 new test files: telemetry, status-mode,
+  issues-handoff, selective-execution, approval; harness CANDIDATES extended; loadFunction dep
+  list in feature-pipeline-helpers.test.mjs gained bumpGateTelemetry).
+- `validate-plugin-versions.mjs` OK 1.2.0; `validate-agent-registry.mjs` OK; ESM check OK;
+  phase-label validation 0 undeclared.
+
+## State
+All changes UNCOMMITTED on worktree branch `claude/ft-todos-implementation-plan-a6603a`
+(15 modified + 6 new files, +707/−134). Not committed — awaiting user go-ahead.
 
 ## Next
-- Review the diff, then commit with a conventional message such as `feat(workflows): add test-writer gate`.
+- Commit + open PR against main when user asks.
+- Manual smoke (needs live run in a scratch project): design --approval loop, /pipeline-status
+  against a v1.1.0 state file, --stage re-run, code-review→issues handoff.

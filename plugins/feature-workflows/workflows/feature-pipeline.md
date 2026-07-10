@@ -62,6 +62,23 @@ gate cannot pass; it does NOT silently skip steps.
 
 ## What's new
 
+- **v1.2.0 — status mode, telemetry, selective execution, approval checkpoints, code-review
+  issues routing.**
+  - **`status` mode / `/pipeline-status <planDir>`** — read-only report of a persisted run
+    (gates, stages, budgets, telemetry, exact next command). Writes nothing.
+  - **Per-gate telemetry** — every agent call/retry/escalation/fallback is counted per gate in
+    `result.gateTelemetry`; a summary table + degradation trailer prints at every terminal exit.
+  - **Selective execution** — `--stage=stageNN` re-arms one stage; `--from-gate=<gate>` is a
+    deterministic user-driven rewind (adds `execute` to the loop-back flag map). One-shot args;
+    invalid values exit at `blockedAt='bad-args'` without touching persisted state.
+  - **Human design-approval checkpoint** (`--approval`) — the design-stop exits at
+    `awaiting-approval`; the command asks the user (approve / edit stage boundaries / reject to
+    plan) and re-invokes. Implement blocks at `design-not-approved` until signed off.
+  - **Tune confirmation reworked** — the old tune-confirm subagent assumed subagents could call
+    AskUserQuestion (they cannot); tune now stops at `tune-awaiting-confirm` and the command
+    re-invokes with `confirmTune`/`finalGates`/`cancelTune`.
+  - **Code-review blockers route through the issues handoff** — blocker findings classified
+    upstream flow to `/tune-feature` instead of dead-ending at `code-review`.
 - **Decision agents + state machine (Phase E).** Loops stop being blind-cap:
   - **quick-decider** rides every loop boundary (plan-refine, escalation schema-recovery,
     reconcile design-fix, gsd-debug, and all four reviewLoops: Requirements/Arch/Design/Plan).
@@ -181,7 +198,7 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 
 ```jsonc
 {
-  "mode": "design",                                                 // optional: design|implement|tune (default design; --resume hydrates persisted mode)
+  "mode": "design",                                                 // optional: design|implement|tune|status (default design; --resume hydrates persisted mode)
   "task": "Fix the token expiry check in auth middleware (uses < instead of <=)",
   "planPath": ".planning/user-plans/fix-token-expiry/plan.md",   // optional: where plan is written/read
   "definitionPath": ".planning/user-plans/fix-token-expiry/idea.md", // optional: where the idea doc is written (default: plan dir /idea.md)
@@ -215,7 +232,16 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
   "timestamp": "202606261430",                                  // optional: planDir leaf when no JIRA id in task (default: slug leaf)
   "useChunker": true,                                            // optional: plan-chunker -> stageNN.md after plan-architect (default true, design mode)
   "useIssues": true,                                             // optional: write issues-and-improvements.md on upstream-defect handoff (default true, implement mode)
-  "useTuneConfirm": true,                                        // optional: AskUserQuestion confirm of derived gate-revisit plan (default true, tune mode)
+  "useTuneConfirm": true,                                        // optional: stop at tune-awaiting-confirm for user confirmation of the derived gate-revisit plan (default true, tune mode)
+  "useApproval": false,                                          // optional: human design-approval checkpoint at the design-stop (default false; design mode)
+  "approveDesign": false,                                        // optional one-shot: apply the user's APPROVE decision on a design resume (awaiting-approval stop)
+  "rejectToPlan": false,                                         // optional one-shot: reject the design back to Plan (plan + downstream + stage split re-run)
+  "stageEdits": "",                                              // optional one-shot: user's stage-boundary edit text; plan-chunker re-runs with it
+  "confirmTune": false,                                          // optional one-shot: apply the user's CONFIRM decision on a tune resume (tune-awaiting-confirm stop)
+  "cancelTune": false,                                           // optional one-shot: cancel the tune run (tune-cancelled)
+  "finalGates": [],                                              // optional one-shot: with confirmTune, override the gate-revisit list (subset of requirements|architecture|design|plan)
+  "stage": "",                                                   // optional one-shot: stageNN to re-arm for re-execution (implement mode; clears stale test/review verdicts)
+  "fromGate": "",                                                // optional one-shot: gate to rewind deterministically (requirements|architecture|design|plan in design/tune; execute|tests in implement)
   "resume": "",                                                  // optional: <planDir> to hydrate pipeline-state.json and re-run from first incomplete gate
   "models": {                                                      // optional: per-gate model tier overrides (aliases: haiku|sonnet|opus|fable)
     "plan": "sonnet",
@@ -240,8 +266,28 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 - `useIssues` (optional, default `true`, **implement mode**): on an upstream-defect goalkeeper verdict
   (finding points at plan/arch/design/requirements), write `<planDir>/issues-and-improvements.md` and
   stop (`blockedAt='issues-handoff'`) for `/tune-feature`. `--no-issues` degrades to a plain block.
-- `useTuneConfirm` (optional, default `true`, **tune mode**): confirm the agent-derived gate-revisit plan
-  via AskUserQuestion before running it. `--no-confirm` runs the derived plan directly (CI/batch).
+- `useTuneConfirm` (optional, default `true`, **tune mode**): stop at `blockedAt='tune-awaiting-confirm'`
+  so the /tune-feature command can confirm the agent-derived gate-revisit plan with the user (workflow
+  subagents cannot use AskUserQuestion), then re-invoke with `confirmTune`/`finalGates` or `cancelTune`.
+  `--no-confirm` runs the derived plan directly (CI/batch).
+- `useApproval` (optional, default `false`, **design mode**): human design-approval checkpoint. The
+  design-stop exits at `blockedAt='awaiting-approval'` (`approvalPending: true`, `designReady: true`)
+  with re-invoke recipes in `handoff.message`; the /design-feature command asks the user and re-invokes
+  with ONE of `approveDesign: true` (records `result.designApproved`), `stageEdits: "<text>"`
+  (plan-chunker re-runs with the edits, then re-asks), or `rejectToPlan: true` (plan + downstream +
+  stage split re-run, then re-asks). Persisted into config, so an approval-gated design also blocks
+  implement (`blockedAt='design-not-approved'`) until signed off.
+- `stage` (optional one-shot, **implement mode**): re-arm exactly one stage (`stageNN`) for
+  re-execution after a manual edit. The stage flips to pending and the stale
+  test/review/goalkeeper verdicts are cleared (they re-earn over the fresh diff); other done stages
+  stay skipped. Unknown id → `blockedAt='bad-args'` listing the valid ids (nothing runs, nothing
+  persisted).
+- `fromGate` (optional one-shot): deterministic user-driven rewind — clears that gate + every
+  downstream completion flag via the same machinery as the goalkeeper loop-back. Design targets
+  (`requirements|architecture|design|plan`, aliases `arch`/`detailed-design`) are valid in design/tune
+  and also clear `designReady`; `execute|tests` (alias `test`/`exec`) are valid in implement. Invalid
+  target or a design target in implement mode → `blockedAt='bad-args'` (nothing runs). Never persisted
+  into config.
 - `planPath` (optional): an explicit plan path. If set it is used verbatim and the
   dynamic planDir (Gate -2) is skipped — if a plan already exists there it is refined instead of
   written from scratch. Absent on a fresh run → `feature-categorizer` derives
@@ -427,13 +473,21 @@ The workflow returns a JSON summary object:
 If a gate fails, `blockedAt` names it and `ready` is `false`; nothing after the
 failing gate runs. `blockedAt` values: design gates (`define`/`requirements`/`architecture`/
 `detailed-design`/`e2e-usecases`/`plan`/`tdd-enforce`/`review`), implement gates (`execute`/`test`/
-`code-review`/`goalkeeper`), tune-specific (`tune-no-issues`/`tune-cancelled`), or `issues-handoff`
-(implement upstream-defect path), or `uncaught-throw` (safety net, `--resume`-able).
+`code-review`/`goalkeeper`), tune-specific (`tune-no-issues`/`tune-awaiting-confirm`/`tune-cancelled`),
+approval checkpoint (`awaiting-approval` at the design-stop; `design-not-approved` in implement),
+`bad-args` (invalid `--stage`/`--from-gate`; nothing ran, nothing persisted), or `issues-handoff`
+(implement upstream-defect path — goalkeeper loop-back or code-review blockers classified upstream),
+or `uncaught-throw` (safety net, `--resume`-able).
+
+v1.2.0 result additions (all optional — older state hydrates unchanged): `gateTelemetry`
+(per-gate agent-call counters `{calls, retries, escalations, fallbacks, models}`, printed as a
+summary table at every terminal exit alongside the degradation trailer), `designApproved`
+(`{approved, by, seq}` human sign-off), `approvalPending` (design stopped awaiting approval).
 
 ## Modes
 
 ONE engine, selected by `args.mode`. Each mode runs a subset of the gate sequence; `<planDir>/
-pipeline-state.json` is the shared contract across the three invocations.
+pipeline-state.json` is the shared contract across the invocations.
 
 | field | design sets | implement reads/sets | tune reads/sets |
 |---|---|---|---|
@@ -449,7 +503,9 @@ pipeline-state.json` is the shared contract across the three invocations.
 Runs Gates -2 → 2 (define → requirements → arch → design → plan → tdd → reconcile → review/refine),
 then `plan-chunker` → `stageNN.md`. Sets `designReady=true`, calls `consolidate`, **returns — NO code
 executes.** `handoff.message` instructs `/implement-feature <planDir>`. The gsd-quick fast-path
-and all implement/tune gates are skipped (gsd-quick belongs to implement).
+and all implement/tune gates are skipped (gsd-quick belongs to implement). With `useApproval` the
+design-stop first exits at `blockedAt='awaiting-approval'` until the user's decision arrives via
+`approveDesign`/`stageEdits`/`rejectToPlan` (see Inputs).
 
 ### `implement` — `/implement-feature <planDir>` (DO; positional planDir required)
 Hydrates state, **asserts `designReady`** (else `blockedAt='design-not-ready'`). Runs stages sequentially
@@ -460,17 +516,27 @@ Debug), Gate 5 (Code Review), Gate 5.1 (Goalkeeper). Goalkeeper `commit` → pub
 
 ### `tune` — `/tune-feature <planDir>` (FIX; positional planDir required)
 Runs its own branch first (before the translator gate). Reads `issues-and-improvements.md` → `tunePlanner`
-agent derives `tunePlan` (minimal `planGates` to revisit + `issueRefs` + `preserveStages`). Confirms via
-AskUserQuestion (unless `--no-confirm` / already `tuneConfirmed`). Revisits ONLY `planGates` in **refine
+agent derives `tunePlan` (minimal `planGates` to revisit + `issueRefs` + `preserveStages`). Stops at
+`blockedAt='tune-awaiting-confirm'` for the user's confirmation — re-invoke with `confirmTune`
+(optionally `finalGates`) or `cancelTune` (unless `--no-confirm` / already `tuneConfirmed`).
+Revisits ONLY `planGates` in **refine
 mode** (critical-reviewer + design-reviser revise the EXISTING doc in place via `reviewLoop` — not a
 rewrite). Re-runs reconcile on touched docs. **Stage preservation:** only stages whose `files` intersect
 the revised gate's scope reset to `pending`; `preserveStages` / file-disjoint stages keep `done`. Re-sets
 `designReady=true`, consolidate, stop. `handoff.message` instructs re-running `/implement-feature`.
 
+### `status` — `/pipeline-status <planDir>` (READ-ONLY; positional planDir required)
+Loads + validates `pipeline-state.json`, renders `result.statusReport` (task/mode/lastGate header,
+gate table, stage table, budgets used, per-gate telemetry, open questions/issues, and the exact
+next command), and returns. **Writes nothing** — no consolidate, no checkpoint, no failed-launch
+record — so it is safe on blocked, mid-run, or corrupt state (a failed validation downgrades to a
+WARNING line in the report). Only an explicit `args.mode='status'` selects it; status is never
+persisted into config.
+
 ### `issues-and-improvements.md` lifecycle
 ```
-implement: goalkeeper loop-back + upstream defect
-  -> issueClassifier (per defect) -> isUpstream? gate ∈ {requirements,architecture,design,plan}
+implement: goalkeeper loop-back upstream defect, OR blocker-severity code-review findings
+  -> issueClassifier (per finding) -> isUpstream? gate ∈ {requirements,architecture,design,plan}
   -> append <planDir>/issues-and-improvements.md  -> blockedAt='issues-handoff' (stop)
 tune: read issues-and-improvements.md -> tunePlanner -> planGates -> confirm -> refine those gates
   -> re-reconcile -> invalidate file-intersecting stages -> designReady=true (stop)
@@ -568,8 +634,12 @@ re-read fresh rather than trusting in-memory cache across `Workflow` calls.
    `gsd-debug` (if enabled) diagnoses + fixes and tests re-run up to the debug
    soft sub-cap (`maxDebugRetries`, default 20). Blocks only if green cannot be
    reached.
-5. **Code review** — `critical-reviewer` reviews the diff; gate blocks on any
-   `blocker`-severity finding.
+5. **Code review** — `critical-reviewer` reviews the diff; blocker/high-severity findings gate the
+   run. In implement mode with `useIssues`, each blocking finding is first classified via
+   `issueClassifier`: findings rooted in a design doc append to `<planDir>/issues-and-improvements.md`
+   and stop at `blockedAt='issues-handoff'` (run `/tune-feature`) instead of dead-ending; zero
+   upstream findings, classification failure, or `--no-issues` keep the plain
+   `blockedAt='code-review'` hard-block. A blocker never lets the run proceed.
 5.1. **Goalkeeper** (implement, `useGoalkeeper`) — `complex-decision-analyst` re-judges the
    finished work as a **commit goalkeeper**. `commit` → proceeds to publish/persist/git-commit. A
    `loop-back` verdict is **no longer a rewind** (the Phase-E loop-back state machine was removed in the
