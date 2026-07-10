@@ -7,8 +7,14 @@ samples/
 __pycache__/
 .idea/
 
-# Claude Code local settings
+# Claude Code local settings and runtime state
 .claude/settings.local.json
+.claude/worktrees/
+.claude/agent-memory/
+
+# Local engine copy installed by /feature-workflows:setup
+# (source of truth: plugins/feature-workflows/workflows/)
+.claude/workflows/
 
 # Local debug / scratch artifacts
 progress_debug*.py

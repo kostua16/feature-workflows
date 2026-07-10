@@ -1,13 +1,26 @@
 ---
 description: Convenience alias — runs /design-feature then instructs /implement-feature (split engine). Design THINK flow only by default; add --auto-implement to chain into the DO flow (implies --auto-commit off unless --auto-commit).
 argument-hint: <task description> [--auto-implement] [--auto-commit] [--target=TEST_TARGET] [--plan=PLAN_PATH] [--definition=DEF_PATH] [--gsd-quick] [--no-chunker] [--no-gsd-debug] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-publish] [--no-persist] [--no-interview] [--no-parallel] [--no-translator] [--no-categorizer] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-goalkeeper] [--no-quick-decider] [--decision-cap=N] [--timestamp=TS] [--retries=N] [--debug-retries=N] [--max-reconcile-iterations=N] [--resume <planDir>]
-allowed-tools: Workflow
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
 Run the `feature-pipeline` workflow in **design mode** — the THINK-only flow. This is the convenience
 alias that chains the 3 split pipelines (`/design-feature` → `/implement-feature` → `/tune-feature`).
 By default it runs design mode and STOPS pre-execute (the human checkpoint). Add `--auto-implement` to
 chain into implement mode after `designReady`.
+
+## Preflight — engine must be installed
+
+- Engine installed: !`test -f .claude/workflows/feature-pipeline.js && echo INSTALLED || echo MISSING`
+- Installed engine version: !`grep -m1 "engine-version:" .claude/workflows/feature-pipeline.js 2>/dev/null || echo none`
+- Plugin engine version: !`grep -m1 "engine-version:" "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" 2>/dev/null || echo unknown`
+
+If the engine is MISSING: tell the user to run `/feature-workflows:setup` first and STOP — do not
+call the Workflow tool. If the two versions differ: STOP before calling the Workflow tool — an
+outdated installed engine's agent/gate contract may not match the plugin's registered agents and
+would fail mid-pipeline instead of at preflight. Ask the user (AskUserQuestion) to either re-run
+`/feature-workflows:setup` first (recommended) or explicitly proceed with the outdated engine;
+only call the Workflow tool after setup has been re-run or the user explicitly chose to proceed.
 
 Parse `$ARGUMENTS` into:
 - `task`: everything except the flags (required, UNLESS `--resume` is given)
@@ -114,6 +127,9 @@ Examples:
 
 ## Editing the workflow script
 
-After editing `.claude/workflows/feature-pipeline.js`, validate it as **ES module** — see the
-**Validation** section in `.claude/workflows/feature-pipeline.md`. Plain `node --check` parses as
-CommonJS and silently passes invalid ESM; use the `--input-type=module` recipe there.
+The canonical engine source lives in the plugin at `plugins/feature-workflows/workflows/feature-pipeline.js`
+(resolved at runtime as `${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js`). The project copy at
+`.claude/workflows/feature-pipeline.js` is installed by `/feature-workflows:setup` and overwritten on
+re-run — edit the plugin source, not the copy. After editing, validate as **ES module** — see the
+**Validation** section in the `feature-pipeline.md` reference next to the engine. Plain `node --check`
+parses as CommonJS and silently passes invalid ESM; use the `--input-type=module` recipe there.
