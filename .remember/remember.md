@@ -1,4 +1,4 @@
-# Handoff — 2026-07-10
+# Handoff — 2026-07-10 (branch claude/busy-maxwell-9e40dc)
 
 ## What happened this session
 Full review of the dynamic workflow engine

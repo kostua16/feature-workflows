@@ -54,6 +54,8 @@ export const meta = {
     { title: 'Debug' },
     { title: 'Design' },
     { title: 'Goalkeeper' },
+    { title: 'Decide' },
+    { title: 'Checkpoint' },
   ],
 }
 
