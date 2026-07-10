@@ -7,9 +7,28 @@ Line refs point at the engine file unless stated otherwise.
 Suggested priority order: BF-1 (tune is functionally broken without it) → BF-2/EN-3 (mode
 guard) → EN-1 (test harness, so the rest land safely) → everything else.
 
-Status update: all `BF-*` and `RB-*` items below are implemented in
+## Status (engine v1.1.0)
+
+**Bugfixes (BF-1..5)** and **Robustness (RB-1..15)** are implemented in
 `plugins/feature-workflows/workflows/feature-pipeline.js` and covered by
 `tests/feature-pipeline-helpers.test.mjs` where the behavior is locally testable.
+
+**Enforcements (EN-1..5)** and **Improvements (IM-1..5)** are implemented too:
+
+| Item | Status | Where |
+|------|--------|-------|
+| EN-1 unit tests for pure logic | ✅ done | `tests/harness.mjs` + `tests/*.test.mjs`, CI `node --test` step |
+| EN-2 schema-validate state on resume | ✅ done | `validatePipelineState()`; blocks `resume-invalid-state` |
+| EN-3 CI agent-registry check | ✅ done | `scripts/validate-agent-registry.mjs` + CI step |
+| EN-4 verify append-only files grew | ✅ done | `verifyAppendGrowth()` + `FILE_ACK.totalBytes`; wired into review-history/decisions/issues appends |
+| EN-5 enforce lane ownership post-execute | ✅ done | `detectOwnershipViolations()` + `normalizePath()`; records `result.ownershipWarnings` |
+| IM-1 checksum-verify state (Q1 fallback) | ✅ done | `stateChecksum()` embedded in state, verified on resume |
+| IM-2 persist budgets across resume | ✅ done | `hydrateBudget()` + `--fresh-budget`; stamped in `consolidate()` |
+| IM-3 prompt-size hygiene | ✅ done | `compactList()` on carried-blocker interpolations |
+| IM-4 stack-agnostic test gate | ✅ done | `detectTestCommand()` + `--test-cmd`/`--test-framework`; auto-detect fallback |
+| IM-5 consolidate flag zoo into profiles | ✅ done | `PROFILES`/`resolveProfile()` + `--profile=full\|standard\|light` |
+
+Only **Features (FT-*)** remain open.
 
 ---
 
@@ -63,19 +82,19 @@ Status update: all `BF-*` and `RB-*` items below are implemented in
 
 ## Enforcements
 
-### EN-1. Unit tests for the engine's pure logic
+### EN-1. Unit tests for the engine's pure logic — ✅ DONE (v1.1.0)
 - Zero tests exist; CI only checks version lockstep (`.github/workflows/validate-plugin.yml`,
   `scripts/validate-plugin-versions.mjs`).
 - `resolveMode`, `invalidateStages`, `clearGateAndDownstream`, `detectNonEnglish`,
   `categorizeSlug`, `extractJson`, `writeChunkedFile` chunking are pure and trivially
   testable in Node with a stubbed `agent()`. BF-1, BF-4, BF-5 would have been caught.
 
-### EN-2. Schema-validate `pipeline-state.json` on resume
+### EN-2. Schema-validate `pipeline-state.json` on resume — ✅ DONE (v1.1.0)
 - `PIPELINE_STATE` (`:687`) is documentation-only; `loadPipelineState` hydrates whatever the
   file-reader returns. Corrupt/truncated state (plausible — see IM-1) hydrates garbage into
   25+ result flags. Validate and repair-or-block with a clear message.
 
-### EN-3. CI agent-registry check
+### EN-3. CI agent-registry check — ✅ DONE (v1.1.0)
 - The engine spawns some agents by `agentType` (`nsAgent('todo-store')`,
   `nsAgent('file-writer')`) but others only by prompt persona with **no agentType**
   (`issue-classifier` `:1131`, `tunePlanner`, `tune-confirm`, `file-reader`). Add a CI script
@@ -83,13 +102,13 @@ Status update: all `BF-*` and `RB-*` items below are implemented in
   `plugins/feature-workflows/agents/*.md` so renames can't silently degrade to generic
   subagents.
 
-### EN-4. Verify append-only files after write
+### EN-4. Verify append-only files after write — ✅ DONE (v1.1.0)
 - `review-history.md`, `decisions.md`, `issues-and-improvements.md`, and stage ticks rely on
   an LLM file-writer obeying "do NOT overwrite". One agent mistake wipes the audit trail
   tune depends on. Enforce with a post-write size/line-count check (file must grow), or move
   appends to a deterministic script.
 
-### EN-5. Enforce lane/stage file ownership post-execute
+### EN-5. Enforce lane/stage file ownership post-execute — ✅ DONE (v1.1.0)
 - Lane disjointness is checked only on *declared* files (`:3547-3557`);
   `EXECUTE_VERDICT.files` is explicitly "post-run sanity, not a gate". Parallel executors
   can silently clobber each other. After fan-out, diff actually-touched files (git status)
@@ -99,7 +118,7 @@ Status update: all `BF-*` and `RB-*` items below are implemented in
 
 ## Improvements
 
-### IM-1. Stop using LLM agents for mechanical file I/O
+### IM-1. Stop using LLM agents for mechanical file I/O — ✅ DONE (v1.1.0)
 - `pipeline-state.json`, `pipeline.log`, and every append go through a haiku file-writer
   told to write bodies "verbatim" in 12k-char chunks (`writeChunkedFile` `:988-1020`).
 - Biggest token cost + most likely source of state corruption (a failed chunk 3/5 leaves
@@ -107,24 +126,24 @@ Status update: all `BF-*` and `RB-*` items below are implemented in
   write/read primitive or a hook, use it; otherwise at least checksum-verify state after
   write (pairs with EN-2).
 
-### IM-2. Persist budget counters across resume
+### IM-2. Persist budget counters across resume — ✅ DONE (v1.1.0)
 - `retryState` is explicitly zeroed on resume (`:2171`); `decisionState` starts fresh each
   process. Every `--resume` grants a full new budget, so a pathological loop that
   hard-blocked can be resumed into the same spin indefinitely. Persist `used` counters in
   config; add `--fresh-budget` to opt into resetting.
 
-### IM-3. Prompt-size hygiene
+### IM-3. Prompt-size hygiene — ✅ DONE (v1.1.0)
 - Gate prompts interpolate the full (growing) `task` — including folded interview answers —
   plus raw JSON blobs (`carriedBlockers`, blockers, findings) into every downstream prompt.
 - Introduce a compact per-gate brief (artifact paths + one-paragraph summaries) as the sole
   cross-gate context; the on-disk artifacts are the real payload.
 
-### IM-4. Make the test gate stack-agnostic
+### IM-4. Make the test gate stack-agnostic — ✅ DONE (v1.1.0)
 - `runTests` hardcodes `python -m pytest` (`:1379`) and the pytest-runner agent, but this is
   a general-purpose marketplace plugin. Auto-detect (pytest / npm test / go test /
   cargo test) or accept `--test-cmd`; rename the gate's agent contract accordingly.
 
-### IM-5. Consolidate the flag zoo into profiles
+### IM-5. Consolidate the flag zoo into profiles — ✅ DONE (v1.1.0)
 - Implement mode alone has ~12 `--no-*` flags. Ship presets
   (`--profile=full|standard|light` — light drops the opus review loops, enhancer, and
   quick-decider for small tasks) with individual flags as overrides. Also allows per-profile

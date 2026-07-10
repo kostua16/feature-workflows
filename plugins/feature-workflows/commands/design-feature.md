@@ -1,6 +1,6 @@
 ---
 description: THINK-only feature pipeline (define -> requirements -> arch -> design -> plan -> tdd -> reconcile -> review/refine -> chunk into stages). Stops pre-execute. Run /implement-feature next.
-argument-hint: <task description> [--plan=PLAN_PATH] [--definition=DEF_PATH] [--no-chunker] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-quick-decider] [--no-interview] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--no-parallel] [--decision-cap=N] [--retries=N] [--max-reconcile-iterations=N] [--timestamp=TS] [--resume <planDir>]
+argument-hint: <task description> [--plan=PLAN_PATH] [--definition=DEF_PATH] [--profile=full|standard|light] [--no-chunker] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-quick-decider] [--no-interview] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--no-parallel] [--decision-cap=N] [--retries=N] [--max-reconcile-iterations=N] [--timestamp=TS] [--resume <planDir>]
 allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
@@ -33,6 +33,7 @@ Parse `$ARGUMENTS` into:
 - `--no-requirements`: → `useRequirements: false` (skip Gate 0.75 + its review loop)
 - `--no-tdd-enforce`: → `useTddEnforce: false` (skip Gate 1.5)
 - `--no-reconcile`: → `useReconcile: false` (skip Gate 1.7 + design-fix loop)
+- `--profile=full|standard|light`: → `profile` (preset defaults for the gate-control flags below; individual `--no-*` flags still override. `light` = small-task preset that drops the opus review/enhancer/quick-decider loops + arch/detailed-design/reconcile/e2e gates. Default `full`.)
 - `--no-explorer`: → `useExplorer: false` (skip Gate 0.2 codebase-facts)
 - `--no-enhancer`: → `useEnhancer: false` (skip prompt-enhancer at retry sites)
 - `--no-quick-decider`: → `useQuickDecider: false` (blind-cap loops at boundaries)
@@ -59,6 +60,7 @@ Workflow({
     task: <task>,
     planPath: <PATH or "">,
     definitionPath: <PATH or "">,
+    profile: <"full"|"standard"|"light">,
     useChunker: <bool>,
     useArchDesign: <bool>,
     useDetailedDesign: <bool>,
