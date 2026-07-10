@@ -1,26 +1,25 @@
-# Handoff — 2026-07-10 (branch claude/busy-maxwell-9e40dc)
+# Handoff — 2026-07-11 (feature-workflows)
 
 ## What happened this session
-Full review of the dynamic workflow engine
-(`plugins/feature-workflows/workflows/feature-pipeline.js`, v1.0.0) producing a
-prioritized improvement backlog at `docs/TODOs.md`:
+- Implemented the accepted "Embed Test Writer And Remove Pytest Runner" plan.
+- Added an implement-mode `Test Authoring` phase in `plugins/feature-workflows/workflows/feature-pipeline.js`.
+- Added the `test-writer` gate before implementation execution; it runs after `designReady` and before both staged `plan-executor` execution and the `gsd-quick` path.
+- Added persisted state/config fields: `useTestWriter`, `testsWritten`, `testWriterSummary`, and `_testWriter`.
+- Added `--no-test-writer` to `implement-feature` and `feature-pipeline` command docs.
+- Removed `plugins/feature-workflows/agents/pytest-runner.md`.
+- Updated docs and metadata from 32 to 31 agents, and replaced stale `pytest-runner` wording with the stack-agnostic `test-runner` persona.
+- Updated `test-writer` instructions to be stack-aware and to use the target project's existing test framework.
 
-- 5 bugfixes (BF-1..5) — headline: BF-1 tune-mode stage invalidation is a no-op for
-  non-plan gates (tune functionally broken); BF-2 the promised implement-mode gate guard
-  (`gateModeActive`) is defined but never wired.
-- 5 enforcements (EN-1..5) — headline: EN-1 zero unit tests for the engine's pure logic.
-- 5 improvements (IM-1..5) — headline: IM-1 LLM file-writer used for mechanical I/O
-  (token cost + state-corruption risk).
-- 5 features (FT-1..5) — headline: FT-1 `/pipeline-status` command.
-- 15 robustness items (RB-1..15) for weak-model drivers (qwen3/kimi): single hardened
-  call path, JSON repair, verdict contradiction guards, artifact-existence verification,
-  circuit breaker, model-escalation ladder, degradation telemetry.
-- 5 unresolved questions (Q1..Q5) at the end of the file.
+## Validation
+- `npm run validate:agents` — passed (`31 agents, 2 agentType refs, 30 persona refs`).
+- `npm test` — passed (`90` tests).
+- `npm run validate:versions` — passed (`version lockstep OK: 1.1.0`).
+- ESM syntax check for `plugins/feature-workflows/workflows/feature-pipeline.js` — passed.
+- Phase-label validation — passed (`undeclared_count=0`).
 
-## State
-- Branch `claude/dynamic-workflow-improvements-2721ab` (worktree). `docs/TODOs.md`
-  committed; PR opened against main.
+## Current state
+- Worktree has the implementation changes unstaged.
+- Unrelated `.codegraph/` remains untracked and should stay out of commits unless explicitly requested.
 
 ## Next
-- Await review/merge of the TODOs PR, then start fixing in the suggested order:
-  BF-1 → BF-2/EN-3 → EN-1 (test harness) → rest.
+- Review the diff, then commit with a conventional message such as `feat(workflows): add test-writer gate`.

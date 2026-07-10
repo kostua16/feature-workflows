@@ -139,9 +139,9 @@ Only **Features (FT-*)** remain open.
   cross-gate context; the on-disk artifacts are the real payload.
 
 ### IM-4. Make the test gate stack-agnostic — ✅ DONE (v1.1.0)
-- `runTests` hardcodes `python -m pytest` (`:1379`) and the pytest-runner agent, but this is
-  a general-purpose marketplace plugin. Auto-detect (pytest / npm test / go test /
-  cargo test) or accept `--test-cmd`; rename the gate's agent contract accordingly.
+- `runTests` used to hardcode `python -m pytest`, but this is a general-purpose marketplace
+  plugin. It now auto-detects pytest / npm test / go test / cargo test or accepts `--test-cmd`;
+  the runtime gate contract is the stack-agnostic `test-runner` persona.
 
 ### IM-5. Consolidate the flag zoo into profiles — ✅ DONE (v1.1.0)
 - Implement mode alone has ~12 `--no-*` flags. Ship presets
@@ -263,7 +263,7 @@ deterministic guards → recovery policy.
   EN-5 which checks the *opposite* — touching files outside the lane.)
 
 #### ✅ DONE (v1.1.0) RB-9. Test-verdict cross-check
-- pytest-runner asserts `passed` honestly, but a weak model may report passed=true on a
+- test-runner asserts `passed` honestly, but a weak model may report passed=true on a
   red run (or invent a summary). Run the test command's exit code through a deterministic
   channel where possible (Bash gate in the runner agent's allowed-tools; require the exact
   command + exit code echoed in `command`), and reject a `passed=true` verdict whose

@@ -23,7 +23,7 @@ feature-categorizer(fresh, no --plan) -> prompt-translator(non-English only)
   -> design-plan-reconciler (+design-fix loop) -> [plan review-loop, prompt-enhancer at retries]
   -> plan-chunker(stageNN.md)                     *** sets designReady=true, STOPS in design ***
 [implement gates — skipped in design/tune]
-  -> plan-executor(per stage) -> pytest-runner -> critical-reviewer(code)
+  -> test-writer -> plan-executor(per stage) -> test-runner -> critical-reviewer(code)
   -> complex-decision-analyst(goalkeeper: commit | issues-handoff) -> docs-architecture-publisher
   -> knowledge-persist -> [git-ops]
 [tune gates — own branch, runs first in tune mode]
@@ -187,7 +187,7 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
   "definitionPath": ".planning/user-plans/fix-token-expiry/idea.md", // optional: where the idea doc is written (default: plan dir /idea.md)
   "maxRefineIterations": 10,                                       // optional: SOFT per-loop cap on plan refine iterations (default 10; global budget is the real stop)
   "autoCommit": false,                                             // optional: if true, commit via git-ops when green (default false)
-  "testTarget": "tests/test_auth.py",                             // optional: pytest target (default: whole suite)
+  "testTarget": "tests/test_auth.py",                             // optional: test target/path scope
   "gsdQuick": false,                                               // optional: force the gsd-quick fast-path (default false; define gate may also recommend it)
   "useGsdDebug": true,                                             // optional: gsd-debug recovery on test failure (default true)
   "maxDebugRetries": 20,                                           // optional: SOFT per-loop cap on gsd-debug fix+retest attempts (default 20)
@@ -210,6 +210,7 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
   "useEnhancer": true,                                          // optional: prompt-enhancer at retry sites (default true)
   "useGoalkeeper": true,                                        // optional: Gate 5.1 complex-decision-analyst commit goalkeeper (default true; full path only)
   "useQuickDecider": true,                                      // optional: quick-decider at loop boundaries (default true; turns blind-cap loops into judgment-cap loops)
+  "useTestWriter": true,                                        // optional: implement-mode test-writer gate before execution (default true)
   "decisionCap": 50,                                            // optional: hard runaway floor for decision-agent calls (quick-decider + goalkeeper). Default 50. Hit -> hard-block (resumable via --resume)
   "timestamp": "202606261430",                                  // optional: planDir leaf when no JIRA id in task (default: slug leaf)
   "useChunker": true,                                            // optional: plan-chunker -> stageNN.md after plan-architect (default true, design mode)
@@ -346,7 +347,8 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 | `execute`   | plan-executor (per lane)              | sonnet  |
 | `gsdQuick`  | gsd-quick skill                       | sonnet  |
 | `gsdDebug`  | gsd-debug root-cause                  | opus    |
-| `test`      | pytest-runner                         | sonnet  |
+| `testWriter`| test-writer                           | opus    |
+| `test`      | test-runner                           | sonnet  |
 | `codeReview`| critical-reviewer (code)              | opus    |
 | `quickDecider`| quick-decider (Phase E2 loop boundaries)| opus |
 | `decisionAnalyst`| complex-decision-analyst (Gate 5.1 goalkeeper)| opus |
@@ -397,6 +399,8 @@ The workflow returns a JSON summary object:
   "retryUsed": 2,                // total spent from the shared global retry budget (refine + debug)
   "executed": true,
   "gsdQuick": false,             // true if the gsd-quick fast-path was taken
+  "testsWritten": true,          // true once test-writer authored or confirmed required tests
+  "testWriterSummary": "...",
   "debugRetries": 0,             // number of gsd-debug fix+retest attempts
   "testsPassed": true,
   "testSummary": "12 passed",
@@ -552,12 +556,15 @@ re-read fresh rather than trusting in-memory cache across `Workflow` calls.
    one stage). Runs ONCE in design; never re-run on resume (stages persisted in state). `--no-chunker`
    collapses to a single implicit `stage01` covering the whole plan. **In design mode the pipeline
    sets `designReady=true` here, calls `consolidate`, and returns — nothing executes.**
+2.2. **Test Authoring** (implement, `useTestWriter`) — `test-writer` writes or confirms the
+   required RED/coverage tests from the accepted plan, requirements, e2e use cases, and stage files.
+   It runs before both staged execution and `gsd-quick`; `--no-test-writer` skips it.
 3. **Execute** — `plan-executor` runs the plan (full path), or `gsd-quick` implements it
    (fast-path). If plan lanes are file-disjoint AND `allowParallelExecute` AND ≥2 lanes, one
    `plan-executor` runs per lane in parallel (`lanesUsed > 1`); otherwise a single executor
    (`lanesUsed = 0`). The plan's Regression-mechanics and Edge-case sections are a
    checklist; any carried blockers from a force-accept are addressed here.
-4. **Test** — `pytest-runner` runs the target; gate passes only if tests pass. On failure,
+4. **Test** — `test-runner` runs the target project's test command; gate passes only if tests pass. On failure,
    `gsd-debug` (if enabled) diagnoses + fixes and tests re-run up to the debug
    soft sub-cap (`maxDebugRetries`, default 20). Blocks only if green cannot be
    reached.

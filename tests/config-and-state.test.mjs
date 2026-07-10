@@ -8,6 +8,7 @@ import { engine } from './harness.mjs'
 const {
   detectTestCommand,
   resolveProfile,
+  resolveUseTestWriter,
   PROFILES,
   hydrateBudget,
   validatePipelineState,
@@ -70,6 +71,16 @@ test('resolveProfile: standard is between full and light', () => {
   // standard keeps the review loops that light drops
   assert.equal(std.useEnhancer, undefined)
   assert.equal(std.useQuickDecider, undefined)
+})
+
+test('resolveUseTestWriter: defaults on and can be disabled explicitly', () => {
+  assert.equal(resolveUseTestWriter({}, {}), true)
+  assert.equal(resolveUseTestWriter({ useTestWriter: false }, {}), false)
+})
+
+test('resolveUseTestWriter: carries persisted disabled state across resume', () => {
+  assert.equal(resolveUseTestWriter({}, { useTestWriter: false }), false)
+  assert.equal(resolveUseTestWriter({ profile: 'light' }, { useTestWriter: false }), false)
 })
 
 // ---- IM-2: hydrateBudget ----------------------------------------------------

@@ -112,7 +112,7 @@ const IDENTICAL_FAILURE_LIMIT = 3;
 const GATE_FALLBACKS = {
   'quick-decider': { decision: 'stop', reasoning: 'fallback after unavailable verdict' },
   'complex-decision-analyst': { decision: 'commit', targetPhase: 'none', reasoning: 'fallback after unavailable verdict', trueDefects: [] },
-  'pytest-runner': { passed: false, summary: 'fallback after unavailable test verdict' },
+  'test-runner': { passed: false, summary: 'fallback after unavailable test verdict' },
   'prompt-enhancer': null,
 };
 `
