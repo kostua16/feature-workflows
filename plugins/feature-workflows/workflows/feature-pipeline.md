@@ -666,7 +666,7 @@ cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
 #    phase('...') + stateCheckpoint('...', ...) calls AND literal phase: '...' agent() opts
 { grep -oE "(phase|stateCheckpoint)\('[^']+'" feature-pipeline.js \
     | sed -E "s/.*'([^']+)'/\1/"
-  grep -oE "phase: *'[^']+'" feature-pipeline.js \
+  grep -oE "\bphase: *'[^']+'" feature-pipeline.js \
     | sed -E "s/.*'([^']+)'/\1/"; } | sort -u > /tmp/used.txt
 # 2. titles declared in meta.phases
 sed -n "/^  phases:/,/^  }/p" feature-pipeline.js \
