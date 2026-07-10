@@ -1,0 +1,8 @@
+{
+  "name": "feature-workflows",
+  "version": "1.0.0",
+  "description": "Gate-enforced feature pipeline: THINK (design) -> DO (implement) -> FIX (tune). Ships the feature-pipeline dynamic-workflow engine (installed into your project via /feature-workflows:setup), 32 specialized sub-agents, and the compress-md skill.",
+  "author": { "name": "Konstantin Leontyev", "email": "koleo169kzai@gmail.com" },
+  "homepage": "https://github.com/kostua16/feature-workflows",
+  "keywords": ["workflow", "pipeline", "tdd", "planning", "agents", "design"]
+}
