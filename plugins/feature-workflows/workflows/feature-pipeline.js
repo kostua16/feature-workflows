@@ -714,6 +714,18 @@ const PIPELINE_STATE_READ = {
   },
 }
 
+const ARTIFACT_CHECK = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['exists', 'sizeBytes', 'summary'],
+  properties: {
+    exists: { type: 'boolean' },
+    sizeBytes: { type: 'integer' },
+    hasExpectedHeadings: { type: 'boolean' },
+    summary: { type: 'string' },
+  },
+}
+
 // plan-chunker (Phase H, design tail): chunk plan.md -> dependency-ordered stageNN.md files.
 // Gate = stages array non-empty. The stages are the implement progress unit (lanes collapse INTO
 // a stage; intra-stage parallelism reuses the existing lane fan-out, scoped to one stage).
@@ -800,6 +812,16 @@ const REFINE_SUBCAP_DEFAULT = 10   // soft per-loop cap on plan refine iteration
 const DEBUG_SUBCAP_DEFAULT = 20    // soft per-loop cap on gsd-debug fix+retest
 const RECONCILE_SUBCAP_DEFAULT = 5 // soft per-loop cap on reconcile design-fix iterations
 const DECISION_CAP_DEFAULT = 50   // Phase E1: hard runaway cap on authoritative decision-agent calls
+const AGENT_TIMEOUT_MS_DEFAULT = 10 * 60 * 1000
+const AGENT_MAX_OUTPUT_CHARS_DEFAULT = 200000
+const IDENTICAL_FAILURE_LIMIT = 3
+
+const GATE_FALLBACKS = {
+  'quick-decider': { decision: 'stop', reasoning: 'fallback after unavailable verdict' },
+  'complex-decision-analyst': { decision: 'commit', targetPhase: 'none', reasoning: 'fallback after unavailable verdict', trueDefects: [] },
+  'pytest-runner': { passed: false, summary: 'fallback after unavailable test verdict' },
+  'prompt-enhancer': null,
+}
 
 // Per-gate model tiers (tier aliases resolved by the model-routing layer).
 // Override any of these via args.models, e.g. { models: { plan: 'sonnet' } }.
@@ -963,7 +985,7 @@ async function consolidate(slug, result, config) {
     await flushPipelineLog(planDir, result)
     await flushPipelineState(planDir, result, config)
   }
-  return agent(
+  return safeAgent(
     `You are the todo-store agent. Write ONE consolidated record for task slug "${slug}"
 under .planning/todos/. Capture the full pipeline result (JSON) verbatim as the durable task record:
 
@@ -971,7 +993,8 @@ ${JSON.stringify(result, null, 2)}
 
 Create or replace the todo entry for this task slug. Do NOT read or modify unrelated tasks.
 Return ok=true once written.`,
-    { label: 'todo-store:consolidate', phase: 'Checkpoint', agentType: nsAgent('todo-store'), schema: TODO_ACK, model: gm('todo') }
+    { label: 'todo-store:consolidate', phase: 'Checkpoint', agentType: nsAgent('todo-store'), schema: TODO_ACK, model: gm('todo') },
+    result
   )
 }
 
@@ -1005,12 +1028,13 @@ async function writeChunkedFile(filePath, body, labelPrefix, result, successNote
     const isFirst = i === 0
     const total = chunks.length
     try {
-      await agent(
+      await safeAgent(
         `You are a file-writer agent. ${isFirst ? `Write (create/overwrite) the file at ${filePath}. Create the parent directory if needed.` : `APPEND to the existing file ${filePath} (do not overwrite what is already there).`}
 This is chunk ${i + 1} of ${total}. Write the body below verbatim, then return ok=true.
 
 ${chunks[i]}`,
-        { label: `${labelPrefix}(${i + 1}/${total})`, phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
+        { label: `${labelPrefix}(${i + 1}/${total})`, phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+        result
       )
     } catch (e) {
       result.logLines.push(`WARNING: ${filePath} chunk ${i + 1}/${total} write failed: ${String(e)}`)
@@ -1055,11 +1079,68 @@ async function flushPipelineState(planDir, result, config) {
 // via the file-reader agent; null if the file does not exist.
 async function loadPipelineState(planDir) {
   const statePath = planDir.replace(/\/$/, '') + '/pipeline-state.json'
-  return agent(
+  return safeAgent(
     `You are a file-reader agent. Read ${statePath} and return its full JSON content parsed as an
 object in the "state" field. If the file does not exist, return state=null.`,
-    { label: 'file-reader:pipeline-state', phase: 'Checkpoint', schema: PIPELINE_STATE_READ, model: gm('todo') }
+    { label: 'file-reader:pipeline-state', phase: 'Checkpoint', schema: PIPELINE_STATE_READ, model: gm('todo') },
+    null
   )
+}
+
+async function verifyArtifactPresence({ path, gate, expectedHeadings, result }) {
+  if (!path || path === 'present') return { exists: !!path, sizeBytes: 0, hasExpectedHeadings: true, summary: 'not a file path' }
+  const headingLine = expectedHeadings && expectedHeadings.length
+    ? `Also verify the file contains at least one of these headings/markers: ${expectedHeadings.join(', ')}.`
+    : 'No specific heading marker is required.'
+  const verdict = await safeAgent(
+    `You are a file-reader agent. Verify the artifact file for gate "${gate}" exists at ${path}.
+Read the file metadata/content just enough to answer:
+- exists: true only if the file exists
+- sizeBytes: approximate byte size; 0 if missing
+- hasExpectedHeadings: true when the heading/marker expectation is met
+${headingLine}
+Return summary with the evidence. Do not modify files.`,
+    { label: `artifact-check:${gate}`, phase: 'Checkpoint', schema: ARTIFACT_CHECK, model: gm('todo') },
+    result
+  )
+  return verdict || { exists: false, sizeBytes: 0, hasExpectedHeadings: false, summary: 'artifact check returned null' }
+}
+
+async function repairResumeArtifactFlags(result) {
+  if (!result) return []
+  const repairs = []
+  const artifacts = [
+    { pathKey: 'definitionPath', flags: ['_define'], gate: 'Define' },
+    { pathKey: 'requirementsPath', flags: ['_requirements', '_reviewedRequirements'], gate: 'Requirements' },
+    { pathKey: 'archPath', flags: ['_arch', '_reviewedArch'], gate: 'Architecture' },
+    { pathKey: 'designPath', flags: ['_design', '_reviewedDesign'], gate: 'Detailed Design' },
+    { pathKey: 'planPath', flags: ['planned', '_plan', '_reviewedPlan', 'planAccepted', 'tddEnforced', 'reconcile'], gate: 'Plan' },
+  ]
+  for (const artifact of artifacts) {
+    const path = result[artifact.pathKey]
+    if (!path) continue
+    const checked = await verifyArtifactPresence({
+      path,
+      gate: `resume:${artifact.gate}`,
+      expectedHeadings: ['#'],
+      result,
+    })
+    if (checked.exists && checked.sizeBytes > 0 && checked.hasExpectedHeadings !== false) continue
+    for (const flag of artifact.flags) {
+      if (flag in result) result[flag] = null
+    }
+    result[artifact.pathKey] = null
+    repairs.push(`${artifact.pathKey} (${artifact.gate})`)
+  }
+  if (repairs.length) {
+    result.designReady = false
+    result.ready = false
+    result.executed = null
+    result.testsPassed = false
+    result.codeReview = null
+    result._goalkeeper = null
+  }
+  return repairs
 }
 
 // chunkPlanIntoStages (Phase H, design tail): split plan.md -> dependency-ordered stageNN.md files
@@ -1150,13 +1231,14 @@ code), and give a concrete suggested fix.`,
     '',
   ].join('\n')
   try {
-    await agent(
+    await safeAgent(
       `You are a file-writer agent. APPEND the markdown section below to ${issuesPath}.
 If the file does not exist, create it with a "# Issues & Improvements" header first, then the section.
 Do NOT overwrite existing content — append only. Return ok=true after appending.
 
 ${section}`,
-      { label: 'file-writer(issues)', phase: 'Goalkeeper', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
+      { label: 'file-writer(issues)', phase: 'Goalkeeper', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+      result
     )
     result.issuesPath = issuesPath
     plogFromResult(result, `issue-classifier: UPSTREAM issue recorded → ${issuesPath} (gate=${verdict.gate})`)
@@ -1181,13 +1263,14 @@ async function tickStageFile({ stage, status, planDir, result, note }) {
     '',
   ].join('\n')
   try {
-    await agent(
+    await safeAgent(
       `You are a file-writer agent. APPEND the status note below to the stage file at ${stage.file}.
 If the file does not exist, create it with a "# Stage ${stage.id}: ${stage.name}" header first.
 Do NOT overwrite existing content — append only. Return ok=true.
 
 ${entry}`,
-      { label: `stage-tick:${stage.id}`, phase: 'Execute', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
+      { label: `stage-tick:${stage.id}`, phase: 'Execute', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+      result
     )
   } catch (e) {
     plogFromResult(result, `stage-tick ${stage.id} append failed (non-blocking): ${String(e)}`)
@@ -1256,12 +1339,13 @@ function invalidateStages(result, preserveStages, touchedFiles) {
   if (!result.stages || !result.stages.length) return 0
   const preserve = new Set(preserveStages || [])
   const touched = new Set((touchedFiles || []).map((f) => String(f)))
+  const scopeKnown = touched.size > 0
   let reset = 0
   for (const stage of result.stages) {
     if (stage.status !== 'done') continue
     if (preserve.has(stage.id)) continue
     const stageFiles = (stage.files || []).map((f) => String(f))
-    if (touched.size && stageFiles.some((f) => touched.has(f))) {
+    if (!scopeKnown || stageFiles.some((f) => touched.has(f))) {
       stage.status = 'pending'
       reset++
     }
@@ -1331,7 +1415,7 @@ async function persistFindings(r) {
       debug: r._debug,
       task: r.task,
     }
-    const verdict = await agent(
+    const verdict = await safeAgent(
       `You are the knowledge-persist agent. Persist the findings from this feature-pipeline run into
 CLAUDE.md and Serena memory as durable rules/gotchas. Only persist genuinely reusable knowledge
 (non-obvious gotchas, recurring rules, edge cases) — do NOT persist one-off task detail.
@@ -1340,7 +1424,8 @@ Findings (JSON):
 ${JSON.stringify(findings, null, 2)}
 
 Read CLAUDE.md first; append rules, do not duplicate existing ones. Do NOT commit.`,
-      { label: 'knowledge-persist', phase: 'Persist', schema: PERSIST_VERDICT, model: gm('persist') }
+      { label: 'knowledge-persist', phase: 'Persist', schema: PERSIST_VERDICT, model: gm('persist') },
+      r
     )
     r.persist = verdict || { persisted: false }
   } catch (e) {
@@ -1356,7 +1441,7 @@ Read CLAUDE.md first; append rules, do not duplicate existing ones. Do NOT commi
 async function publishDesign(r, planPath, task) {
   if (!r) return
   try {
-    const published = await agent(
+    const published = await safeAgent(
       `You are the docs-architecture-publisher agent. Publish/organize the plan and architecture
 design for this task into the project documentation. Source artifacts: plan at ${planPath},
 architecture at ${r.archPath || '(none)'}, detailed design at ${r.designPath || '(none)'}.
@@ -1365,7 +1450,8 @@ Read mem:core and mem:conventions first. Do NOT commit; just write the docs.
 
 Task:
 ${task || r.task || '(none)'}`,
-      { label: 'docs-architecture-publisher', phase: 'Publish', schema: PUBLISH_VERDICT, model: gm('publish') }
+      { label: 'docs-architecture-publisher', phase: 'Publish', schema: PUBLISH_VERDICT, model: gm('publish') },
+      r
     )
     r.published = published || { published: false, summary: 'publisher agent returned null' }
     plogFromResult(r, `Publish: published=${r.published.published}; paths=${(r.published.paths || []).length}`)
@@ -1380,11 +1466,12 @@ async function runTests(testTarget) {
   const target = testTarget && testTarget.trim() ? testTarget.trim() : ''
   const pytestCmd = target ? `python -m pytest -v --tb=short ${target}` : 'python -m pytest -v --tb=short'
   log(`Running tests: ${pytestCmd}`)
-  return agent(
+  return safeAgent(
     `You are the pytest-runner agent. Run this exact pytest command and report whether it passed:
 ${pytestCmd}
 Report the exit status honestly (passed=true only on exit 0). Do NOT modify code or tests.`,
-    { label: 'pytest-runner', phase: 'Test', schema: TEST_VERDICT, model: gm('test') }
+    { label: 'pytest-runner', phase: 'Test', schema: TEST_VERDICT, model: gm('test') },
+    null
   )
 }
 
@@ -1394,16 +1481,7 @@ Report the exit status honestly (passed=true only on exit 0). Do NOT modify code
 // null-handling (convergence gate, fail-forward) degrades gracefully instead of crashing.
 // Use for the critical-path schema-gated calls whose throw would otherwise escape main().
 async function safeAgent(prompt, opts, result) {
-  try {
-    return await agent(prompt, opts)
-  } catch (e) {
-    const msg = String(e && e.message ? e.message : e)
-    if (result && Array.isArray(result.logLines)) {
-      result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (caught): ${msg}`)
-    }
-    log(`Agent "${opts && opts.label}" threw — converting to null (graceful degradation): ${msg}`)
-    return null
-  }
+  return flexibleAgent(prompt, opts, result)
 }
 
 // Some non-standard providers fail to satisfy a forced-StructuredOutput schema with certain
@@ -1413,11 +1491,13 @@ async function safeAgent(prompt, opts, result) {
 // response ourselves. This keeps the gate-enforcing pipeline intact on providers where forced
 // tool-use is unreliable.
 async function flexibleAgent(prompt, opts, result) {
+  const callOpts = escalateAgentOpts(opts, result)
+  const effectivePrompt = hardenForModel(prompt, callOpts && callOpts.schema, callOpts && callOpts.model)
   let out = null
   let schemaFailed = false
   let originalError = ''
   try {
-    out = await agent(prompt, opts)
+    out = await callAgentWithWatchdog(effectivePrompt, callOpts, result)
   } catch (e) {
     originalError = String(e && e.message ? e.message : e)
     schemaFailed = /StructuredOutput|schema|valid output/i.test(originalError)
@@ -1434,30 +1514,34 @@ async function flexibleAgent(prompt, opts, result) {
     log(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
   }
   if (out) {
-    if (typeof out === 'object') return out
+    if (typeof out === 'object') {
+      const normalized = normalizeAgentOutput(callOpts, out, result)
+      if (normalized) return normalized
+    }
     const parsed = extractJson(out)
     if (parsed && typeof parsed === 'object') {
       if (result && Array.isArray(result.logLines)) {
         result.logLines.push(`Parsed JSON object from plain-text agent output for "${opts && opts.label}"`)
       }
       log(`Parsed JSON object from plain-text agent output for "${opts && opts.label}"`)
-      return parsed
+      const normalized = normalizeAgentOutput(callOpts, parsed, result)
+      if (normalized) return normalized
     }
     // Not a valid object response — fall through to JSON-only retry.
   }
 
-  const jsonPrompt = `${prompt}\n\nIMPORTANT: Return ONLY a single JSON object matching the expected structure. Do NOT include markdown fences, explanations, or prose. The JSON must be parseable by JSON.parse().`
+  const jsonPrompt = `${effectivePrompt}\n\nIMPORTANT: Return ONLY a single JSON object matching the expected structure. Do NOT include markdown fences, explanations, or prose. The JSON must be parseable by JSON.parse().`
   try {
     // Strip the schema property entirely so the fallback call is treated as plain text.
-    const { schema: _unused, ...plainOpts } = opts
-    const raw = await agent(jsonPrompt, plainOpts)
+    const { schema: _unused, ...plainOpts } = callOpts
+    const raw = await callAgentWithWatchdog(jsonPrompt, plainOpts, result)
     const parsed = extractJson(raw)
     if (parsed && typeof parsed === 'object') {
       if (result && Array.isArray(result.logLines)) {
         result.logLines.push(`Plain-text JSON fallback succeeded for "${opts && opts.label}"`)
       }
       log(`Plain-text JSON fallback succeeded for "${opts && opts.label}"`)
-      return parsed
+      return normalizeAgentOutput(callOpts, parsed, result)
     }
   } catch (e2) {
     const msg2 = String(e2 && e2.message ? e2.message : e2)
@@ -1466,7 +1550,224 @@ async function flexibleAgent(prompt, opts, result) {
     }
     log(`Plain-text JSON fallback also failed for "${opts && opts.label}": ${msg2}`)
   }
+  recordAgentFailure(result, callOpts, 'unavailable verdict')
+  return fallbackForAgent(callOpts)
+}
+
+function normalizeAgentOutput(opts, value, result) {
+  const normalized = normalizeVerdict(opts && opts.schema, value)
+  if (outputLanguageViolation(normalized)) {
+    recordAgentFailure(result, opts, 'non-English verdict')
+    return null
+  }
+  const contradiction = verdictContradiction(normalized)
+  if (!contradiction) return normalized
+  if (result && Array.isArray(result.logLines)) {
+    result.logLines.push(`WARNING: agent "${opts && opts.label}" returned contradictory verdict: ${contradiction}`)
+  }
+  log(`Agent "${opts && opts.label}" returned contradictory verdict — rejecting: ${contradiction}`)
+  recordAgentFailure(result, opts, contradiction)
   return null
+}
+
+function fallbackForAgent(opts) {
+  const label = String(opts && opts.label || '')
+  const key = Object.keys(GATE_FALLBACKS).find((candidate) => label.includes(candidate))
+  const fallback = key ? GATE_FALLBACKS[key] : null
+  if (!fallback || typeof fallback !== 'object') return fallback
+  return JSON.parse(JSON.stringify(fallback))
+}
+
+function escalateAgentOpts(opts, result) {
+  if (!opts || !result || !result.agentFailures) return opts
+  const key = agentFailureKey(opts)
+  const failures = result.agentFailures[key]
+  if (!failures || failures.count < 2) return opts
+  const model = String(opts.model || '').toLowerCase()
+  if (model === 'opus' || model.includes('claude-opus')) return opts
+  return { ...opts, model: 'opus', escalatedFrom: opts.model || '(default)' }
+}
+
+function recordAgentFailure(result, opts, reason) {
+  if (!result) return 0
+  const key = agentFailureKey(opts)
+  if (!result.agentFailures) result.agentFailures = {}
+  const current = result.agentFailures[key] || { count: 0, reason: '', circuitOpen: false }
+  current.count += 1
+  current.reason = reason
+  current.circuitOpen = current.count >= IDENTICAL_FAILURE_LIMIT
+  result.agentFailures[key] = current
+  if (!result.degradationTelemetry) result.degradationTelemetry = { fallbacks: 0, escalations: 0, languageViolations: 0, circuitBreakers: 0 }
+  result.degradationTelemetry.fallbacks += 1
+  if (reason === 'non-English verdict') result.degradationTelemetry.languageViolations += 1
+  if (current.count === 2) result.degradationTelemetry.escalations += 1
+  if (current.circuitOpen) result.degradationTelemetry.circuitBreakers += 1
+  if (Array.isArray(result.logLines)) {
+    result.logLines.push(`WARNING: agent "${opts && opts.label}" failure ${current.count}/${IDENTICAL_FAILURE_LIMIT}: ${reason}${current.circuitOpen ? ' (circuit open)' : ''}`)
+  }
+  return current.count
+}
+
+function agentFailureKey(opts) {
+  return `${(opts && opts.phase) || 'unknown'}:${(opts && opts.label) || 'agent'}`
+}
+
+function outputLanguageViolation(value) {
+  if (!value || typeof value !== 'object') return false
+  const text = JSON.stringify(value)
+  const lang = detectNonEnglish(text)
+  return lang.ratio > 0.30
+}
+
+async function callAgentWithWatchdog(prompt, opts, result) {
+  const timeoutMs = Number(opts && opts.timeoutMs) || AGENT_TIMEOUT_MS_DEFAULT
+  const maxOutputChars = Number(opts && opts.maxOutputChars) || AGENT_MAX_OUTPUT_CHARS_DEFAULT
+  const timeoutSentinel = { __agentTimeout: true }
+  let timer = null
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(timeoutSentinel), timeoutMs)
+  })
+  try {
+    const out = await Promise.race([agent(prompt, opts), timeout])
+    if (out === timeoutSentinel) {
+      recordAgentWatchdog(result, 'timeouts', opts, `timed out after ${timeoutMs}ms`)
+      return null
+    }
+    if (typeof out === 'string' && out.length > maxOutputChars) {
+      recordAgentWatchdog(result, 'oversized', opts, `returned ${out.length} chars (limit ${maxOutputChars})`)
+      return null
+    }
+    return out
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function recordAgentWatchdog(result, key, opts, detail) {
+  if (!result) return
+  if (!result.agentWatchdog) result.agentWatchdog = { timeouts: 0, oversized: 0 }
+  result.agentWatchdog[key] = (result.agentWatchdog[key] || 0) + 1
+  if (Array.isArray(result.logLines)) {
+    result.logLines.push(`WARNING: agent "${opts && opts.label}" ${detail}`)
+  }
+}
+
+function hardenForModel(prompt, schema, model) {
+  if (!schema) return prompt
+  const modelName = String(model || '').toLowerCase()
+  const isStrong = modelName === 'opus' || modelName.includes('claude-opus')
+  if (isStrong) return prompt
+  if (String(prompt).includes('WEAK-MODEL OUTPUT CONTRACT')) return prompt
+  return `${prompt}
+
+WEAK-MODEL OUTPUT CONTRACT:
+- Return English only.
+- Return one JSON object only: no markdown fences, no prose, no comments.
+- Use the exact field names and primitive types from this example.
+- If a field is unknown, use the schema-safe empty value shown by the example.
+
+Example JSON:
+${JSON.stringify(schemaExample(schema), null, 2)}`
+}
+
+function schemaExample(schema) {
+  if (!schema) return null
+  if (schema.enum && schema.enum.length) return schema.enum[0]
+  const type = Array.isArray(schema.type) ? schema.type.find((entry) => entry !== 'null') : schema.type
+  if (type === 'boolean') return false
+  if (type === 'integer' || type === 'number') return 0
+  if (type === 'array') return []
+  if (type === 'object') {
+    const out = {}
+    for (const [key, propSchema] of Object.entries(schema.properties || {})) {
+      out[key] = schemaExample(propSchema)
+    }
+    return out
+  }
+  return ''
+}
+
+function normalizeVerdict(schema, value) {
+  if (!schema || value == null) return value
+  if (schema.type === 'array') {
+    const values = Array.isArray(value) ? value : [value]
+    return values.map((item) => normalizeVerdict(schema.items || {}, item))
+  }
+  if (schema.type === 'object' && typeof value === 'object' && !Array.isArray(value)) {
+    const normalized = { ...value }
+    const properties = schema.properties || {}
+    for (const [key, propSchema] of Object.entries(properties)) {
+      if (Object.prototype.hasOwnProperty.call(normalized, key)) {
+        normalized[key] = normalizeVerdict(propSchema, normalized[key])
+      }
+    }
+    return normalized
+  }
+  if (schema.type === 'object' && typeof value === 'string') {
+    return { text: value }
+  }
+  if (schema.enum && typeof value === 'string') {
+    const mapped = normalizeEnum(value)
+    const match = schema.enum.find((item) => String(item).toLowerCase() === mapped)
+    return match === undefined ? value : match
+  }
+  if (schema.type === 'boolean') {
+    if (typeof value === 'string') {
+      const lowered = value.trim().toLowerCase()
+      if (lowered === 'true' || lowered === 'yes' || lowered === '1') return true
+      if (lowered === 'false' || lowered === 'no' || lowered === '0') return false
+    }
+    if (value === 1) return true
+    if (value === 0) return false
+  }
+  if ((schema.type === 'number' || schema.type === 'integer') && typeof value === 'string' && value.trim() !== '') {
+    const numeric = Number(value)
+    if (Number.isFinite(numeric)) return schema.type === 'integer' ? Math.trunc(numeric) : numeric
+  }
+  return value
+}
+
+function normalizeEnum(value) {
+  const lowered = value.trim().toLowerCase()
+  const synonyms = {
+    critical: 'blocker',
+    warn: 'low',
+    warning: 'low',
+    ok: 'accepted',
+    approve: 'accepted',
+    approved: 'accepted',
+    retrying: 'retry',
+    halt: 'stop',
+  }
+  return synonyms[lowered] || lowered
+}
+
+function verdictContradiction(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const blockers = countItems(value.blockers) + countItems(value.gaps)
+  if (value.accepted === true && blockers > 0) return 'accepted=true with blockers/gaps'
+  if (value.accepted === false && blockers === 0) return 'accepted=false with no blockers/gaps'
+  const files = countItems(value.files)
+  if (value.completed === true && Number(value.stepsDone || 0) === 0 && files === 0) {
+    return 'completed=true with no stepsDone and no files'
+  }
+  if (value.completed === true && files === 0 && /no changes|nothing (to )?(change|do|modify)|unchanged/i.test(String(value.summary || ''))) {
+    return 'completed=true while summary says no work was done'
+  }
+  if (value.passed === true && /(failed|failures|error|exit\s*1|exit status\s*1|non-zero)/i.test(String(value.summary || value.command || ''))) {
+    return 'passed=true while test summary/command reports failure'
+  }
+  if (value.fixed === true && !value.summary && !value.changeSummary && countItems(value.files) === 0) {
+    return 'fixed=true without summary, changeSummary, or files'
+  }
+  if (value.decision === 'retry' && /(^|\b)(stop|halt|cancel|give up)(\b|$)/i.test(String(value.reasoning || ''))) {
+    return 'decision=retry while reasoning says stop'
+  }
+  return ''
+}
+
+function countItems(value) {
+  return Array.isArray(value) ? value.length : 0
 }
 
 function extractJson(raw) {
@@ -1474,18 +1775,89 @@ function extractJson(raw) {
   if (typeof raw === 'object') return raw
   if (typeof raw !== 'string') return null
   const text = raw.trim()
-  try { return JSON.parse(text) } catch (_) { /* continue */ }
-  // Extract JSON from markdown fences (common failure mode).
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]+?)```/)
-  if (fenceMatch) {
-    try { return JSON.parse(fenceMatch[1].trim()) } catch (_) { /* continue */ }
-  }
-  // Extract first {...} block (greedy) and try to parse; if that fails, try last }.
-  const match = text.match(/\{[\s\S]*\}/)
-  if (match) {
-    try { return JSON.parse(match[0]) } catch (_) { /* continue */ }
+  for (const candidate of jsonCandidates(text)) {
+    const parsed = parseJsonCandidate(candidate)
+    if (parsed !== null) return parsed
   }
   return null
+}
+
+function parseJsonCandidate(candidate) {
+  const variants = [candidate, repairJsonText(candidate)]
+  for (const variant of variants) {
+    try { return JSON.parse(variant) } catch (_) { /* continue */ }
+  }
+  return null
+}
+
+function jsonCandidates(text) {
+  const candidates = [text]
+  const fenceRegex = /```(?:json)?\s*([\s\S]+?)```/gi
+  let fenceMatch
+  while ((fenceMatch = fenceRegex.exec(text)) !== null) {
+    candidates.push(fenceMatch[1].trim())
+  }
+  candidates.push(...braceCandidates(text))
+  return candidates.filter((candidate, index) => candidate && candidates.indexOf(candidate) === index)
+}
+
+function braceCandidates(text) {
+  const candidates = []
+  const stack = []
+  let start = -1
+  let quote = ''
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === quote) {
+        quote = ''
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char !== '{' && char !== '[' && char !== '}' && char !== ']') continue
+    if (char === '{' || char === '[') {
+      if (stack.length === 0) start = i
+      stack.push(char)
+      continue
+    }
+    const opener = stack[stack.length - 1]
+    if ((char === '}' && opener === '{') || (char === ']' && opener === '[')) {
+      stack.pop()
+      if (stack.length === 0 && start >= 0) {
+        candidates.push(text.slice(start, i + 1))
+        start = -1
+      }
+    }
+  }
+  if (start >= 0 && stack.length) {
+    const closers = stack.reverse().map((char) => char === '{' ? '}' : ']').join('')
+    candidates.push(text.slice(start) + closers)
+  }
+  return candidates
+}
+
+function repairJsonText(text) {
+  let repaired = String(text).trim()
+  repaired = repaired.replace(/,\s*([}\]])/g, '$1')
+  repaired = repaired.replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false').replace(/\bNone\b/g, 'null')
+  repaired = repaired.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, value) => JSON.stringify(value.replace(/\\"/g, '"')))
+  repaired = repaired.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+  const openCurly = (repaired.match(/{/g) || []).length
+  const closeCurly = (repaired.match(/}/g) || []).length
+  const openSquare = (repaired.match(/\[/g) || []).length
+  const closeSquare = (repaired.match(/]/g) || []).length
+  if (openSquare > closeSquare) repaired += ']'.repeat(openSquare - closeSquare)
+  if (openCurly > closeCurly) repaired += '}'.repeat(openCurly - closeCurly)
+  return repaired
 }
 
 // Append a review verdict to <planDir>/review-history.md (Phase C2 persistence). Non-blocking.
@@ -1515,13 +1887,14 @@ async function appendReviewHistory(planDir, phaseLabel, iteration, verdict, acce
     '',
   ].join('\n')
   try {
-    await agent(
+    await safeAgent(
       `You are a file-writer agent. APPEND the section below to the file at ${historyPath}.
 Create the file (and parent dirs) if it does not exist. Do NOT overwrite existing content — append only.
 Return ok=true after appending.
 
 ${section}`,
-      { label: `review-history(${phaseLabel}#${iteration})`, phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
+      { label: `review-history(${phaseLabel}#${iteration})`, phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+      null
     )
   } catch (e) {
     log(`review-history append failed (${phaseLabel}#${iteration}): ${String(e)}`)
@@ -1652,7 +2025,7 @@ async function enhancePrompt({ gateKey, basePrompt, failureContext, intent, resu
     result.enhancedPromptsPath = planDir.replace(/\/$/, '') + '/enhanced-prompts.md'
   }
   try {
-    const enhanced = await agent(
+    const enhanced = await safeAgent(
       `You are the prompt-enhancer agent. Harden the following base prompt for a RETRY attempt. The prior
 attempt failed for this reason:
 ${failureContext}
@@ -1666,7 +2039,8 @@ ${basePrompt}
 
 Return the FULL hardened prompt text (the downstream agent will receive it verbatim). Summarize the
 changes you made. Do NOT commit.`,
-      { label: `prompt-enhancer(${gateKey})`, phase: 'Enhance', schema: ENHANCER_VERDICT, model: gm('enhancer') }
+      { label: `prompt-enhancer(${gateKey})`, phase: 'Enhance', schema: ENHANCER_VERDICT, model: gm('enhancer') },
+      result
     )
     if (enhanced && enhanced.enhancedPrompt) {
       result._enhancedPrompts[gateKey] = { intent, failureContext, enhancedPrompt: enhanced.enhancedPrompt, changes: enhanced.changes || [] }
@@ -1685,12 +2059,13 @@ changes you made. Do NOT commit.`,
         '',
       ].join('\n')
       try {
-        await agent(
+        await safeAgent(
           `You are a file-writer agent. APPEND the entry below to ${result.enhancedPromptsPath}.
 Create the file if absent. Do NOT overwrite. Return ok=true.
 
 ${entry}`,
-          { label: `enhanced-prompts(${gateKey})`, phase: 'Enhance', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
+          { label: `enhanced-prompts(${gateKey})`, phase: 'Enhance', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+          result
         )
       } catch (e) {
         log(`enhanced-prompts append failed (${gateKey}): ${String(e)}`)
@@ -1808,13 +2183,14 @@ async function appendDecisionLog(planDir, entry, result) {
   if (!planDir) return
   const path = planDir.replace(/\/$/, '') + '/decisions.md'
   try {
-    await agent(
+    await safeAgent(
       `You are a file-writer agent. APPEND the markdown entry below to ${path}.
 If the file does not exist, create it with a "# Decision Log" header first, then the entry.
 Do NOT overwrite existing content. Entry to append:
 
 ${entry}`,
-      { label: 'file-writer(decisions)', phase: 'Goalkeeper' }
+      { label: 'file-writer(decisions)', phase: 'Goalkeeper' },
+      result
     )
     if (result) result.decisionsPath = path
   } catch (e) {
@@ -1843,13 +2219,14 @@ async function writeOpenQuestions(planDir, entries, result) {
   })
   const body = records.map((r) => `- [${r.status.toUpperCase()}] [${r.gate}] ${r.id} (${r.severity}): ${r.text}`).join('\n')
   try {
-    await agent(
+    await safeAgent(
       `You are a file-writer agent. APPEND the open-questions list below to ${path}.
 If the file does not exist, create it with a "# Open Questions" header first, then the list.
 Do NOT overwrite existing content — append only. List to append:
 
 ${body}`,
-      { label: 'file-writer(open-questions)', phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
+      { label: 'file-writer(open-questions)', phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+      result
     )
     if (result) result.openQuestionsPath = path
     plogFromResult(result, `open-questions.md: appended ${records.length} entr${records.length === 1 ? 'y' : 'ies'} (${path})`)
@@ -1869,12 +2246,13 @@ async function writeFailedLaunch(leaf, blockedAt, reason, argsKeys) {
   const stamp = 'pre-result-exit'
   const body = `# Failed launch breadcrumb\n\n- blockedAt: ${blockedAt}\n- reason: ${reason}\n- argsKeys: ${argsKeys}\n- writtenAt: ${stamp}\n`
   try {
-    await agent(
+    await safeAgent(
       `You are a file-writer agent. Write (overwrite) the markdown below to the file at ${path}.
 Create the parent directory if it does not exist. Content:
 
 ${body}`,
-      { label: 'file-writer(failed-launch)', phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
+      { label: 'file-writer(failed-launch)', phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+      null
     )
   } catch (e) {
     log('writeFailedLaunch failed (non-blocking): ' + String(e))
@@ -2101,7 +2479,7 @@ async function main() {
   let planPath
   if (explicitPlanPath) {
     planPath = explicitPlanPath
-  } else {
+  } else if (gateModeActive('design', mode)) {
     // Fresh run with no explicit --plan → derive dynamically.
     const leafId = jiraIdFromTask(task) || ((args && args.timestamp) ? args.timestamp : slug)
     if (useCategorizer) {
@@ -2183,6 +2561,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (result.handoff === undefined) result.handoff = null
     if (!result.logLines) result.logLines = []
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
+    const resumeRepairs = await repairResumeArtifactFlags(result)
+    for (const repair of resumeRepairs) {
+      plog(`resume-repair: cleared ${repair} because artifact verification failed`)
+    }
   } else {
     result = {
       task,
@@ -2305,7 +2687,7 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       // useTuneConfirm default ON (--no-confirm runs directly). On resume with result.tuneConfirmed we
       // skip re-confirming.
       if (useTuneConfirm && !result.tuneConfirmed) {
-        const confirmed = await agent(
+        const confirmed = await safeAgent(
           `You are the tune-confirmation agent. Confirm the following tune gate-revisit plan with the user
 via AskUserQuestion. Present the derived gates + preserved stages; offer to run as-is, edit (the user
 replies with a corrected gate set), or cancel.
@@ -2324,7 +2706,8 @@ If the user approves (as-is or edited), set confirmed=true and record the FINAL 
               confirmed: { type: 'boolean', description: 'true if the user approved the revisit plan' },
               finalGates: { type: 'array', items: { type: 'string', enum: ['requirements', 'architecture', 'design', 'plan'] }, description: 'final approved gate list (may differ from derived)' },
             },
-          }, model: gm('quickDecider') }
+          }, model: gm('quickDecider') },
+          result
         )
         if (!confirmed || !confirmed.confirmed) {
           result.blockedAt = 'tune-cancelled'
@@ -2376,7 +2759,11 @@ Task:\n${task}`,
           { label: 'design-plan-reconciler(tune)', phase: 'Reconcile', schema: RECONCILE_VERDICT, model: gm('reconcile') },
           result
         )
-        result.reconcile = reconcile || result.reconcile
+        result.reconcile = reconcile || result.reconcile || {
+          consistent: true,
+          conflicts: [],
+          summary: 'tune reconcile unavailable; no new conflicts reported',
+        }
         plog(`Tune: reconcile consistent=${result.reconcile.consistent}; conflicts=${(result.reconcile.conflicts || []).length}`)
       }
 
@@ -2451,6 +2838,7 @@ ${task}`,
       _e4LoopGuard++
       if (_e4LoopGuard > 1) plog(`Phase E4: re-running full path (loop-back pass ${_e4LoopGuard})`)
 
+    if (gateModeActive('design', mode)) {
     // Gate 0: Define ---------------------------------------------------------
     phase('Define')
   let definition = result._define || null
@@ -2554,6 +2942,8 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
   }
   stateCheckpoint('Define', 'done')
 
+    }
+
   // Decide execution path: explicit gsdQuick arg wins, else honor the define
   // recommendation persisted on result (so resume routes the same way).
   // Phase F-K: gsd-quick is an ALTERNATE EXECUTOR, so it belongs to implement mode only.
@@ -2571,21 +2961,22 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
     } else {
       phase('Execute')
       plog('gsd-quick fast-path: implementing via gsd-quick skill')
-      const gsdRun = await agent(
+      const gsdRun = await safeAgent(
         `You are running inside feature-pipeline. Invoke the "gsd-quick" skill via your Skill tool
 to implement this task end-to-end (plan + execute + test):
 
 Task:
 ${task}
 
-Definition doc: ${definition.definitionPath}
+Definition doc: ${result.definitionPath || definitionPath}
 Plan dir: ${planPath.replace(/plan\.md$/, '')}
 
 Adhere to the pass gates in the definition doc. Do NOT commit. Do NOT weaken tests.
 If the gsd-quick skill or the Skill tool is unavailable, implement directly following
 the definition pass gates and set usedFallback=true. Report what was implemented and the
 test outcome you observed.`,
-        { label: 'gsd-quick', phase: 'Execute', schema: GSD_RUN_VERDICT, model: gm('gsdQuick') }
+        { label: 'gsd-quick', phase: 'Execute', schema: GSD_RUN_VERDICT, model: gm('gsdQuick') },
+        result
       )
       if (!gsdRun || !gsdRun.ran) {
         result.blockedAt = 'gsd-quick'
@@ -3462,18 +3853,46 @@ malformed output.`
       // failed without blocking; surface it as a warning (not a hard block — the gate may have been
       // intentionally disabled, or the path legitimately optional for that task).
       const mandatedArtifacts = [
-        { key: 'idea', path: result.definitionPath, gate: 'Define', flag: true },
-        { key: 'requirements', path: result.requirementsPath, gate: 'Requirements', flag: useRequirements },
-        { key: 'architecture', path: result.archPath, gate: 'Architecture', flag: useArchDesign },
-        { key: 'detailed-design', path: result.designPath, gate: 'Detailed Design', flag: useDetailedDesign },
-        { key: 'plan', path: result.planPath, gate: 'Plan', flag: true },
+        { key: 'idea', path: result.definitionPath, gate: 'Define', flag: true, expectedHeadings: ['#'] },
+        { key: 'requirements', path: result.requirementsPath, gate: 'Requirements', flag: useRequirements, expectedHeadings: ['#'] },
+        { key: 'architecture', path: result.archPath, gate: 'Architecture', flag: useArchDesign, expectedHeadings: ['#'] },
+        { key: 'detailed-design', path: result.designPath, gate: 'Detailed Design', flag: useDetailedDesign, expectedHeadings: ['#'] },
+        { key: 'plan', path: result.planPath, gate: 'Plan', flag: true, expectedHeadings: ['#', 'Stage', 'TODO'] },
         { key: 'stages', path: (result.stages || []).length ? 'present' : null, gate: 'Chunk Plan', flag: useChunker },
       ]
       const missingArtifacts = mandatedArtifacts.filter((a) => a.flag && !a.path)
+      const failedArtifactChecks = []
+      for (const artifact of mandatedArtifacts.filter((a) => a.flag && a.path && a.path !== 'present')) {
+        const checked = await verifyArtifactPresence({
+          path: artifact.path,
+          gate: artifact.gate,
+          expectedHeadings: artifact.expectedHeadings || [],
+          result,
+        })
+        if (!checked.exists || checked.sizeBytes <= 0 || checked.hasExpectedHeadings === false) {
+          failedArtifactChecks.push({ artifact, checked })
+        }
+      }
       if (missingArtifacts.length) {
         const msg = `designWarnings: ${missingArtifacts.length} mandated artifact(s) produced no path: ${missingArtifacts.map((a) => `${a.key}(${a.gate})`).join(', ')}`
         plog(msg)
         result.designWarnings.push(msg)
+      }
+      if (missingArtifacts.length || failedArtifactChecks.length) {
+        result.blockedAt = 'artifact-missing'
+        result.artifactChecks = failedArtifactChecks.map(({ artifact, checked }) => ({
+          key: artifact.key,
+          path: artifact.path,
+          gate: artifact.gate,
+          exists: checked.exists,
+          sizeBytes: checked.sizeBytes,
+          hasExpectedHeadings: checked.hasExpectedHeadings,
+          summary: checked.summary,
+        }))
+        plog(`Design mode: artifact verification failed — missing=${missingArtifacts.length}; invalid=${failedArtifactChecks.length}`)
+        stateCheckpoint('Design', 'blocked')
+        await consolidate(slug, result, config)
+        return result
       }
 
       phase('Design')
@@ -3521,6 +3940,7 @@ malformed output.`
       const stages = result.stages && result.stages.length
         ? result.stages
         : [{ id: 'stage01', file: planDir + 'stage01.md', name: 'Whole plan', status: 'pending', files: (result.lanes || []).flatMap((l) => l.files || []) }]
+      if (!result.stages || !result.stages.length) result.stages = stages
       const carriedBlockersLine = result.carriedBlockers && result.carriedBlockers.length
         ? `Carried-forward blockers from force-accept (address specifically): ${JSON.stringify(result.carriedBlockers)}`
         : ''
@@ -3563,7 +3983,7 @@ malformed output.`
         if (useLanes) {
           plog(`Execute: stage ${stage.id} — ${scopedLanes.length} file-disjoint lanes in parallel`)
           const laneVerdicts = await parallel(scopedLanes.map((lane) => () =>
-            agent(
+            safeAgent(
               `You are the plan-executor agent. Execute stage ${stage.id} ("${stage.name}") of the plan at ${planPath}.
 
 Task:
@@ -3581,7 +4001,8 @@ Do NOT commit. Write tests per the plan's TDD scenarios. The plan's "Regression-
 "Edge-case enumeration" sections are a checklist — verify every named construction site in your lane
 is updated before declaring completion. ${carriedBlockersLine}
 Return completed=true only if your lane's steps are fully executed.`,
-              { label: `plan-executor:${stage.id}:${lane.name}`, phase: 'Execute', schema: EXECUTE_VERDICT, model: gm('execute') }
+              { label: `plan-executor:${stage.id}:${lane.name}`, phase: 'Execute', schema: EXECUTE_VERDICT, model: gm('execute') },
+              result
             )
           ))
           const valid = laneVerdicts.filter(Boolean)
@@ -3717,9 +4138,10 @@ resolves the failures, plus a change summary.`
           result, planDir, useEnhancer,
         })
       }
-      const dbg = await agent(
+      const dbg = await safeAgent(
         debugPrompt,
-        { label: 'gsd-debug', phase: 'Debug', schema: DEBUG_VERDICT, model: gm('gsdDebug') }
+        { label: 'gsd-debug', phase: 'Debug', schema: DEBUG_VERDICT, model: gm('gsdDebug') },
+        result
       )
       result._debug = dbg
       if (!dbg || !dbg.fixed) {
@@ -3911,13 +4333,14 @@ Do NOT include formatting nits unless they change meaning.`,
   if (autoCommit && !result.committed) {
     phase('Commit')
     plog('Committing (autoCommit=true)')
-    const commit = await agent(
+    const commit = await safeAgent(
       `You are the git-ops agent. Stage and commit the current changes for this task:
 ${task}
 
 Commit on the current branch (do NOT push unless already instructed).
 Use a clear conventional-commit message. Return the commit hash.`,
-      { label: 'git-ops', phase: 'Commit', schema: COMMIT_VERDICT, model: gm('commit') }
+      { label: 'git-ops', phase: 'Commit', schema: COMMIT_VERDICT, model: gm('commit') },
+      result
     )
     result.committed = !!(commit && commit.committed)
     result.commitHash = commit ? commit.commitHash : null
