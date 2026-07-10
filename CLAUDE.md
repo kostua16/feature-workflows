@@ -45,3 +45,5 @@ This project shall be a claude code plugin\marketplace app that allows users to 
 - Always spawn 'plan-chunker' agent to chunk the plan into smaller, more manageable parts.
 - Always spawn 'test-writer' agent to write tests for the feature/change/CR.
 - Always run shell commands using the Serena `execute_shell_command` tool instead of using a Bash tool or similar.
+- Always read related documents in the 'docs' folder and serena memories before starting any task.
+- Once useful notes/knowledge are found, always capture them in the 'docs' folder and serena memories.
