@@ -86,8 +86,10 @@ function loadFunction(name) {
     'normalizeEnum',
     'verdictContradiction',
     'countItems',
+    'reasoningSaysStop',
     'fallbackForAgent',
     'recordAgentFailure',
+    'agentCircuitOpen',
     'agentFailureKey',
     'outputLanguageViolation',
     'hardenForModel',
@@ -97,6 +99,11 @@ function loadFunction(name) {
     'jsonCandidates',
     'braceCandidates',
     'repairJsonText',
+    'stripTrailingCommasOutsideStrings',
+    'replacePythonLiteralsOutsideStrings',
+    'quoteBareKeysOutsideStrings',
+    'normalizeSingleQuotedStrings',
+    'rewriteOutsideStrings',
     name,
   ]
   const body = [...new Set(functionNames)].map(extractFunction).join('\n')
@@ -221,6 +228,7 @@ test('verdictContradiction rejects internally inconsistent verdicts', () => {
   assert.equal(verdictContradiction({ completed: true, stepsDone: 1, files: [], summary: 'nothing to change' }), 'completed=true while summary says no work was done')
   assert.equal(verdictContradiction({ passed: true, summary: '3 failed, exit 1' }), 'passed=true while test summary/command reports failure')
   assert.equal(verdictContradiction({ decision: 'retry', reasoning: 'we should stop now' }), 'decision=retry while reasoning says stop')
+  assert.equal(verdictContradiction({ decision: 'retry', reasoning: 'do not stop; retry is still useful' }), '')
   assert.equal(verdictContradiction({ accepted: true, blockers: [] }), '')
 })
 
@@ -276,6 +284,7 @@ test('fallbackForAgent centralizes known gate fallback defaults', () => {
 
 test('recordAgentFailure opens circuit and updates degradation telemetry', () => {
   const recordAgentFailure = loadFunction('recordAgentFailure')
+  const agentCircuitOpen = loadFunction('agentCircuitOpen')
   const result = { logLines: [] }
   const opts = { phase: 'Review', label: 'critical-reviewer' }
 
@@ -284,6 +293,7 @@ test('recordAgentFailure opens circuit and updates degradation telemetry', () =>
   recordAgentFailure(result, opts, 'same malformed verdict')
 
   assert.equal(result.agentFailures['Review:critical-reviewer'].circuitOpen, true)
+  assert.equal(agentCircuitOpen(opts, result), true)
   assert.equal(result.degradationTelemetry.fallbacks, 3)
   assert.equal(result.degradationTelemetry.escalations, 1)
   assert.equal(result.degradationTelemetry.circuitBreakers, 1)
@@ -294,4 +304,13 @@ test('outputLanguageViolation flags mostly non-English verdict text', () => {
 
   assert.equal(outputLanguageViolation({ summary: 'ошибка не исправлена, нужно остановиться' }), true)
   assert.equal(outputLanguageViolation({ summary: 'error not fixed, stop safely' }), false)
+})
+
+test('repairJsonText does not quote keys or literals inside JSON string values', () => {
+  const extractJson = loadFunction('extractJson')
+
+  assert.deepEqual(extractJson('{summary: "keep retry: True and status: open", fixed: False,}'), {
+    summary: 'keep retry: True and status: open',
+    fixed: false,
+  })
 })

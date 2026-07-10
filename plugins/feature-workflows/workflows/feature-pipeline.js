@@ -1492,6 +1492,12 @@ async function safeAgent(prompt, opts, result) {
 // tool-use is unreliable.
 async function flexibleAgent(prompt, opts, result) {
   const callOpts = escalateAgentOpts(opts, result)
+  if (agentCircuitOpen(callOpts, result)) {
+    if (result && Array.isArray(result.logLines)) {
+      result.logLines.push(`WARNING: agent "${callOpts && callOpts.label}" skipped because circuit is open`)
+    }
+    return fallbackForAgent(callOpts)
+  }
   const effectivePrompt = hardenForModel(prompt, callOpts && callOpts.schema, callOpts && callOpts.model)
   let out = null
   let schemaFailed = false
@@ -1586,6 +1592,12 @@ function escalateAgentOpts(opts, result) {
   const model = String(opts.model || '').toLowerCase()
   if (model === 'opus' || model.includes('claude-opus')) return opts
   return { ...opts, model: 'opus', escalatedFrom: opts.model || '(default)' }
+}
+
+function agentCircuitOpen(opts, result) {
+  if (!opts || !result || !result.agentFailures) return false
+  const failures = result.agentFailures[agentFailureKey(opts)]
+  return !!(failures && failures.circuitOpen)
 }
 
 function recordAgentFailure(result, opts, reason) {
@@ -1760,7 +1772,7 @@ function verdictContradiction(value) {
   if (value.fixed === true && !value.summary && !value.changeSummary && countItems(value.files) === 0) {
     return 'fixed=true without summary, changeSummary, or files'
   }
-  if (value.decision === 'retry' && /(^|\b)(stop|halt|cancel|give up)(\b|$)/i.test(String(value.reasoning || ''))) {
+  if (value.decision === 'retry' && reasoningSaysStop(String(value.reasoning || ''))) {
     return 'decision=retry while reasoning says stop'
   }
   return ''
@@ -1768,6 +1780,14 @@ function verdictContradiction(value) {
 
 function countItems(value) {
   return Array.isArray(value) ? value.length : 0
+}
+
+function reasoningSaysStop(text) {
+  const lowered = String(text || '').toLowerCase()
+  const stopMatch = lowered.match(/\b(stop|halt|cancel|give up)\b/)
+  if (!stopMatch) return false
+  const before = lowered.slice(Math.max(0, stopMatch.index - 20), stopMatch.index)
+  return !/(do\s+not|don't|dont|never|should\s+not|must\s+not|not\s+to)\s+$/.test(before)
 }
 
 function extractJson(raw) {
@@ -1847,10 +1867,10 @@ function braceCandidates(text) {
 
 function repairJsonText(text) {
   let repaired = String(text).trim()
-  repaired = repaired.replace(/,\s*([}\]])/g, '$1')
-  repaired = repaired.replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false').replace(/\bNone\b/g, 'null')
-  repaired = repaired.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, value) => JSON.stringify(value.replace(/\\"/g, '"')))
-  repaired = repaired.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+  repaired = stripTrailingCommasOutsideStrings(repaired)
+  repaired = replacePythonLiteralsOutsideStrings(repaired)
+  repaired = normalizeSingleQuotedStrings(repaired)
+  repaired = quoteBareKeysOutsideStrings(repaired)
   const openCurly = (repaired.match(/{/g) || []).length
   const closeCurly = (repaired.match(/}/g) || []).length
   const openSquare = (repaired.match(/\[/g) || []).length
@@ -1858,6 +1878,124 @@ function repairJsonText(text) {
   if (openSquare > closeSquare) repaired += ']'.repeat(openSquare - closeSquare)
   if (openCurly > closeCurly) repaired += '}'.repeat(openCurly - closeCurly)
   return repaired
+}
+
+function stripTrailingCommasOutsideStrings(text) {
+  let out = ''
+  let quote = ''
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    if (quote) {
+      out += char
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === quote) {
+        quote = ''
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      out += char
+      continue
+    }
+    if (char === ',') {
+      let j = i + 1
+      while (/\s/.test(text[j] || '')) j += 1
+      if (text[j] === '}' || text[j] === ']') continue
+    }
+    out += char
+  }
+  return out
+}
+
+function replacePythonLiteralsOutsideStrings(text) {
+  return rewriteOutsideStrings(text, (segment) =>
+    segment.replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false').replace(/\bNone\b/g, 'null')
+  )
+}
+
+function quoteBareKeysOutsideStrings(text) {
+  return rewriteOutsideStrings(text, (segment) =>
+    segment.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+  )
+}
+
+function normalizeSingleQuotedStrings(text) {
+  let out = ''
+  let doubleQuote = false
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    if (doubleQuote) {
+      out += char
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        doubleQuote = false
+      }
+      continue
+    }
+    if (char === '"') {
+      doubleQuote = true
+      out += char
+      continue
+    }
+    if (char !== "'") {
+      out += char
+      continue
+    }
+    let value = ''
+    i += 1
+    for (; i < text.length; i++) {
+      const inner = text[i]
+      if (inner === '\\' && i + 1 < text.length) {
+        value += text[i + 1]
+        i += 1
+      } else if (inner === "'") {
+        break
+      } else {
+        value += inner
+      }
+    }
+    out += JSON.stringify(value)
+  }
+  return out
+}
+
+function rewriteOutsideStrings(text, rewriteSegment) {
+  let out = ''
+  let segment = ''
+  let quote = ''
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    if (quote) {
+      out += char
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === quote) {
+        quote = ''
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      out += rewriteSegment(segment)
+      segment = ''
+      quote = char
+      out += char
+      continue
+    }
+    segment += char
+  }
+  return out + rewriteSegment(segment)
 }
 
 // Append a review verdict to <planDir>/review-history.md (Phase C2 persistence). Non-blocking.
