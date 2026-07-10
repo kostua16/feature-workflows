@@ -1,4 +1,5 @@
 // feature-pipeline.js
+// engine-version: 1.0.0
 // Gate-enforcing pipeline for new features / bug-fixes.
 // Encodes CLAUDE.md agent rules as a deterministic gate sequence:
 //   task-definition-architect -> plan-architect -> [review/refine loop] ->
@@ -22,6 +23,7 @@
 
 export const meta = {
   name: 'feature-pipeline',
+  version: '1.0.0',
   description: '1 engine + 3 modes (design/implement/tune) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). Durable cross-mode state via pipeline-state.json.',
   phases: [
     { title: 'Categorize' },
@@ -52,6 +54,8 @@ export const meta = {
     { title: 'Debug' },
     { title: 'Design' },
     { title: 'Goalkeeper' },
+    { title: 'Decide' },
+    { title: 'Checkpoint' },
   ],
 }
 
@@ -784,6 +788,13 @@ const TUNE_PLAN_VERDICT = {
 // Global retry budget. The pipeline only exits on a TRUE hard error (no artifact,
 // needsClarification) or when retryUsed >= retryBudget. Per-loop soft sub-caps stop one
 // loop from monopolizing the whole budget.
+// The named agents this engine spawns by agentType (todo-store, file-writer) ship inside
+// the feature-workflows plugin, where the subagent registry lists them under the plugin
+// namespace. Change ONE constant if the plugin is renamed; set to '' to fall back to bare
+// names (agents copied into the project's .claude/agents/).
+const AGENT_NS = 'feature-workflows'
+const nsAgent = (name) => (AGENT_NS ? `${AGENT_NS}:${name}` : name)
+
 const RETRY_BUDGET_DEFAULT = 20
 const REFINE_SUBCAP_DEFAULT = 10   // soft per-loop cap on plan refine iterations
 const DEBUG_SUBCAP_DEFAULT = 20    // soft per-loop cap on gsd-debug fix+retest
@@ -960,7 +971,7 @@ ${JSON.stringify(result, null, 2)}
 
 Create or replace the todo entry for this task slug. Do NOT read or modify unrelated tasks.
 Return ok=true once written.`,
-    { label: 'todo-store:consolidate', phase: 'Checkpoint', agentType: 'todo-store', schema: TODO_ACK, model: gm('todo') }
+    { label: 'todo-store:consolidate', phase: 'Checkpoint', agentType: nsAgent('todo-store'), schema: TODO_ACK, model: gm('todo') }
   )
 }
 
@@ -999,7 +1010,7 @@ async function writeChunkedFile(filePath, body, labelPrefix, result, successNote
 This is chunk ${i + 1} of ${total}. Write the body below verbatim, then return ok=true.
 
 ${chunks[i]}`,
-        { label: `${labelPrefix}(${i + 1}/${total})`, phase: 'Checkpoint', agentType: 'file-writer', schema: FILE_ACK, model: gm('todo') }
+        { label: `${labelPrefix}(${i + 1}/${total})`, phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
       )
     } catch (e) {
       result.logLines.push(`WARNING: ${filePath} chunk ${i + 1}/${total} write failed: ${String(e)}`)
@@ -1145,7 +1156,7 @@ If the file does not exist, create it with a "# Issues & Improvements" header fi
 Do NOT overwrite existing content — append only. Return ok=true after appending.
 
 ${section}`,
-      { label: 'file-writer(issues)', phase: 'Goalkeeper', agentType: 'file-writer', schema: FILE_ACK, model: gm('todo') }
+      { label: 'file-writer(issues)', phase: 'Goalkeeper', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
     )
     result.issuesPath = issuesPath
     plogFromResult(result, `issue-classifier: UPSTREAM issue recorded → ${issuesPath} (gate=${verdict.gate})`)
@@ -1176,7 +1187,7 @@ If the file does not exist, create it with a "# Stage ${stage.id}: ${stage.name}
 Do NOT overwrite existing content — append only. Return ok=true.
 
 ${entry}`,
-      { label: `stage-tick:${stage.id}`, phase: 'Execute', agentType: 'file-writer', schema: FILE_ACK, model: gm('todo') }
+      { label: `stage-tick:${stage.id}`, phase: 'Execute', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
     )
   } catch (e) {
     plogFromResult(result, `stage-tick ${stage.id} append failed (non-blocking): ${String(e)}`)
@@ -1510,7 +1521,7 @@ Create the file (and parent dirs) if it does not exist. Do NOT overwrite existin
 Return ok=true after appending.
 
 ${section}`,
-      { label: `review-history(${phaseLabel}#${iteration})`, phase: 'Checkpoint', agentType: 'file-writer', schema: FILE_ACK, model: gm('todo') }
+      { label: `review-history(${phaseLabel}#${iteration})`, phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
     )
   } catch (e) {
     log(`review-history append failed (${phaseLabel}#${iteration}): ${String(e)}`)
@@ -1679,7 +1690,7 @@ changes you made. Do NOT commit.`,
 Create the file if absent. Do NOT overwrite. Return ok=true.
 
 ${entry}`,
-          { label: `enhanced-prompts(${gateKey})`, phase: 'Enhance', agentType: 'file-writer', schema: FILE_ACK, model: gm('todo') }
+          { label: `enhanced-prompts(${gateKey})`, phase: 'Enhance', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
         )
       } catch (e) {
         log(`enhanced-prompts append failed (${gateKey}): ${String(e)}`)
@@ -1838,7 +1849,7 @@ If the file does not exist, create it with a "# Open Questions" header first, th
 Do NOT overwrite existing content — append only. List to append:
 
 ${body}`,
-      { label: 'file-writer(open-questions)', phase: 'Checkpoint', agentType: 'file-writer', schema: FILE_ACK, model: gm('todo') }
+      { label: 'file-writer(open-questions)', phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
     )
     if (result) result.openQuestionsPath = path
     plogFromResult(result, `open-questions.md: appended ${records.length} entr${records.length === 1 ? 'y' : 'ies'} (${path})`)
@@ -1863,7 +1874,7 @@ async function writeFailedLaunch(leaf, blockedAt, reason, argsKeys) {
 Create the parent directory if it does not exist. Content:
 
 ${body}`,
-      { label: 'file-writer(failed-launch)', phase: 'Checkpoint', agentType: 'file-writer', schema: FILE_ACK, model: gm('todo') }
+      { label: 'file-writer(failed-launch)', phase: 'Checkpoint', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') }
     )
   } catch (e) {
     log('writeFailedLaunch failed (non-blocking): ' + String(e))

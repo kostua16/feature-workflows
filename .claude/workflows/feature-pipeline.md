@@ -631,8 +631,12 @@ This workflow is an **ES module** (`export const meta`) with no `package.json ty
 Syntax-checking requires ESM mode — plain `node --check` parses as CommonJS and **silently passes
 invalid ESM** (verified: a missing colon returns exit 0).
 
+The canonical source lives in the plugin repo at `plugins/feature-workflows/workflows/`; the
+project copy at `.claude/workflows/` is installed by `/feature-workflows:setup`. Edit the plugin
+source and re-run setup — the recipes below work from whichever directory holds the copy you edited.
+
 ```bash
-cd .claude/workflows
+cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
 sed 's/^return final$/\/\/ __sandbox_return__ final/' feature-pipeline.js \
   | node --input-type=module --check
 ```
@@ -648,16 +652,22 @@ Run this after editing the script (before invoking the Workflow) to confirm it s
 
 ### Phase-label validation (I7)
 
-Every `phase('X')` / `stateCheckpoint('X', …)` title should map to a `meta.phases`
-entry — a stray label (e.g. two distinct gates both emitting `'Detailed Design'`,
-or a chunker re-using a design label) silently collides the progress-tree grouping
-and mislabels the pipeline log. Catch this at CI time:
+Every `phase('X')` / `stateCheckpoint('X', …)` title — and every literal
+`phase: 'X'` option on an `agent()` call (cross-cutting groups like `Enhance`,
+`Checkpoint`, `Decide` are attributed to the progress tree only this way) —
+should map to a `meta.phases` entry. A stray label (e.g. two distinct gates both
+emitting `'Detailed Design'`, or a chunker re-using a design label) silently
+collides the progress-tree grouping and mislabels the pipeline log. Catch this
+at CI time:
 
 ```bash
-cd .claude/workflows
-# 1. labels actually emitted by the script (phase('...') + stateCheckpoint('...', ...))
-grep -oE "(phase|stateCheckpoint)\('[^']+'" feature-pipeline.js \
-  | sed -E "s/.*'([^']+)'/\1/" | sort -u > /tmp/used.txt
+cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
+# 1. labels actually emitted by the script:
+#    phase('...') + stateCheckpoint('...', ...) calls AND literal phase: '...' agent() opts
+{ grep -oE "(phase|stateCheckpoint)\('[^']+'" feature-pipeline.js \
+    | sed -E "s/.*'([^']+)'/\1/"
+  grep -oE "phase: *'[^']+'" feature-pipeline.js \
+    | sed -E "s/.*'([^']+)'/\1/"; } | sort -u > /tmp/used.txt
 # 2. titles declared in meta.phases
 sed -n "/^  phases:/,/^  }/p" feature-pipeline.js \
   | grep -oE "title: *'[^']+'" | sed -E "s/.*'([^']+)'/\1/" | sort -u > /tmp/declared.txt
