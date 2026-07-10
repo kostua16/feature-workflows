@@ -1,6 +1,6 @@
 ---
 description: THINK-only feature pipeline (define -> requirements -> arch -> design -> plan -> tdd -> reconcile -> review/refine -> chunk into stages). Stops pre-execute. Run /implement-feature next.
-argument-hint: <task description> [--plan=PLAN_PATH] [--definition=DEF_PATH] [--profile=full|standard|light] [--no-chunker] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-quick-decider] [--no-interview] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--no-parallel] [--decision-cap=N] [--retries=N] [--max-reconcile-iterations=N] [--timestamp=TS] [--resume <planDir>]
+argument-hint: <task description> [--plan=PLAN_PATH] [--definition=DEF_PATH] [--profile=full|standard|light] [--approval] [--from-gate=requirements|architecture|design|plan] [--no-chunker] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-quick-decider] [--no-interview] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--no-parallel] [--decision-cap=N] [--retries=N] [--max-reconcile-iterations=N] [--timestamp=TS] [--resume <planDir>]
 allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
@@ -43,6 +43,8 @@ Parse `$ARGUMENTS` into:
 - `--no-publish`: → `usePublish: false` (skip docs-architecture-publisher — runs at end even though execute stops, since design docs are publishable)
 - `--no-persist`: → `useKnowledgePersist: false` (skip knowledge-persist)
 - `--no-parallel`: → `allowParallelExecute: false` (affects intra-stage parallelism in implement)
+- `--approval`: if present → `useApproval: true` (human design-approval checkpoint at the design-stop; see the **Approval loop** section. Default **off** — the run ends at `designReady` without asking)
+- `--from-gate=<gate>`: → `fromGate` (`requirements`|`architecture`|`design`|`plan`; only with `--resume`. Deterministically clears that gate + every downstream completion flag so those gates re-run — a user-driven version of the goalkeeper rewind. One-shot: applies to this invocation only)
 - `--decision-cap=N`: → `decisionCap` (default 50)
 - `--retries=N`: → `retryBudget` (default 20; shared global budget)
 - `--max-reconcile-iterations=N`: → `maxReconcileIterations` (default 5)
@@ -82,10 +84,32 @@ Workflow({
     retryBudget: <int>,
     maxReconcileIterations: <int>,
     timestamp: <TS or "">,
-    resume: <planDir or "">
+    resume: <planDir or "">,
+    useApproval: <bool>,
+    fromGate: <"requirements"|"architecture"|"design"|"plan" or "">
   }
 })
 ```
+
+## Approval loop (`--approval`)
+
+With `--approval`, the engine stops at the design-stop with `blockedAt === 'awaiting-approval'`
+instead of finishing (`approvalPending: true`; the artifacts and stages are complete). The engine
+CANNOT ask the user itself (workflow subagents have no AskUserQuestion) — YOU must run the loop:
+
+1. Call AskUserQuestion with the stage list from `result.handoff.stages` and exactly these
+   options: **Approve stages as-is** / **Edit stage boundaries** (collect the user's edit text) /
+   **Reject back to Plan**.
+2. Re-invoke the Workflow with `mode: "design"`, `resume: <result.planDir>`, plus ONE of:
+   - Approve → `approveDesign: true`
+   - Edit → `stageEdits: "<the user's edit text>"` (the plan-chunker re-runs with the edits,
+     then the engine stops at `awaiting-approval` again — repeat from step 1)
+   - Reject → `rejectToPlan: true` (the plan + downstream gates and the stage split re-run,
+     then the engine stops at `awaiting-approval` again — repeat from step 1)
+3. Repeat until the result has `designApproved.approved === true` (normal design-stop handoff)
+   or the user cancels (just stop; the run stays resumable).
+
+`result.handoff.message` carries these exact re-invoke recipes — follow them verbatim.
 
 When the workflow returns its result JSON, report it concisely:
 - Always print `result.planDir` first (the dynamic `docs/.../feature/<leaf>/` dir). If `result._categorization` is set, show `category/subCategory`.
@@ -93,7 +117,9 @@ When the workflow returns its result JSON, report it concisely:
 - If `designReady === true`: list the produced artifacts — `definitionPath`, `requirementsPath`, `archPath`, `designPath`, `useCasePath`, `planPath`, `codebase-facts`, and the `stageNN.md` files (`result.stages`: show count + each stage's `id`/`name`/`files`). Show `reconcile` consistency, `yagniWarnings`, the plan-acceptance outcome (`planAccepted && !forceAccepted` = clean accept; `forceAccepted === true` = force-accepted at Gate 2 — list `carriedBlockers`), and `published`/`persist` results.
 - Print `result.handoff.message` verbatim — it tells the user the next step: `/implement-feature <planDir>`.
 - If `needsClarification === true` (Gate 0): the `user-interviewer` tried to resolve inline; if `interview.resolved === false` (or `--no-interview`), present remaining `openQuestions` numbered and stop. Do NOT proceed until answered; on answer re-run with answers folded into `task`.
-- If `blockedAt` is set: name the blocking gate (`define`/`requirements`/`architecture`/`detailed-design`/`e2e-usecases`/`plan`/`tdd-enforce`/`review`/`uncaught-throw`), show the relevant detail, and note it is `--resume`-able: `/design-feature --resume <planDir>`.
+- If `blockedAt === 'awaiting-approval'`: run the **Approval loop** above — do not just report and stop.
+- If `blockedAt === 'bad-args'`: an invalid `--from-gate` value; print `result.handoff.message` (it lists the valid targets).
+- If `blockedAt` is set otherwise: name the blocking gate (`define`/`requirements`/`architecture`/`detailed-design`/`e2e-usecases`/`plan`/`tdd-enforce`/`review`/`uncaught-throw`), show the relevant detail, and note it is `--resume`-able: `/design-feature --resume <planDir>`.
 
 Examples:
 

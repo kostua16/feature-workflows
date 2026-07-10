@@ -28,7 +28,17 @@ guard) → EN-1 (test harness, so the rest land safely) → everything else.
 | IM-4 stack-agnostic test gate | ✅ done | `detectTestCommand()` + `--test-cmd`/`--test-framework`; auto-detect fallback |
 | IM-5 consolidate flag zoo into profiles | ✅ done | `PROFILES`/`resolveProfile()` + `--profile=full\|standard\|light` |
 
-Only **Features (FT-*)** remain open.
+**Features (FT-1..5)** are implemented in **v1.2.0**:
+
+| Item | Status | Where |
+|------|--------|-------|
+| FT-1 `/pipeline-status` | ✅ done | engine `status` mode (`renderStatusReport`/`summarizeGates`/`deriveNextCommand`) + `commands/pipeline-status.md` |
+| FT-2 code-review → issues handoff | ✅ done | `selectBlockingFindings` + `classifyAndRecordIssue` on blockers; shared `buildIssuesHandoff` |
+| FT-3 selective stage execution | ✅ done | `--stage` (`resetStageForRerun`) + `--from-gate` (`normalizeGateTarget` + `LOOPBACK_FLAG_MAP.execute`) |
+| FT-4 per-gate telemetry | ✅ done | `bumpGateTelemetry` in `flexibleAgent`/`recordAgentFailure`; `renderTelemetrySummary` at terminal exits |
+| FT-5 design-approval gate | ✅ done | `--approval` → `awaiting-approval` stop + command-level AskUserQuestion loop; `applyApprovalDecision`; tune-confirm converted to the same stop/re-invoke pattern (`tune-awaiting-confirm`) |
+
+Nothing remains open in this backlog.
 
 ---
 
@@ -153,32 +163,37 @@ Only **Features (FT-*)** remain open.
 
 ## Features
 
-### FT-1. `/pipeline-status <planDir>` command
+### DONE (v1.2.0) FT-1. `/pipeline-status <planDir>` command
 - Read `pipeline-state.json` and render: mode, gates done/blocked, stage table, budgets
   used, open questions, and the exact next command (`/implement-feature …` /
   `/tune-feature …`). All data already exists; today users must read raw JSON.
 
-### FT-2. Route code-review blockers through the issues handoff
+### DONE (v1.2.0) FT-2. Route code-review blockers through the issues handoff
 - Only goalkeeper loop-back defects get classified into `issues-and-improvements.md`; a
   blocker-severity code-review finding just hard-blocks (`:3782-3789`) with no tune path.
 - Run `classifyAndRecordIssue` on code-review blockers too, so upstream-rooted review
   findings flow into `/tune-feature` instead of dead-ending.
 
-### FT-3. Selective stage execution
+### DONE (v1.2.0) FT-3. Selective stage execution
 - `--stage=stageNN` (re-run one stage after a manual edit) and `--from-gate=<gate>` (clear a
   gate + downstream flags deterministically — machinery already exists in
   `LOOPBACK_FLAG_MAP`). Today the only rewind is the goalkeeper's, which the user can't
   drive.
 
-### FT-4. Per-gate telemetry in the run report
+### DONE (v1.2.0) FT-4. Per-gate telemetry in the run report
 - Record agent-call count, model, retries, iteration counts per gate into
   `pipeline-state.json`; print a summary table at each terminal gate. Turns "the pipeline is
   slow/expensive" into actionable data for IM-5 profiles.
 
-### FT-5. Optional human design-approval gate
+### DONE (v1.2.0) FT-5. Optional human design-approval gate
 - At the design-stop, offer an AskUserQuestion checkpoint: approve stages as-is, edit stage
   boundaries, or reject back to Plan — mirroring the tune-confirm pattern (`:2306`).
   Records consent in state (useful for `--auto-implement` in `/feature-pipeline`).
+- Implemented as a **command-level** checkpoint (see Q3 resolution): the engine stops at
+  `blockedAt='awaiting-approval'` and `/design-feature` runs the AskUserQuestion loop, re-invoking
+  with `approveDesign`/`stageEdits`/`rejectToPlan`. The tune-confirm gate carried the same broken
+  subagent-AskUserQuestion assumption and was converted to the identical stop/re-invoke pattern
+  (`tune-awaiting-confirm` + `confirmTune`/`finalGates`/`cancelTune`).
 
 ---
 
@@ -325,9 +340,10 @@ deterministic guards → recovery policy.
   file-writers the only option?
 - Q2: Is the E4 design-gate rewind (BF-5) intentionally kept for a future single-command
   mode, or safe to delete?
-- Q3: Subagent access to AskUserQuestion is assumed by user-interviewer/tune-confirm but
-  explicitly denied in the requirements-collector prompt (`:2766`) — which is true in the
-  actual harness?
+- ~~Q3~~ RESOLVED (v1.2.0): workflow subagents **cannot** use AskUserQuestion (user-confirmed).
+  tune-confirm and the FT-5 approval gate are command-level stop/re-invoke checkpoints now.
+  Note: the user-interviewer gate (Define clarifications) still carries the old assumption —
+  candidate for the same conversion.
 - Q4: Does the target weak-model harness support forced structured output (tool-use JSON) at
   all, or is plain-text JSON the only reliable channel? Decides whether RB-1 keeps the
   schema-first path or inverts (plain-JSON-first for weak tiers).

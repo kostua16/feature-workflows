@@ -5,7 +5,8 @@ allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
 Run the `feature-pipeline` workflow in **tune mode** — the FIX flow that consumes
-`issues-and-improvements.md` (written by a prior `/implement-feature` upstream-defect handoff),
+`issues-and-improvements.md` (written by a prior `/implement-feature` upstream-defect handoff —
+from a goalkeeper loop-back or from blocker-severity code-review findings classified as upstream),
 derives a minimal design-gate revisit plan, refines only those gates in place, preserves completed
 plan stages, then re-enables `designReady` so you can re-run `/implement-feature`.
 
@@ -31,7 +32,7 @@ Parse `$ARGUMENTS` into:
   not a flag value) is the planDir. Hydrate persisted pipeline state at `<planDir>/pipeline-state.json`.
   `<planDir>` = the plan dir shared across design/implement/tune. A bare `plan.md` path also accepted
   (`/plan.md` suffix stripped). `task` is optional — resolved from the persisted state.
-- `--no-confirm`: if present → `useTuneConfirm: false` (skip the AskUserQuestion confirmation; run the derived gate-revisit plan directly — for CI/batch. Default **enabled** — confirms the derived plan with the user)
+- `--no-confirm`: if present → `useTuneConfirm: false` (skip the confirmation stop; run the derived gate-revisit plan directly — for CI/batch. Default **enabled** — the engine stops at `tune-awaiting-confirm` and YOU confirm with the user; see the **Confirmation loop** section)
 - `--no-reconcile`: → `useReconcile: false` (skip the post-tune plan↔design re-reconcile)
 - `--no-enhancer`: → `useEnhancer: false`
 - `--no-quick-decider`: → `useQuickDecider: false`
@@ -63,10 +64,29 @@ Workflow({
 })
 ```
 
+## Confirmation loop
+
+Unless `--no-confirm` was given, the engine derives the gate-revisit plan and then STOPS with
+`blockedAt === 'tune-awaiting-confirm'` — it cannot ask the user itself (workflow subagents have
+no AskUserQuestion). YOU must run the loop:
+
+1. Call AskUserQuestion presenting `result.handoff.planGates` (gates to revisit) and
+   `result.handoff.preserveStages` (stages kept), with options: **Run as-is** / **Edit the gate
+   set** (collect a subset/reorder of `requirements|architecture|design|plan`) / **Cancel**.
+2. Re-invoke the Workflow with `mode: "tune"`, `resume: <planDir>`, plus ONE of:
+   - Run as-is → `confirmTune: true`
+   - Edited → `confirmTune: true, finalGates: [<the user's gate list>]`
+   - Cancel → `cancelTune: true`
+3. On confirm the tune run proceeds to completion; on cancel it exits with
+   `blockedAt === 'tune-cancelled'`.
+
+`result.handoff.message` carries these exact re-invoke recipes — follow them verbatim.
+
 When the workflow returns its result JSON, report it concisely:
 - Always print `result.planDir` first.
 - If `result.designReady === true` after tune (success path): state "Tune complete." Show the revisited gates (`result.handoff.revisitedGates`), stages reset count (`result.handoff.stagesReset`), reconcile consistency (`result.reconcile`), and print `result.handoff.message` verbatim — it tells the user to re-run `/implement-feature <planDir>`.
 - If `blockedAt === 'tune-no-issues'`: no issues-and-improvements.md (or no gates derived). Print `result.handoff.message` and stop — the user must run `/implement-feature <planDir>` first to surface upstream defects.
+- If `blockedAt === 'tune-awaiting-confirm'`: run the **Confirmation loop** above — do not just report and stop.
 - If `blockedAt === 'tune-cancelled'`: the user cancelled the confirmation. Re-runnable with `<planDir>`.
 - If `blockedAt === 'uncaught-throw'`: an escaping error tripped the safety net (see `result._uncaughtError`); `pipeline-state.json` was written, so re-runnable with `<planDir>`.
 

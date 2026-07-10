@@ -1,6 +1,6 @@
 ---
 description: DO flow — author tests -> execute stages -> test -> code-review -> decide -> commit. On upstream defect writes issues-and-improvements.md and stops (run /tune-feature). Requires prior /design-feature.
-argument-hint: <planDir> [--target=TEST_TARGET] [--test-cmd=CMD] [--test-framework=NAME] [--profile=full|standard|light] [--fresh-budget] [--auto-commit] [--no-test-writer] [--no-issues] [--no-gsd-debug] [--no-publish] [--no-persist] [--no-goalkeeper] [--no-quick-decider] [--no-enhancer] [--no-parallel] [--decision-cap=N] [--retries=N] [--debug-retries=N] [--gsd-quick]
+argument-hint: <planDir> [--stage=stageNN] [--from-gate=execute|tests] [--target=TEST_TARGET] [--test-cmd=CMD] [--test-framework=NAME] [--profile=full|standard|light] [--fresh-budget] [--auto-commit] [--no-test-writer] [--no-issues] [--no-gsd-debug] [--no-publish] [--no-persist] [--no-goalkeeper] [--no-quick-decider] [--no-enhancer] [--no-parallel] [--decision-cap=N] [--retries=N] [--debug-retries=N] [--gsd-quick]
 allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
@@ -29,6 +29,12 @@ Parse `$ARGUMENTS` into:
   `<planDir>` = the design run's plan dir (e.g. `docs/parser/feature/add-retry-layer`), exactly the
   `result.planDir` printed by `/design-feature`. A bare `plan.md` path also accepted (`/plan.md`
   suffix stripped). `task` is optional — resolved from the persisted state.
+- `--stage=stageNN`: → `stage` (re-run exactly ONE stage after a manual edit: that stage flips
+  back to pending and the stale test/review/goalkeeper verdicts are cleared so they re-earn over
+  the fresh diff; other done stages stay skipped. One-shot: applies to this invocation only)
+- `--from-gate=execute|tests`: → `fromGate` (deterministically clear that gate + downstream
+  completion flags so they re-run — a user-driven rewind. Design-gate targets belong to
+  `/design-feature --from-gate` / `/tune-feature`; implement mode rejects them. One-shot)
 - `--target=PATH`: → `testTarget` (optional test target/path scope)
 - `--test-cmd="<cmd>"`: → `testCmd` (run this EXACT test command, stack-agnostic; overrides auto-detect)
 - `--test-framework=<name>`: → `testFramework` (mapped template: `pytest`|`npm`|`jest`|`vitest`|`node`|`go`|`cargo`|`make`; used when `--test-cmd` is absent). With neither set, the runner auto-detects the project's test command.
@@ -36,7 +42,7 @@ Parse `$ARGUMENTS` into:
 - `--fresh-budget`: if present → `freshBudget: true` (reset the retry + decision budgets on resume; default carries the used counters across `--resume` so a spinning loop can't be resumed into a full fresh budget)
 - `--auto-commit`: if present → `autoCommit: true` (commit on success; default `false` — leaves changes staged-and-uncommitted)
 - `--no-test-writer`: if present → `useTestWriter: false` (skip the pre-execute test-authoring gate; default enabled)
-- `--no-issues`: if present → `useIssues: false` (on an upstream-defect goalkeeper verdict, do NOT write `issues-and-improvements.md`; degrade to a plain block. Default **enabled** — writes the issues file + stops for `/tune-feature`)
+- `--no-issues`: if present → `useIssues: false` (on upstream-flagged findings — a goalkeeper loop-back OR blocker-severity code-review findings — do NOT classify or write `issues-and-improvements.md`; degrade to a plain block. Default **enabled** — upstream-rooted findings are written to the issues file and the run stops for `/tune-feature`)
 - `--no-gsd-debug`: → `useGsdDebug: false` (disable gsd-debug recovery on test failure)
 - `--no-publish`: → `usePublish: false` (skip docs-architecture-publisher)
 - `--no-persist`: → `useKnowledgePersist: false` (skip knowledge-persist)
@@ -59,6 +65,8 @@ Workflow({
   args: {
     mode: "implement",
     resume: <planDir>,
+    stage: <"stageNN" or "">,
+    fromGate: <"execute"|"tests" or "">,
     testTarget: <PATH or "">,
     testCmd: <"exact test command" or "">,
     testFramework: <"pytest|npm|go|cargo|…" or "">,
@@ -87,10 +95,12 @@ When the workflow returns its result JSON, report it concisely:
 - If `ready === true` (all stages done, tests green, code-review clean): state "Implementation complete." Show `testsPassed`, `testSummary`, code-review issue count, stage progress (`result.stages`: count done/total + each `id`/`status`), and whether committed (`committed` / `commitHash`) or that `autoCommit` was off so changes are staged-and-uncommitted. Note `lanesUsed` and `persist`/`published` results.
 - If `blockedAt === 'design-not-ready'`: design was not run. Print `result.handoff.message` and stop — the user must run `/design-feature` first.
 - If `blockedAt === 'test-authoring'`: the test-writer gate could not write or confirm the required tests. Show `result.testWriterSummary` and re-run after fixing the blocker.
+- If `blockedAt === 'design-not-approved'`: the design run used `--approval` and the sign-off is still pending. Print `result.handoff.message` — the user must finish the approval via `/design-feature --resume <planDir>` first.
+- If `blockedAt === 'bad-args'`: an invalid `--stage`/`--from-gate` value; print `result.handoff.message` (it lists the valid stage ids / gate targets). Nothing ran.
 - If `blockedAt === 'execute'`: a stage failed. Show `result._execute._failedStage` (which `stageNN`) + the executor summary. Re-run: `/implement-feature <planDir>` (done stages are skipped; the failed stage re-runs).
 - If `blockedAt === 'test'`: tests failing after gsd-debug. Show `result.testSummary` + `debugRetries`. The user may fix manually then re-run.
-- If `blockedAt === 'code-review'`: blocker-severity findings. Show `result.codeReview.blockers`. Fix + re-run.
-- If `blockedAt === 'issues-handoff'` (the Phase I upstream-defect path): print `result.handoff.message` verbatim — it tells the user to run `/tune-feature <planDir>`. Show `result.handoff.upstreamCount` and the `issuesPath`. Do NOT attempt to commit.
+- If `blockedAt === 'code-review'`: blocker-severity findings with no upstream root (or classification unavailable). Show `result.codeReview.blockers`. Fix + re-run.
+- If `blockedAt === 'issues-handoff'` (upstream-defect path — from the goalkeeper loop-back OR from blocker-severity code-review findings classified as upstream): print `result.handoff.message` verbatim — it tells the user to run `/tune-feature <planDir>`. Show `result.handoff.upstreamCount` and the `issuesPath`. Do NOT attempt to commit.
 - If `blockedAt === 'goalkeeper'`: decision cap exhausted during a loop-back — re-runnable with `<planDir>`.
 - If `blockedAt === 'uncaught-throw'`: an escaping error tripped the safety net (see `result._uncaughtError`); `pipeline-state.json` was written, so re-runnable with `<planDir>`.
 
@@ -100,6 +110,8 @@ Examples:
 /implement-feature docs/parser/feature/add-retry-layer
 /implement-feature docs/parser/feature/add-retry-layer --auto-commit
 /implement-feature docs/parser/feature/add-retry-layer --no-issues
+/implement-feature docs/parser/feature/add-retry-layer --stage=stage02
+/implement-feature docs/parser/feature/add-retry-layer --from-gate=tests
 ```
 
 ## Editing the workflow script

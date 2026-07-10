@@ -89,6 +89,7 @@ function loadFunction(name) {
     'reasoningSaysStop',
     'fallbackForAgent',
     'recordAgentFailure',
+    'bumpGateTelemetry',
     'agentCircuitOpen',
     'agentFailureKey',
     'outputLanguageViolation',

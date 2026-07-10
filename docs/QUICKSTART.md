@@ -41,13 +41,17 @@ derived from the plugin, not a source of truth.
 THINK-only: produces definition, requirements, architecture, detailed design, e2e use cases,
 plan, and dependency-ordered `stageNN.md` files under a dynamic `docs/.../feature/<leaf>/`
 planDir — then **stops before any code executes**. Note the printed `planDir`.
+Add `--approval` to insert a human sign-off checkpoint (approve / edit stage boundaries /
+reject back to plan) before the design is marked ready.
 
 ```
 /feature-workflows:implement-feature <planDir>
 ```
 
 DO: executes the stages, runs tests, code-reviews, and (opt-in via `--auto-commit`) commits.
-If it finds an upstream design defect it writes `issues-and-improvements.md` and stops.
+If it finds an upstream design defect (goalkeeper loop-back or blocker-severity code-review
+findings) it writes `issues-and-improvements.md` and stops. After a manual edit you can re-run
+just one stage with `--stage=stageNN`, or rewind a gate with `--from-gate=execute|tests`.
 
 ```
 /feature-workflows:tune-feature <planDir>
@@ -57,6 +61,15 @@ FIX: consumes the issues file, revisits only the affected design gates, preserve
 stages, and re-enables `designReady` — then re-run `/feature-workflows:implement-feature`.
 
 All modes are resumable: `--resume <planDir>` (or just re-run implement/tune with `<planDir>`).
+
+At any point, inspect a run without touching it:
+
+```
+/feature-workflows:pipeline-status <planDir>
+```
+
+Read-only report: mode, gates done/blocked, stage table, budgets used, per-gate telemetry,
+open questions, and the exact next command to run.
 
 ## 4. Updating
 

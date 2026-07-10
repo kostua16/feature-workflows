@@ -1,6 +1,6 @@
 ---
 description: Convenience alias — runs /design-feature then instructs /implement-feature (split engine). Design THINK flow only by default; add --auto-implement to chain into the DO flow (implies --auto-commit off unless --auto-commit).
-argument-hint: <task description> [--auto-implement] [--auto-commit] [--target=TEST_TARGET] [--plan=PLAN_PATH] [--definition=DEF_PATH] [--gsd-quick] [--no-chunker] [--no-gsd-debug] [--no-test-writer] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-publish] [--no-persist] [--no-interview] [--no-parallel] [--no-translator] [--no-categorizer] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-goalkeeper] [--no-quick-decider] [--decision-cap=N] [--timestamp=TS] [--retries=N] [--debug-retries=N] [--max-reconcile-iterations=N] [--resume <planDir>]
+argument-hint: <task description> [--auto-implement] [--yes] [--auto-commit] [--target=TEST_TARGET] [--plan=PLAN_PATH] [--definition=DEF_PATH] [--gsd-quick] [--no-chunker] [--no-gsd-debug] [--no-test-writer] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-publish] [--no-persist] [--no-interview] [--no-parallel] [--no-translator] [--no-categorizer] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-goalkeeper] [--no-quick-decider] [--decision-cap=N] [--timestamp=TS] [--retries=N] [--debug-retries=N] [--max-reconcile-iterations=N] [--resume <planDir>]
 allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 ---
 
@@ -25,7 +25,8 @@ only call the Workflow tool after setup has been re-run or the user explicitly c
 Parse `$ARGUMENTS` into:
 - `task`: everything except the flags (required, UNLESS `--resume` is given)
 - `--resume <planDir>`: → `resume: <planDir>` (hydrate persisted pipeline state at `<planDir>/pipeline-state.json` and re-run from the first incomplete gate; `task` is optional here — it is resolved from the persisted state). `<planDir>` is the ORIGINAL RUN's plan dir (e.g. `docs/parser/feature/add-retry-layer`), exactly what `result.planDir` printed at run end. A bare `plan.md` path is also accepted (the `/plan.md` suffix is stripped). The dynamic planDir is NOT re-derived on resume (the categorizer is non-deterministic); the persisted `planPath` is reused verbatim. Slug-only resume is no longer supported — the path is the sole resume format. Note: if source files changed since the original run, persisted artifact paths may be stale.
-- `--auto-implement`: if present → `autoImplement: true` (after design sets `designReady`, CHAIN into implement mode automatically via `Workflow resume`. Default `false` — design stops pre-execute and instructs the user to run `/implement-feature <planDir>`).
+- `--auto-implement`: if present → `autoImplement: true` (after design sets `designReady`, CHAIN into implement mode automatically via `Workflow resume`. Default `false` — design stops pre-execute and instructs the user to run `/implement-feature <planDir>`). **Since v1.2.0 `--auto-implement` also passes `useApproval: true` to the design run** — the human approves the stage split before code executes (see the Approval loop in `design-feature.md`). Add `--yes` to skip that checkpoint (pre-v1.2.0 behavior).
+- `--yes`: if present → do NOT pass `useApproval: true` with `--auto-implement` (skip the design-approval checkpoint; chain straight from `designReady` into implement).
 - `--auto-commit`: if present anywhere → `autoCommit: true` (default `false`; only meaningful when `--auto-implement` chains into implement)
 - `--target=PATH`: → `testTarget` (optional test target/path scope)
 - `--plan=PATH`: → `planPath` (**OPTIONAL — do NOT pass a default**). Only set when the user typed `--plan=<PATH>`. When ABSENT, pass `planPath: ""` (empty) so the workflow runs the Gate -2 `feature-categorizer` to derive the dynamic planDir `docs/{category}/{sub-category}/feature/{leaf}/`. Passing a hardcoded default defeats the categorizer (it treats any truthy planPath as an explicit override). **Ignored on `--resume`** (the resume path supplies the planDir).
@@ -101,7 +102,8 @@ Workflow({
     retryBudget: <int>,
     maxDebugRetries: <int>,
     maxReconcileIterations: <int>,
-    resume: <planDir or "">
+    resume: <planDir or "">,
+    useApproval: <bool>                // true when --auto-implement without --yes
   }
 })
 ```
@@ -111,7 +113,8 @@ When the workflow returns its result JSON, report it concisely:
 - In design mode the run ENDS after plan acceptance + (optional) chunking + publish/persist — NO code executes. State this plainly: "Design ready — nothing executed yet."
 - If `result.designReady === true`: list the produced artifacts (`definitionPath`, `requirementsPath`, `archPath`, `designPath`, `useCasePath`, `planPath`, `codebase-facts`) and the `stageNN.md` files (`result.stages`: count + each stage `id`/`name`/`files`). Show `reconcile` consistency, `yagniWarnings`, and the plan-acceptance outcome (`planAccepted && !forceAccepted` = clean accept; `forceAccepted === true` = force-accepted — list `carriedBlockers`). Note `persist`/`published` results.
 - Print `result.handoff.message` verbatim — it tells the user the next step: `/implement-feature <planDir>`.
-- If `--auto-implement` was passed AND `designReady === true`: chain automatically by invoking the workflow again in implement mode (`Workflow({name:"feature-pipeline", args:{mode:"implement", resume:<planDir>, autoCommit, ...}})`). On `ready === true`, report implementation complete (stages done/total, `testsPassed`, `testSummary`, code-review count, `committed`/`commitHash` or autoCommit-off). On `blockedAt === 'issues-handoff'`, print the handoff and stop — instruct `/tune-feature <planDir>`.
+- If `blockedAt === 'awaiting-approval'` (the `--auto-implement` design run stopped at the approval checkpoint): run the **Approval loop** from `design-feature.md` — AskUserQuestion (approve / edit stage boundaries / reject to plan), re-invoke with `approveDesign`/`stageEdits`/`rejectToPlan`, repeat until `designApproved.approved === true` — and only then chain into implement.
+- If `--auto-implement` was passed AND `designReady === true` AND (approval is complete — `designApproved.approved === true` — or `--yes` was given): chain automatically by invoking the workflow again in implement mode (`Workflow({name:"feature-pipeline", args:{mode:"implement", resume:<planDir>, autoCommit, ...}})`). On `ready === true`, report implementation complete (stages done/total, `testsPassed`, `testSummary`, code-review count, `committed`/`commitHash` or autoCommit-off). On `blockedAt === 'issues-handoff'`, print the handoff and stop — instruct `/tune-feature <planDir>`.
 - If `needsClarification === true` (Gate 0 stopped): the `user-interviewer` already tried to resolve the open questions inline; if `interview.resolved === false` (or `--no-interview`), present the remaining `openQuestions` to the user as a numbered list and stop. Do NOT proceed until the user answers; on answer, re-run with those answers folded into `task`.
 - If `blockedAt` is set (design gates): name the blocking gate (`define`/`requirements`/`architecture`/`detailed-design`/`e2e-usecases`/`plan`/`tdd-enforce`/`review`/`uncaught-throw`), show the relevant detail, and note it is `--resume`-able: `/feature-pipeline --resume <planDir>`. If `blockedAt === 'uncaught-throw'`, an escaping error tripped the safety net (see `result._uncaughtError`); `pipeline-state.json` was still written, so `--resume`-able.
 
