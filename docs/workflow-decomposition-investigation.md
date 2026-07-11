@@ -140,6 +140,100 @@ workflows/dist/fp-design.js … fp-status.js   (self-contained, checked into the
 - Migration compatibility: persisted `pipeline-state.json` from v1.4.0 must hydrate unchanged in
   the split engine (state schema is versioned via `validatePipelineState` — keep it identical).
 
+## Recommended `src/` layout and build design (stage-1 blueprint)
+
+### Why hand-rolled concatenation, not a bundler
+
+The dist file is unusual: it must start with a **pure-literal** `export const meta`, end with a
+top-level `return final` (illegal ESM — standard tooling can't even re-parse the output), contain
+**zero** `import`s (the sandbox has no module resolution), and stay grep-stable (`/setup` and the
+command preflights grep the `// engine-version:` header). A bundler (esbuild/rollup) would be the
+repo's **first npm dependency** (deliberately zero-dep today), renames/reorders symbols (noisy
+dist diffs), and still needs post-processing for the meta header and the sandbox tail. A ~150-line
+zero-dep concat builder in `scripts/` matches the repo's existing tooling style and gives full
+control over the output shape.
+
+### Source layout
+
+```
+plugins/feature-workflows/workflows/
+  src/
+    meta/feature-pipeline.meta.mjs  # export const meta = {…} (pure literal; one per entry)
+    schemas.mjs        # ~45 verdict JSON-Schema consts        (today: lines 69–1043)
+    config.mjs         # MODEL_DEFAULTS, PROFILES, GATE_FALLBACKS, budget/mode resolvers
+    text-utils.mjs     # taskSlug, categorizeSlug, jiraIdFromTask, detectNonEnglish, …
+    json-repair.mjs    # extractJson … rewriteOutsideStrings
+    agent-core.mjs     # safeAgent/flexibleAgent, escalation, circuit breaker, watchdog,
+                       # telemetry, hardenForModel, normalizeVerdict
+    state.mjs          # consolidate, flush/load/validate pipeline state, artifact checks,
+                       # resume repair, checksums
+    review-loop.mjs    # reviewLoop, appendReviewHistory, enhancePrompt
+    decisions.mjs      # quick-decider, goalkeeper, decision log, LOOPBACK_FLAG_MAP,
+                       # clearGateAndDownstream, applyApprovalDecision
+    stages.mjs         # chunkPlanIntoStages, tickStageFile, invalidateStages, resetStageForRerun
+    issues.mjs         # issues handoff, classifyAndRecordIssue, readIssuesFile
+    modes/design.mjs … modes/status.mjs   # one runX(ctx) per mode branch of today's main()
+    main.mjs           # config resolution + state hydration + mode dispatch (slim)
+  feature-pipeline.js  # BUILD OUTPUT — same path, so commands/setup/preflights are untouched
+```
+
+Source rules the builder enforces (build fails otherwise):
+
+- Real ESM `import { x } from './y.mjs'` between src files only — Node-importable, so tests
+  import modules directly. **No `node:` builtins, no npm imports anywhere in src** (dist runs in
+  the FS-less sandbox; I/O stays inside `agent()` prompts, as today).
+- Top level = declarations only (`const` / `function` / `async function`), globally unique names
+  (the concat output is one flat namespace), no side-effectful top-level statements.
+- No `export default`, no re-exports, no default/namespace imports, no dynamic `import()` —
+  imports exist solely for the dependency graph and are stripped.
+
+### Builder: `scripts/build-workflows.mjs` (zero-dep)
+
+1. **Entries manifest** in the script: `{ entry, metaModule, out }` — one entry now
+   (`main.mjs → feature-pipeline.js`); stage 2 adds the six per-mode entries.
+2. **Walk the import graph** from the entry, topo-sort (deps first, refuse cycles). Only reached
+   modules are emitted → module-granular tree-shaking per entry for free (e.g. `fp-status` won't
+   carry the review-loop or agent-escalation stack).
+3. **Transform**: drop import lines, strip the `export ` keyword; reject anything outside the
+   allowed forms.
+4. **Collision check**: duplicate top-level identifiers across included modules → hard fail.
+5. **Emit**: `// GENERATED — edit workflows/src/, run npm run build` banner +
+   `// engine-version: <plugin.json version>` (injected — see versioning below) → the `meta`
+   literal with its `version` field rewritten to the same value → concatenated bodies →
+   `const final = await main()` / `return final` tail.
+6. **Post-emit self-checks** (all exist today as manual/CI steps, now automatic per dist):
+   the sed-neutralized `node --input-type=module --check` ESM check; phase-label validation
+   (every `phase('…')` literal ∈ `meta.phases`); forbidden-token scan (`import `, `require(`,
+   `Date.now`, `Math.random(`, `new Date(`).
+
+npm scripts: `"build": "node scripts/build-workflows.mjs"` and
+`"validate:build": "node scripts/build-workflows.mjs --check"` (rebuild to a temp buffer,
+byte-compare against the committed dist; wire into `validate-plugin.yml` so a src edit without a
+rebuild fails CI). Dist stays **committed** — users install the plugin from the repo, so the
+built artifact must be in-tree.
+
+### Versioning simplification
+
+Today's 3-way lockstep (plugin.json / header / `meta.version`) exists because all three are
+hand-edited. With the builder injecting header + `meta.version` from `plugin.json`, the manifest
+becomes the **single source of truth**; `validate:versions` reduces to "dist matches manifest"
+(and `validate:build` already proves dist is fresh). One bump site instead of three.
+
+### Test-harness impact
+
+`tests/harness.mjs` currently text-strips the sandbox tail from the monolith to import pure
+functions. After the split it imports `src/*.mjs` directly and the `CANDIDATES` existence dance
+disappears. Keep one build-integrity test: run the builder in-memory, assert output ≡ committed
+dist, and run the neutralized syntax check.
+
+### Migration mechanics (keeping it a pure refactor)
+
+The monolith is already ordered in clean regions, so stage 1 is a mechanical cut along the table
+in "Current engine anatomy": move regions into modules, add imports, build, and diff the dist
+against the current engine — the first build should be **semantically identical** (only the
+generated banner differs). The 180 existing tests plus the post-emit checks are the safety net;
+`meta`, gate order, and `pipeline-state.json` handling change by zero bytes.
+
 ## Suggested staging
 
 1. **Modularize source, build to the SAME single dist engine** (pure refactor, no behavior
