@@ -7,7 +7,8 @@ allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 Run the `feature-pipeline` workflow in **status mode** — a strictly read-only inspection of a
 persisted run. It loads `<planDir>/pipeline-state.json`, validates it, and renders a report:
 mode, gate progress, stage table, budgets used, per-gate telemetry, open questions/issues, and
-the exact next command (`/implement-feature …` / `/tune-feature …` / `/design-feature --resume …`).
+the exact next command (`/implement-feature …` / `/tune-feature …` / `/review-design …` /
+`/design-feature --resume …`).
 It writes NOTHING — no state flush, no checkpoint — so it is always safe to run, including on a
 blocked, mid-run, or corrupt pipeline.
 

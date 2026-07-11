@@ -62,6 +62,20 @@ stages, and re-enables `designReady` — then re-run `/feature-workflows:impleme
 
 All modes are resumable: `--resume <planDir>` (or just re-run implement/tune with `<planDir>`).
 
+### Optional quality gate: review the design docset before implementing
+
+```
+/feature-workflows:review-design <planDir>
+```
+
+INSPECT: audits the whole design docset through parallel review lenses (cross-artifact
+consistency, completeness, feasibility vs the codebase, testability, scope discipline),
+adversarially verifies every finding, and writes `design-review.md` plus tune-consumable
+entries in `issues-and-improvements.md` — without changing a single artifact. If issues were
+recorded, `/feature-workflows:tune-feature <planDir>` fixes them; if not, proceed to implement.
+Also useful after `extract-design` (deeper second opinion on the as-is audit) or after a tune
+pass (confirm the revisions didn't introduce new inconsistencies).
+
 At any point, inspect a run without touching it:
 
 ```

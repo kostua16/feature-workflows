@@ -69,6 +69,17 @@ const CANDIDATES = [
   'DECOMPOSE_VERDICT',
   'AUDIT_VERDICT',
   'OVERVIEW_VERDICT',
+  'REVIEW_FINDINGS_VERDICT',
+  'REVIEW_MERGE_VERDICT',
+  'REVIEW_VERIFY_VERDICT',
+  'REVIEW_LENSES',
+  'SEVERITY_RANK',
+  'meetsMinSeverity',
+  'resolveMinSeverity',
+  'resolveReviewLenses',
+  'collectReviewDocs',
+  'reviewIssueSection',
+  'buildReviewReport',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

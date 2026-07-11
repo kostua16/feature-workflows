@@ -1,15 +1,17 @@
 # feature-pipeline
 
-**Description:** Gate-enforcing pipeline for new features / bug-fixes. ONE engine, FIVE
+**Description:** Gate-enforcing pipeline for new features / bug-fixes. ONE engine, SIX
 modes (`args.mode`): `design` (THINK), `implement` (DO), `tune` (FIX), `extract` (reverse
-design extraction from existing code), `status` (read-only report). Encodes the CLAUDE.md
-agent rules as a deterministic sequence of gates. Thin slash commands drive it:
+design extraction from existing code), `review` (standalone design-docset audit), `status`
+(read-only report). Encodes the CLAUDE.md agent rules as a deterministic sequence of gates.
+Thin slash commands drive it:
 
 ```
 /design-feature  <task>     ... mode:design   -> THINK docs + plan + stageNN.md, stop pre-execute
 /implement-feature <planDir>           mode:implement -> DO: execute stages -> test -> review -> commit
 /tune-feature    <planDir>             mode:tune     -> FIX: consume issues -> refine gates -> re-enable designReady
 /extract-design  <scope>               mode:extract  -> REVERSE: existing code -> as-is design docs + audit
+/review-design   <planDir>             mode:review   -> INSPECT: audit the design docset -> design-review.md + issues
 /pipeline-status <planDir>             mode:status   -> READ-ONLY: gates/stages/budgets/telemetry report
 /feature-pipeline <task>               convenience alias -> design (stop); --auto-implement chains
 ```
@@ -40,6 +42,12 @@ feature-categorizer(fresh, no --plan) -> prompt-translator(non-English only)
   -> arch-design-orchestrator(as built) [+fidelity review-loops] [-> requirements(reverse-derived)]
   [-> critical-reviewer(as-is design audit) -> issues-and-improvements.md]
   -> [system-overview synthesis (multi-slice)] -> publish/persist -> extractReady=true, STOP
+[review gates — own branch, runs only in review mode; changes NOTHING]
+  -> collect artifact inventory from state -> critical-reviewer per lens, in parallel
+     (consistency | completeness | feasibility | testability | scope)
+  -> merge/dedup (across lenses AND against already-recorded issues)
+  -> adversarial verify per finding (refuted findings dropped)
+  -> design-review.md report + gate-mapped findings -> issues-and-improvements.md, STOP
 ```
 
 
@@ -72,6 +80,20 @@ gate cannot pass; it does NOT silently skip steps.
 
 ## What's new
 
+- **Review mode (engine 1.4.0).** A sixth mode, `review`, is the INSPECT flow: a standalone
+  audit of an EXISTING design docset (forward-designed, extracted, or tuned) that COLLECTS all
+  design issues without changing anything — no artifact edits, no `designReady`/stage changes
+  (fixing stays in `/tune-feature`). One `critical-reviewer` per review lens (`consistency`,
+  `completeness`, `feasibility`, `testability`, `scope`) reads the whole docset in parallel;
+  the union is deduplicated across lenses AND against issues already recorded (re-runs stay
+  additive); each merged finding is adversarially verified (an independent reviewer tries to
+  refute it — refuted findings are dropped, unavailable verdicts keep the finding, over-report
+  bias). Output: `<planDir>/design-review.md` (every confirmed finding) + the gate-mapped
+  findings at/above `--min-severity` appended to `issues-and-improvements.md` in the exact
+  tune-consumable section format. New command: `/review-design <planDir>`. New flags:
+  `--lenses=`, `--min-severity=`, `--no-verify`. New result fields: `reviewPath`,
+  `designReview`. New blocked values: `review-requires-plandir`, `review-no-artifacts`,
+  `design-review`.
 - **Extract mode (engine 1.3.0).** A fifth mode, `extract`, reverse-engineers design docs from
   EXISTING code: hybrid scope input (free text / paths / entry points) → `scope-manifest.md` → a
   pause-and-resume scope-confirmation checkpoint (the command layer asks the user; workflow
@@ -221,7 +243,7 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 
 ```jsonc
 {
-  "mode": "design",                                                 // optional: design|implement|tune|extract|status (default design; --resume hydrates persisted mode)
+  "mode": "design",                                                 // optional: design|implement|tune|extract|review|status (default design; --resume hydrates persisted mode)
   "task": "Fix the token expiry check in auth middleware (uses < instead of <=)",
   "planPath": ".planning/user-plans/fix-token-expiry/plan.md",   // optional: where plan is written/read
   "definitionPath": ".planning/user-plans/fix-token-expiry/idea.md", // optional: where the idea doc is written (default: plan dir /idea.md)
@@ -274,6 +296,9 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
   "slices": [],                                                  // optional: extract-mode slice-id selection; unselected slices kept as 'skipped'
   "scopeConfirmed": true,                                        // TRANSIENT (extract confirmation leg only): true = scope approved, false = cancel. NOT persisted; omit on first invocation
   "scopeFiles": [],                                              // TRANSIENT (extract confirmation leg only): user-adjusted scope file list
+  "useReviewVerify": true,                                       // optional: review-mode adversarial verification of merged findings (default true)
+  "minSeverity": "low",                                          // optional: review-mode floor for RECORDING findings to issues-and-improvements.md (blocker|high|medium|low; default low)
+  "reviewLenses": [],                                            // optional: review-mode lens selection (consistency|completeness|feasibility|testability|scope; [] = all)
   "resume": "",                                                  // optional: <planDir> to hydrate pipeline-state.json and re-run from first incomplete gate
   "models": {                                                      // optional: per-gate model tier overrides (aliases: haiku|sonnet|opus|fable)
     "plan": "sonnet",
@@ -287,8 +312,9 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
   pre-execute at `designReady`; `implement` = DO gates (asserts `designReady` from a prior design
   run); `tune` = FIX branch (consumes `issues-and-improvements.md`, revisits only mapped gates in
   refine mode, re-sets `designReady`); `extract` = REVERSE branch (existing code → as-is design
-  docs, slice by slice, terminating at `extractReady`). On `--resume` the persisted `mode` hydrates
-  if `mode` is absent.
+  docs, slice by slice, terminating at `extractReady`); `review` = INSPECT branch (audits the
+  existing docset, writes `design-review.md` + tune-consumable issues, changes nothing). On
+  `--resume` the persisted `mode` hydrates if `mode` is absent.
 - `resume` (optional): a `<planDir>` (or bare `plan.md` path) to hydrate `<planDir>/pipeline-state.json`
   and re-run from the first incomplete gate. Path-only — the categorizer is never re-run on resume; the
   persisted `planPath` is reused verbatim. Works for all three modes.
@@ -342,6 +368,17 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 - `maxSlices` / `slices` (optional, defaults `8` / `[]`, **extract mode**): bound or select the slices
   extracted this run; every excess/unselected slice stays in the queue as `skipped` so the index is
   complete and a later `--resume`/`--slices` run can pick it up.
+- `useReviewVerify` (optional, default `true`, **review mode**): adversarially verify each merged
+  finding (an independent critical-reviewer tries to REFUTE it against the docs). Refuted findings
+  are dropped; an unavailable verdict keeps the finding marked unverified (over-report bias — a
+  false NEGATIVE would hide a real design defect, a false positive only costs a tune look).
+  `--no-verify` skips the pass.
+- `minSeverity` (optional, default `low`, **review mode**): the severity floor for RECORDING
+  findings to `issues-and-improvements.md`. Findings below the floor (or with `gate: none`) still
+  appear in `design-review.md` — the report is complete, the issues file is actionable.
+- `reviewLenses` (optional, default `[]` = all, **review mode**): run only the named review
+  dimensions (`consistency`, `completeness`, `feasibility`, `testability`, `scope`). Unknown keys
+  are ignored; an all-unknown list falls back to all lenses.
 - **Profiles in extract mode**: profile presets tune the FORWARD flow, so the core extraction gates
   (code facts, e2e use cases, detailed design, architecture) are re-derived with
   profile-independent ON defaults — a `light` extract run drops only review/requirements/audit,
@@ -465,6 +502,9 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 | `decomposer`| arch-design-orchestrator (extract Gate X1 slicing)| opus |
 | `audit`     | critical-reviewer (extract Gate X7 as-is audit)| opus |
 | `overview`  | arch-design-orchestrator (extract Gate X8 synthesis)| sonnet |
+| `reviewLens`| critical-reviewer (review Gate R1, per lens)| opus |
+| `reviewMerge`| findings dedup/merge (review Gate R2)| sonnet |
+| `reviewVerify`| critical-reviewer (review Gate R3 adversarial verify)| opus |
 
 Override example: `models: { plan: 'sonnet', review: 'sonnet' }` downgrades the planning gates.
 
@@ -528,6 +568,8 @@ The workflow returns a JSON summary object:
   "overviewPath": null,          // <planDir>/system-overview.md (multi-slice extract only)
   "auditPath": null,             // <planDir>/design-audit.md (single-slice; per-slice audits on queue entries)
   "extractReady": false,         // extract terminal: all pending slices processed + artifacts verified
+  "reviewPath": null,            // <planDir>/design-review.md (review mode report)
+  "designReview": null,          // review summary {lenses, docsReviewed, raw, confirmed, refuted, droppedDuplicates, recorded, minSeverity}
   "decisionsPath": "...",        // <planDir>/decisions.md — audit log of quick-decider + goalkeeper verdicts; null if no decision fired
   "decisionUsed": 0,             // spent from the hard decisionCap (quick-decider + goalkeeper)
   "published": { "published": true, "paths": [...], "summary": "..." }, // Gate 5.4; null if skipped, {published:false} on failure
@@ -545,6 +587,7 @@ failing gate runs. `blockedAt` values: design gates (`define`/`requirements`/`ar
 `detailed-design`/`e2e-usecases`/`plan`/`tdd-enforce`/`review`), implement gates (`execute`/`test`/
 `code-review`/`goalkeeper`), tune-specific (`tune-no-issues`/`tune-awaiting-confirm`/`tune-cancelled`),
 extract-specific (`extract-scope`/`extract-cancelled`/`extract-budget`/`artifact-missing`),
+review-specific (`review-requires-plandir`/`review-no-artifacts`/`design-review`),
 approval checkpoint (`awaiting-approval` at the design-stop; `design-not-approved` in implement),
 `bad-args` (invalid `--stage`/`--from-gate`; nothing ran, nothing persisted), or `issues-handoff`
 (implement upstream-defect path — goalkeeper loop-back or code-review blockers classified upstream),
@@ -625,6 +668,25 @@ naming the follow-up commands. Artifact names deliberately reuse the forward pip
 (`codebase-facts.md`, `e2e-use-cases.md`, `detailed-design.md`, `architecture.md`,
 `requirements.md`) — that reuse IS the baseline compatibility.
 
+### `review` — `/review-design <planDir>` (INSPECT; positional planDir required)
+Own branch right after tune (before the translator gate); requires a hydrated resume — a fresh
+invocation without `pipeline-state.json` blocks cleanly at `review-requires-plandir` (before the
+planDir derivation, which review has no fresh-run path for). Flow: build the artifact inventory
+from the persisted state (idea/requirements/architecture/detailed-design/e2e/codebase-facts +
+plan — only when actually written — + `stageNN.md` files; empty inventory blocks at
+`review-no-artifacts`) → **Gate R1** one `critical-reviewer` per lens in parallel (the barrier is
+deliberate: R2 dedups ACROSS lenses) → **Gate R2** merge/dedup, also against the existing
+`issues-and-improvements.md` so re-running review never re-records an issue (merge failure falls
+back to the raw union — over-report, never silently drop) → **Gate R3** adversarial verification
+per finding (refuted → dropped; unavailable verdict → kept, marked unverified) →
+`design-review.md` written deterministically from the verified findings (chunked file-writer) →
+findings with `gate != none` at/above `minSeverity` append to `issues-and-improvements.md` (same
+growth-verified, append-only discipline as the classifier/audit) → `designReview` summary +
+handoff (`nextMode:'tune'` when anything was recorded, else `implement`/`design` by
+`designReady`). **Changes nothing**: no artifact edits, no `designReady`/stage mutation — a
+review is safe at any point (pre-implement quality gate, post-extract second opinion, post-tune
+regression check). All lens reviewers failing blocks at `design-review` (re-runnable).
+
 ### `issues-and-improvements.md` lifecycle
 ```
 implement: goalkeeper loop-back upstream defect, OR blocker-severity code-review findings
@@ -632,6 +694,8 @@ implement: goalkeeper loop-back upstream defect, OR blocker-severity code-review
   -> append <planDir>/issues-and-improvements.md  -> blockedAt='issues-handoff' (stop)
 extract: as-is design audit findings with gate ∈ {requirements,architecture,design,plan,tests}
   -> append <sliceDir>/issues-and-improvements.md (same section format; no implement run needed)
+review: lens findings -> merge/dedup -> adversarial verify -> gate-mapped, >= minSeverity
+  -> append <planDir>/issues-and-improvements.md (same section format; no implement run needed)
 tune: read issues-and-improvements.md -> tunePlanner -> planGates -> confirm -> refine those gates
   -> re-reconcile -> invalidate file-intersecting stages -> designReady=true (stop)
 implement (<planDir>): re-runs from the first invalidated stage -> green -> commit

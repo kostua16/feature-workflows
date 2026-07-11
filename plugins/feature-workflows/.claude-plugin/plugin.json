@@ -1,7 +1,7 @@
 {
   "name": "feature-workflows",
-  "version": "1.3.0",
-  "description": "Gate-enforced feature pipeline: THINK (design) -> DO (implement) -> FIX (tune) -> EXTRACT (reverse-engineer design docs from existing code) + read-only status. Ships the feature-pipeline dynamic-workflow engine (installed into your project via /feature-workflows:setup), 31 specialized sub-agents, and the compress-md skill.",
+  "version": "1.4.0",
+  "description": "Gate-enforced feature pipeline: THINK (design) -> DO (implement) -> FIX (tune) -> EXTRACT (reverse-engineer design docs from existing code) -> REVIEW (audit an existing design docset and collect issues) + read-only status. Ships the feature-pipeline dynamic-workflow engine (installed into your project via /feature-workflows:setup), 31 specialized sub-agents, and the compress-md skill.",
   "author": { "name": "Konstantin Leontyev", "email": "koleo169kzai@gmail.com" },
   "homepage": "https://github.com/kostua16/feature-workflows",
   "keywords": ["workflow", "pipeline", "tdd", "planning", "agents", "design"]

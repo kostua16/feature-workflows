@@ -2,13 +2,13 @@
   "name": "feature-workflows",
   "owner": { "name": "Konstantin Leontyev", "email": "koleo169kzai@gmail.com" },
   "metadata": {
-    "description": "Gate-enforced feature-development pipeline for Claude Code: design/implement/tune/extract modes driven by a dynamic workflow engine."
+    "description": "Gate-enforced feature-development pipeline for Claude Code: design/implement/tune/extract/review modes driven by a dynamic workflow engine."
   },
   "plugins": [
     {
       "name": "feature-workflows",
       "source": "./plugins/feature-workflows",
-      "description": "Gate-enforced feature pipeline: 7 commands, 31 sub-agents, the feature-pipeline dynamic-workflow engine, compress-md skill.",
+      "description": "Gate-enforced feature pipeline: 8 commands, 31 sub-agents, the feature-pipeline dynamic-workflow engine, compress-md skill.",
       "category": "workflows",
       "tags": ["pipeline", "tdd", "planning", "agents"],
       "strict": true
