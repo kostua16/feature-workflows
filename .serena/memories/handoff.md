@@ -1,8 +1,16 @@
 # Handoff — current state & next actions
 
-_Last updated: 2026-07-11 (review mode — standalone design-docset audit, engine v1.4.0)._
+_Last updated: 2026-07-11 (workflow-decomposition investigation; engine still v1.4.0, unchanged)._
 
 ## Current state
+- Investigated splitting the monolithic engine into smaller composed workflows —
+  see `docs/workflow-decomposition-investigation.md`. Verdict: feasible; hard constraints are
+  ONE-level `workflow()` nesting and no code sharing between scripts (needs a src→dist build
+  step to avoid duplicating the ~2.8k-line helper stack). Recommended staging: (1) modularize
+  source + build to the same single dist engine, (2) split per MODE (six sibling workflows,
+  `pipeline-state.json` contract unchanged), (3) selective `workflow()` children —
+  extract-slice first, then a shared design-docs child for design/tune/extract reuse.
+  No engine changes made.
 - Implemented **review mode** (`mode: 'review'`, engine/plugin v1.4.0) — the sixth pipeline
   mode and the INSPECT flow: `/review-design <planDir>` audits an existing design docset
   (forward-designed, extracted, or tuned) and collects ALL design issues without mutating
