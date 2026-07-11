@@ -37,6 +37,7 @@ guard) → EN-1 (test harness, so the rest land safely) → everything else.
 | FT-3 selective stage execution | ✅ done | `--stage` (`resetStageForRerun`) + `--from-gate` (`normalizeGateTarget` + `LOOPBACK_FLAG_MAP.execute`) |
 | FT-4 per-gate telemetry | ✅ done | `bumpGateTelemetry` in `flexibleAgent`/`recordAgentFailure`; `renderTelemetrySummary` at terminal exits |
 | FT-5 design-approval gate | ✅ done | `--approval` → `awaiting-approval` stop + command-level AskUserQuestion loop; `applyApprovalDecision`; tune-confirm converted to the same stop/re-invoke pattern (`tune-awaiting-confirm`) |
+| FT-6 extract mode (v1.3.0) | ✅ done | `mode:extract` branch + `commands/extract-design.md`; `seedExtractQueue`/`nextPendingSlice`; scope-confirm stop/re-invoke; as-is audit → `issues-and-improvements.md` |
 
 Nothing remains open in this backlog.
 
@@ -195,6 +196,19 @@ Nothing remains open in this backlog.
   subagent-AskUserQuestion assumption and was converted to the identical stop/re-invoke pattern
   (`tune-awaiting-confirm` + `confirmTune`/`finalGates`/`cancelTune`).
 
+#### ✅ DONE (v1.3.0) FT-6. Extract mode — reverse design extraction from existing code
+- Fifth engine mode (`mode:extract`, command `/extract-design <scope>`): hybrid scope input
+  (free text / paths / globs / entry points) → `scope-manifest.md` (code-explorer) →
+  pause-and-resume scope confirmation (command layer AskUserQuestion; engine returns
+  `handoff.status='awaiting-scope-confirm'` — same stop/re-invoke pattern as the FT-5
+  approval gate and tune-confirm) → optional decomposition of a wide scope into a
+  resumable slice queue (`slices/<id>/` docsets + slice-local state files) → per slice:
+  deep code facts → observable e2e use cases → detailed design + architecture *as built* →
+  optional fidelity reviews / reverse-derived requirements / as-is design audit whose
+  findings append to `issues-and-improvements.md` (tune-consumable) → multi-slice
+  `system-overview.md` → publish/persist → `extractReady`. Output dirs are `/tune-feature`
+  and `/design-feature --resume` baselines (artifact names reused deliberately).
+
 ---
 
 ## Robustness & self-recovery (weak-model guardrails)
@@ -341,7 +355,8 @@ deterministic guards → recovery policy.
 - Q2: Is the E4 design-gate rewind (BF-5) intentionally kept for a future single-command
   mode, or safe to delete?
 - ~~Q3~~ RESOLVED (v1.2.0): workflow subagents **cannot** use AskUserQuestion (user-confirmed).
-  tune-confirm and the FT-5 approval gate are command-level stop/re-invoke checkpoints now.
+  tune-confirm and the FT-5 approval gate are command-level stop/re-invoke checkpoints now,
+  and the v1.3.0 extract-mode scope confirmation was built on the same pattern from the start.
   Note: the user-interviewer gate (Define clarifications) still carries the old assumption —
   candidate for the same conversion.
 - Q4: Does the target weak-model harness support forced structured output (tool-use JSON) at

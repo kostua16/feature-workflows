@@ -1,13 +1,16 @@
 # feature-pipeline
 
-**Description:** Gate-enforcing pipeline for new features / bug-fixes. ONE engine, THREE
-modes (`args.mode`): `design` (THINK), `implement` (DO), `tune` (FIX). Encodes the CLAUDE.md
-agent rules as a deterministic sequence of gates. Three thin slash commands drive it:
+**Description:** Gate-enforcing pipeline for new features / bug-fixes. ONE engine, FIVE
+modes (`args.mode`): `design` (THINK), `implement` (DO), `tune` (FIX), `extract` (reverse
+design extraction from existing code), `status` (read-only report). Encodes the CLAUDE.md
+agent rules as a deterministic sequence of gates. Thin slash commands drive it:
 
 ```
 /design-feature  <task>     ... mode:design   -> THINK docs + plan + stageNN.md, stop pre-execute
 /implement-feature <planDir>           mode:implement -> DO: execute stages -> test -> review -> commit
 /tune-feature    <planDir>             mode:tune     -> FIX: consume issues -> refine gates -> re-enable designReady
+/extract-design  <scope>               mode:extract  -> REVERSE: existing code -> as-is design docs + audit
+/pipeline-status <planDir>             mode:status   -> READ-ONLY: gates/stages/budgets/telemetry report
 /feature-pipeline <task>               convenience alias -> design (stop); --auto-implement chains
 ```
 
@@ -30,6 +33,13 @@ feature-categorizer(fresh, no --plan) -> prompt-translator(non-English only)
   -> read issues-and-improvements.md -> tunePlanner(minimal gate-revisit plan, AskUserQuestion confirm)
   -> revisit ONLY mapped gates in refine mode -> re-reconcile -> invalidate file-intersecting stages
   -> set designReady=true, STOP
+[extract gates — own branch after Translate, runs only in extract mode]
+  -> code-explorer(scope-manifest) -> [pause: awaiting-scope-confirm handoff, command layer confirms]
+  -> [decompose wide scope into slice queue] -> per slice: code-explorer(deep facts)
+  -> e2e-usecase-extractor(observable behavior) -> detailed-design-architect(as built)
+  -> arch-design-orchestrator(as built) [+fidelity review-loops] [-> requirements(reverse-derived)]
+  [-> critical-reviewer(as-is design audit) -> issues-and-improvements.md]
+  -> [system-overview synthesis (multi-slice)] -> publish/persist -> extractReady=true, STOP
 ```
 
 
@@ -62,6 +72,19 @@ gate cannot pass; it does NOT silently skip steps.
 
 ## What's new
 
+- **Extract mode (engine 1.3.0).** A fifth mode, `extract`, reverse-engineers design docs from
+  EXISTING code: hybrid scope input (free text / paths / entry points) → `scope-manifest.md` → a
+  pause-and-resume scope-confirmation checkpoint (the command layer asks the user; workflow
+  subagents cannot AskUserQuestion — same stop/re-invoke pattern as the v1.2.0 approval and
+  tune-confirm checkpoints) → optional decomposition of a wide scope into a resumable
+  slice queue → per slice: deep code facts → observable e2e use cases → detailed design +
+  architecture *as built* → optional fidelity reviews, reverse-derived requirements, and an
+  as-is design audit whose findings feed `issues-and-improvements.md` (tune-consumable). Output
+  dirs are `/tune-feature` and `/design-feature --resume` baselines. New command:
+  `/extract-design`. New flags: `--no-confirm`, `--no-decompose`, `--max-slices=N`, `--slices=`,
+  `--no-audit`, `--no-requirements`, `--no-review`. New result fields: `extractScope`,
+  `scopeManifestPath`, `scopeConfirmed`, `extractQueue`, `overviewPath`, `auditPath`,
+  `extractReady`.
 - **v1.2.0 — status mode, telemetry, selective execution, approval checkpoints, code-review
   issues routing.**
   - **`status` mode / `/pipeline-status <planDir>`** — read-only report of a persisted run
@@ -198,7 +221,7 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 
 ```jsonc
 {
-  "mode": "design",                                                 // optional: design|implement|tune|status (default design; --resume hydrates persisted mode)
+  "mode": "design",                                                 // optional: design|implement|tune|extract|status (default design; --resume hydrates persisted mode)
   "task": "Fix the token expiry check in auth middleware (uses < instead of <=)",
   "planPath": ".planning/user-plans/fix-token-expiry/plan.md",   // optional: where plan is written/read
   "definitionPath": ".planning/user-plans/fix-token-expiry/idea.md", // optional: where the idea doc is written (default: plan dir /idea.md)
@@ -242,6 +265,15 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
   "finalGates": [],                                              // optional one-shot: with confirmTune, override the gate-revisit list (subset of requirements|architecture|design|plan)
   "stage": "",                                                   // optional one-shot: stageNN to re-arm for re-execution (implement mode; clears stale test/review verdicts)
   "fromGate": "",                                                // optional one-shot: gate to rewind deterministically (requirements|architecture|design|plan in design/tune; execute|tests in implement)
+  "useScopeConfirm": true,                                       // optional: extract-mode pause-and-resume scope confirmation checkpoint (default true)
+  "useDecompose": true,                                          // optional: extract-mode decomposition of a wide scope into slices (default true)
+  "useAudit": true,                                              // optional: extract-mode as-is design audit -> issues-and-improvements.md (default true)
+  "useExtractRequirements": true,                                // optional: extract-mode reverse-derived requirements.md (default true)
+  "useExtractReview": true,                                      // optional: extract-mode fidelity review loops on extracted docs (default true)
+  "maxSlices": 8,                                                // optional: extract-mode cap on slices per run; excess kept as 'skipped' (default 8)
+  "slices": [],                                                  // optional: extract-mode slice-id selection; unselected slices kept as 'skipped'
+  "scopeConfirmed": true,                                        // TRANSIENT (extract confirmation leg only): true = scope approved, false = cancel. NOT persisted; omit on first invocation
+  "scopeFiles": [],                                              // TRANSIENT (extract confirmation leg only): user-adjusted scope file list
   "resume": "",                                                  // optional: <planDir> to hydrate pipeline-state.json and re-run from first incomplete gate
   "models": {                                                      // optional: per-gate model tier overrides (aliases: haiku|sonnet|opus|fable)
     "plan": "sonnet",
@@ -254,7 +286,9 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 - `mode` (optional, default `design`): selects the gate range. `design` = THINK gates only, stops
   pre-execute at `designReady`; `implement` = DO gates (asserts `designReady` from a prior design
   run); `tune` = FIX branch (consumes `issues-and-improvements.md`, revisits only mapped gates in
-  refine mode, re-sets `designReady`). On `--resume` the persisted `mode` hydrates if `mode` is absent.
+  refine mode, re-sets `designReady`); `extract` = REVERSE branch (existing code → as-is design
+  docs, slice by slice, terminating at `extractReady`). On `--resume` the persisted `mode` hydrates
+  if `mode` is absent.
 - `resume` (optional): a `<planDir>` (or bare `plan.md` path) to hydrate `<planDir>/pipeline-state.json`
   and re-run from the first incomplete gate. Path-only — the categorizer is never re-run on resume; the
   persisted `planPath` is reused verbatim. Works for all three modes.
@@ -288,6 +322,31 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
   and also clear `designReady`; `execute|tests` (alias `test`/`exec`) are valid in implement. Invalid
   target or a design target in implement mode → `blockedAt='bad-args'` (nothing runs). Never persisted
   into config.
+- `useScopeConfirm` (optional, default `true`, **extract mode**): pause after scope resolution with a
+  `handoff.status='awaiting-scope-confirm'` return (NOT a `blockedAt` error). Subagents inside the
+  workflow cannot AskUserQuestion, so the COMMAND LAYER presents `handoff.scopeSummary` to the user
+  and re-invokes with the transient confirmation args (`scopeConfirmed` true/false, optional
+  `scopeFiles`, optional `slices`). `--no-confirm` skips the pause (fully autonomous extraction).
+- `useDecompose` (optional, default `true`, **extract mode**): when the scope resolver flags the scope
+  `wide`, decompose it into feature/subsystem slices and loop the extraction cycle per slice (each
+  slice under `<planDir>/slices/<id>/` with its own state file). `--no-decompose` extracts the whole
+  scope as one docset.
+- `useAudit` (optional, default `true`, **extract mode**): after extraction, run the as-is design audit
+  (critical-reviewer as auditor) → `design-audit.md` + tune-consumable findings appended to
+  `issues-and-improvements.md`. Non-blocking.
+- `useExtractRequirements` (optional, default `true`, **extract mode**): reverse-derive the FRs/NFRs the
+  code demonstrably satisfies → `requirements.md` (each marked `[extracted]`). Non-blocking.
+- `useExtractReview` (optional, default `true`, **extract mode**): fidelity review loops on the extracted
+  detailed design + architecture (does the doc faithfully describe the code? — the code is the source
+  of truth; design debt belongs to the audit).
+- `maxSlices` / `slices` (optional, defaults `8` / `[]`, **extract mode**): bound or select the slices
+  extracted this run; every excess/unselected slice stays in the queue as `skipped` so the index is
+  complete and a later `--resume`/`--slices` run can pick it up.
+- **Profiles in extract mode**: profile presets tune the FORWARD flow, so the core extraction gates
+  (code facts, e2e use cases, detailed design, architecture) are re-derived with
+  profile-independent ON defaults — a `light` extract run drops only review/requirements/audit,
+  never the extracted docs themselves. Explicit `--no-e2e`/`--no-arch`/`--no-design` flags (and
+  persisted per-run flags) still win.
 - `planPath` (optional): an explicit plan path. If set it is used verbatim and the
   dynamic planDir (Gate -2) is skipped — if a plan already exists there it is refined instead of
   written from scratch. Absent on a fresh run → `feature-categorizer` derives
@@ -402,6 +461,10 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 | `persist`   | knowledge-persist (Gate 5.5)          | sonnet  |
 | `commit`    | git-ops                               | sonnet  |
 | `todo`      | todo-store write (consolidate)        | haiku   |
+| `scopeResolver`| code-explorer (extract Gate X0 scope manifest)| sonnet |
+| `decomposer`| arch-design-orchestrator (extract Gate X1 slicing)| opus |
+| `audit`     | critical-reviewer (extract Gate X7 as-is audit)| opus |
+| `overview`  | arch-design-orchestrator (extract Gate X8 synthesis)| sonnet |
 
 Override example: `models: { plan: 'sonnet', review: 'sonnet' }` downgrades the planning gates.
 
@@ -457,7 +520,14 @@ The workflow returns a JSON summary object:
   "stages": [],                  // plan-chunker output: [{id,file,name,status,files}]; progress unit in implement. [] if --no-chunker/not run
   "tunePlan": null,              // tune mode: derived gate-revisit plan ({planGates, issueRefs, preserveStages}); persisted so resume reuses it
   "tuneConfirmed": false,        // tune mode: true after AskUserQuestion confirm (or --no-confirm); persisted so resume won't re-prompt
-  "handoff": null,               // {from, nextMode, message, ...}; cross-mode pointer (design->implement, implement->tune, tune->implement)
+  "handoff": null,               // {from, nextMode, message, ...}; cross-mode pointer (design->implement, implement->tune, tune->implement, extract->tune). Extract adds status:'awaiting-scope-confirm' + scopeSummary at the confirmation pause, and slices[] at the terminal
+  "extractScope": null,          // extract Gate X0 SCOPE_VERDICT (files, entryPoints, confidence, wide, suggestedSlices)
+  "scopeManifestPath": null,     // <planDir>/scope-manifest.md
+  "scopeConfirmed": false,       // extract: true once the command-layer confirmation leg ran (or --no-confirm)
+  "extractQueue": [],            // extract: resumable slice queue [{id,name,planDir,files,entryPoints,status,artifacts}]
+  "overviewPath": null,          // <planDir>/system-overview.md (multi-slice extract only)
+  "auditPath": null,             // <planDir>/design-audit.md (single-slice; per-slice audits on queue entries)
+  "extractReady": false,         // extract terminal: all pending slices processed + artifacts verified
   "decisionsPath": "...",        // <planDir>/decisions.md — audit log of quick-decider + goalkeeper verdicts; null if no decision fired
   "decisionUsed": 0,             // spent from the hard decisionCap (quick-decider + goalkeeper)
   "published": { "published": true, "paths": [...], "summary": "..." }, // Gate 5.4; null if skipped, {published:false} on failure
@@ -474,6 +544,7 @@ If a gate fails, `blockedAt` names it and `ready` is `false`; nothing after the
 failing gate runs. `blockedAt` values: design gates (`define`/`requirements`/`architecture`/
 `detailed-design`/`e2e-usecases`/`plan`/`tdd-enforce`/`review`), implement gates (`execute`/`test`/
 `code-review`/`goalkeeper`), tune-specific (`tune-no-issues`/`tune-awaiting-confirm`/`tune-cancelled`),
+extract-specific (`extract-scope`/`extract-cancelled`/`extract-budget`/`artifact-missing`),
 approval checkpoint (`awaiting-approval` at the design-stop; `design-not-approved` in implement),
 `bad-args` (invalid `--stage`/`--from-gate`; nothing ran, nothing persisted), or `issues-handoff`
 (implement upstream-defect path — goalkeeper loop-back or code-review blockers classified upstream),
@@ -533,11 +604,34 @@ record — so it is safe on blocked, mid-run, or corrupt state (a failed validat
 WARNING line in the report). Only an explicit `args.mode='status'` selects it; status is never
 persisted into config.
 
+### `extract` — `/extract-design <scope>` (REVERSE; hybrid scope input)
+Own branch AFTER the translator gate (free-text scope input benefits from translation); never enters
+the design/implement gate path. planDir lands under `docs/{cat}/{sub}/extract/{leaf}/` (note the
+`extract/` segment). Flow: `code-explorer` resolves the hybrid input (free text / paths / globs /
+entry points) into `scope-manifest.md` → **pause-and-resume scope confirmation** (the engine returns
+`handoff.status='awaiting-scope-confirm'`; the COMMAND asks the user via AskUserQuestion in the main
+session — subagents inside the workflow cannot — then re-invokes with `scopeConfirmed`/`scopeFiles`/
+`slices`) → a `wide` scope is decomposed into a dependency-ordered, **resumable slice queue**
+(`extractQueue`, flushed to state after every slice) → per slice, the abstraction ladder is climbed
+in REVERSE: deep code facts → observable e2e use cases (early — they anchor intent) → detailed
+design *as built* → architecture *as built* → optional fidelity reviews (code = source of truth) →
+optional reverse-derived requirements (`[extracted]`-marked) → optional as-is design audit whose
+upstream findings append to `issues-and-improvements.md` in the tune-consumable format. Multi-slice
+runs synthesize `system-overview.md` and write a design-shaped slice-local `pipeline-state.json`
+per slice (`designReady=true`), so **each slice dir is a valid `/tune-feature` / `/design-feature
+--resume` target**; single-slice runs write artifacts flat in the planDir and set the parent
+`designReady=true` themselves. Terminal: artifact verification → `extractReady=true` → handoff
+naming the follow-up commands. Artifact names deliberately reuse the forward pipeline's
+(`codebase-facts.md`, `e2e-use-cases.md`, `detailed-design.md`, `architecture.md`,
+`requirements.md`) — that reuse IS the baseline compatibility.
+
 ### `issues-and-improvements.md` lifecycle
 ```
 implement: goalkeeper loop-back upstream defect, OR blocker-severity code-review findings
   -> issueClassifier (per finding) -> isUpstream? gate ∈ {requirements,architecture,design,plan}
   -> append <planDir>/issues-and-improvements.md  -> blockedAt='issues-handoff' (stop)
+extract: as-is design audit findings with gate ∈ {requirements,architecture,design,plan,tests}
+  -> append <sliceDir>/issues-and-improvements.md (same section format; no implement run needed)
 tune: read issues-and-improvements.md -> tunePlanner -> planGates -> confirm -> refine those gates
   -> re-reconcile -> invalidate file-intersecting stages -> designReady=true (stop)
 implement (<planDir>): re-runs from the first invalidated stage -> green -> commit

@@ -238,7 +238,7 @@ test('verdictContradiction rejects internally inconsistent verdicts', () => {
 })
 
 test('implement-mode guard is wired into the full design gate path', () => {
-  assert.match(source, /} else if \(gateModeActive\('design', mode\)\) \{/)
+  assert.match(source, /} else if \(gateModeActive\('design', mode\) \|\| isExtractMode\) \{/)
 })
 
 test('gsd-quick prompt uses persisted definition path instead of a nullable local definition', () => {

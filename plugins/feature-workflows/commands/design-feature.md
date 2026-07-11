@@ -130,6 +130,9 @@ Examples:
 /design-feature --resume docs/parser/feature/add-retry-layer
 ```
 
+Note: `--resume` also accepts a dir produced by `/extract-design` (or one of its `slices/<id>/`
+sub-dirs) — the extracted as-is docs become the refine baseline for a forward design pass.
+
 ## Editing the workflow script
 
 The canonical engine source lives in the plugin at `plugins/feature-workflows/workflows/feature-pipeline.js`
