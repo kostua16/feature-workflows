@@ -85,6 +85,10 @@ When the workflow returns its result JSON, report it concisely:
   blocked before any doc was written). Print `result.handoff.message`.
 - If `blockedAt === 'design-review'`: every lens reviewer failed. Re-runnable:
   `/review-design <planDir>`.
+- If `blockedAt === 'review-record-failed'`: actionable findings were confirmed but the
+  `issues-and-improvements.md` append failed — nothing was recorded for tune (the report at
+  `result.reviewPath` still carries every confirmed finding). Print `result.handoff.message` and
+  re-run `/review-design <planDir>` — re-runs are dedup-safe.
 - If `blockedAt === 'uncaught-throw'`: an escaping error tripped the safety net (see
   `result._uncaughtError`); re-runnable with `<planDir>`.
 

@@ -226,6 +226,36 @@ test('source: review issues append is growth-verified and append-only', () => {
   assert.ok(fn.includes('append only'))
 })
 
+test('source: recordReviewIssues reports the persisted count, not the intent', () => {
+  const fn = source.slice(
+    source.indexOf('async function recordReviewIssues'),
+    source.indexOf('// extractSlice:')
+  )
+  // A failed/absent ack must return 0 and must NOT set issuesPath — the handoff routes
+  // to /tune-feature off this value, and tune dead-ends on a missing issues file.
+  const failGuard = fn.indexOf('if (!ack || ack.ok === false)')
+  const setPath = fn.indexOf('result.issuesPath = issuesPath')
+  assert.ok(failGuard > 0 && setPath > 0 && failGuard < setPath)
+  assert.ok((fn.match(/return 0/g) || []).length >= 2) // no-findings, failed ack, and catch paths
+  assert.ok(fn.includes('return findings.length'))
+})
+
+test('source: review branch gates the tune handoff on the recorded count and blocks on a failed append', () => {
+  const branch = source.slice(
+    source.indexOf('if (isReviewMode) {'),
+    source.indexOf('// Gate -1: Prompt Translator')
+  )
+  assert.ok(branch.includes("'review-record-failed'"))
+  assert.ok(branch.includes('recordable.length && !recorded'))
+  // The success handoff must key off the persisted count, not the pre-append intent.
+  assert.ok(branch.includes('result.handoff = recorded'))
+  assert.ok(!branch.includes('result.handoff = recordable.length'))
+  // Recording runs before the report is composed so recordedCount is the persisted truth.
+  const recordIdx = branch.indexOf('await recordReviewIssues(')
+  const reportIdx = branch.indexOf('buildReviewReport(')
+  assert.ok(recordIdx > 0 && reportIdx > 0 && recordIdx < reportIdx)
+})
+
 test('source: review lens fan-out is a parallel barrier feeding the merge gate', () => {
   const fn = source.slice(
     source.indexOf('async function runReviewLenses'),

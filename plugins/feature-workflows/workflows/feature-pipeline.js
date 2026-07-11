@@ -2310,8 +2310,12 @@ Do NOT modify any file. Do NOT commit.`,
 
 // Append the recordable findings to issues-and-improvements.md in the tune-consumable
 // section format (same append-only + growth-verified discipline as the audit/classifier).
+// Returns the count actually persisted (0 on a failed/absent ack) and sets
+// result.issuesPath ONLY on success — the review handoff routes to /tune-feature based on
+// this return value, so a failed append must not claim findings were recorded (tune would
+// dead-end at tune-no-issues).
 async function recordReviewIssues({ findings, planDir, result }) {
-  if (!findings.length) return
+  if (!findings.length) return 0
   const issuesPath = planDir.replace(/\/$/, '') + '/issues-and-improvements.md'
   const sections = findings.map(reviewIssueSection).join('\n')
   try {
@@ -2325,12 +2329,18 @@ ${sections}`,
       { label: 'file-writer(review-issues)', phase: 'Design Review', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
       result
     )
+    if (!ack || ack.ok === false) {
+      plogFromResult(result, `Design Review: issues append FAILED (file-writer returned ${ack ? 'ok=false' : 'null'}) — findings NOT recorded`)
+      return 0
+    }
     result.issuesPath = issuesPath
     const growth = verifyAppendGrowth(result, issuesPath, ack)
     if (growth && growth.ok === false) plogFromResult(result, `Design Review: issues-and-improvements.md DID NOT grow (possible overwrite): ${issuesPath} ${growth.prev}->${growth.now}`)
     plogFromResult(result, `Design Review: ${findings.length} finding(s) recorded to ${issuesPath} (tune-consumable)`)
+    return findings.length
   } catch (e) {
-    plogFromResult(result, `Design Review: issues append failed (non-blocking): ${String(e)}`)
+    plogFromResult(result, `Design Review: issues append failed: ${String(e)} — findings NOT recorded`)
+    return 0
   }
 }
 
@@ -4680,19 +4690,20 @@ Task:\n${task}`,
         }
       }
 
-      // Report first (it carries EVERY confirmed finding), then record the actionable
-      // subset: gate-mapped (a "none" gate has no tune target) and above the severity floor.
+      // Record the actionable subset first — gate-mapped (a "none" gate has no tune
+      // target) and above the severity floor — so the report's recorded count is the
+      // PERSISTED truth, not the intent (a failed append must not read as "recorded").
       const recordable = findings.filter((f) => f.gate && f.gate !== 'none' && meetsMinSeverity(f.severity, config.minSeverity))
+      const recorded = await recordReviewIssues({ findings: recordable, planDir, result })
       const reviewPath = planDir + 'design-review.md'
       const reportBody = buildReviewReport({
         task, docs, lenses, findings,
-        recordedCount: recordable.length, droppedDuplicates, refutedCount: refuted,
+        recordedCount: recorded, droppedDuplicates, refutedCount: refuted,
         minSeverity: config.minSeverity,
       })
       await writeChunkedFile(reviewPath, reportBody, 'file-writer:design-review', result,
         (n, max) => `design-review.md written in ${n} chunks (>${max} chars)`)
       result.reviewPath = reviewPath
-      await recordReviewIssues({ findings: recordable, planDir, result })
       result.designReview = {
         lenses: lenses.map((l) => l.key),
         docsReviewed: docs.length,
@@ -4700,16 +4711,34 @@ Task:\n${task}`,
         confirmed: findings.length,
         refuted,
         droppedDuplicates,
-        recorded: recordable.length,
+        recorded,
         minSeverity: config.minSeverity,
       }
-      result.handoff = recordable.length
+      // Actionable findings that could NOT be persisted: routing to tune would dead-end
+      // at tune-no-issues, so block resumable at the review command instead (re-running
+      // review is safe — the merge gate dedups against whatever did land in the file).
+      if (recordable.length && !recorded) {
+        result.blockedAt = 'review-record-failed'
+        result.handoff = {
+          from: 'review',
+          message: `Design review found ${recordable.length} actionable finding(s) but the issues-and-improvements.md append failed — nothing was recorded for tune. Report: ${reviewPath}. Re-run: /review-design ${planDir} (re-runs are dedup-safe).`,
+          nextMode: 'review',
+          planDir,
+          recorded: 0,
+        }
+        plog(`Review: issues append failed for ${recordable.length} actionable finding(s) — blocking (resumable)`)
+        stateCheckpoint('Design Review', 'blocked')
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
+      result.handoff = recorded
         ? {
           from: 'review',
-          message: `Design review complete — ${findings.length} confirmed finding(s); ${recordable.length} recorded to ${result.issuesPath}. Report: ${reviewPath}. Fix them with: /tune-feature ${planDir}`,
+          message: `Design review complete — ${findings.length} confirmed finding(s); ${recorded} recorded to ${result.issuesPath}. Report: ${reviewPath}. Fix them with: /tune-feature ${planDir}`,
           nextMode: 'tune',
           planDir,
-          recorded: recordable.length,
+          recorded,
         }
         : {
           from: 'review',
@@ -4719,7 +4748,7 @@ Task:\n${task}`,
           recorded: 0,
         }
       stateCheckpoint('Design Review', 'done')
-      plog(`Review: complete — confirmed=${findings.length}; recorded=${recordable.length}; report=${reviewPath}`)
+      plog(`Review: complete — confirmed=${findings.length}; recorded=${recorded}; report=${reviewPath}`)
       logTelemetrySummary()
       await consolidate(slug, result, config)
       return result

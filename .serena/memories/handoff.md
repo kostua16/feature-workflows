@@ -19,7 +19,13 @@ _Last updated: 2026-07-11 (review mode — standalone design-docset audit, engin
   `mergeReviewFindings`, `verifyReviewFindings`, `recordReviewIssues`; config
   `useReviewVerify`/`minSeverity`/`reviewLenses`; result `reviewPath`/`designReview`;
   model tiers `reviewLens`/`reviewVerify`=opus, `reviewMerge`=sonnet; phase `Design Review`;
-  blocked values `review-requires-plandir` / `review-no-artifacts` / `design-review`.
+  blocked values `review-requires-plandir` / `review-no-artifacts` / `design-review` /
+  `review-record-failed`.
+- PR #9 review fix: `recordReviewIssues` returns the PERSISTED count (0 on failed/absent
+  ack; `issuesPath` set only on success), recording runs before the report so the report's
+  recorded count is truth, and actionable-but-unpersisted findings block at
+  `review-record-failed` (re-run review, dedup-safe) instead of routing tune to a
+  `tune-no-issues` dead end.
 - Invariants kept: review never sets `designReady` or resets stages (structural tests);
   the `review-requires-plandir` block returns BEFORE planDir derivation (a fresh review run
   would otherwise throw on undefined planPath pre-safety-net).

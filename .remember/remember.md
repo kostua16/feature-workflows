@@ -18,7 +18,10 @@ additive; merge failure falls back to the raw union — over-report, never drop)
 → gate-mapped findings ≥ `minSeverity` appended to `issues-and-improvements.md` in the EXACT
 tune-consumable section format (`reviewIssueSection` mirrors classifier/audit byte-for-byte;
 a source test asserts exactly 3 writers of that header)
-→ `designReview` summary + handoff (`nextMode:'tune'` when recorded, else implement/design).
+→ `designReview` summary + handoff (`nextMode:'tune'` only when findings actually persisted,
+else implement/design; a failed append with actionable findings blocks at
+`review-record-failed` — PR #9 review fix: recordReviewIssues returns the persisted count,
+sets issuesPath only on success, and runs before the report).
 
 - Engine: `resolveMode`/`gateModeActive` gained `review`; schemas REVIEW_FINDINGS/MERGE/
   VERIFY_VERDICT; model tiers reviewLens=opus, reviewMerge=sonnet, reviewVerify=opus; config

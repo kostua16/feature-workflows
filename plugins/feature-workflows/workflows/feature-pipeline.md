@@ -93,7 +93,8 @@ gate cannot pass; it does NOT silently skip steps.
   tune-consumable section format. New command: `/review-design <planDir>`. New flags:
   `--lenses=`, `--min-severity=`, `--no-verify`. New result fields: `reviewPath`,
   `designReview`. New blocked values: `review-requires-plandir`, `review-no-artifacts`,
-  `design-review`.
+  `design-review`, `review-record-failed` (actionable findings confirmed but the issues
+  append failed — blocks back at review instead of routing tune to a dead end).
 - **Extract mode (engine 1.3.0).** A fifth mode, `extract`, reverse-engineers design docs from
   EXISTING code: hybrid scope input (free text / paths / entry points) → `scope-manifest.md` → a
   pause-and-resume scope-confirmation checkpoint (the command layer asks the user; workflow
@@ -587,7 +588,8 @@ failing gate runs. `blockedAt` values: design gates (`define`/`requirements`/`ar
 `detailed-design`/`e2e-usecases`/`plan`/`tdd-enforce`/`review`), implement gates (`execute`/`test`/
 `code-review`/`goalkeeper`), tune-specific (`tune-no-issues`/`tune-awaiting-confirm`/`tune-cancelled`),
 extract-specific (`extract-scope`/`extract-cancelled`/`extract-budget`/`artifact-missing`),
-review-specific (`review-requires-plandir`/`review-no-artifacts`/`design-review`),
+review-specific (`review-requires-plandir`/`review-no-artifacts`/`design-review`/
+`review-record-failed`),
 approval checkpoint (`awaiting-approval` at the design-stop; `design-not-approved` in implement),
 `bad-args` (invalid `--stage`/`--from-gate`; nothing ran, nothing persisted), or `issues-handoff`
 (implement upstream-defect path — goalkeeper loop-back or code-review blockers classified upstream),
@@ -679,11 +681,13 @@ deliberate: R2 dedups ACROSS lenses) → **Gate R2** merge/dedup, also against t
 `issues-and-improvements.md` so re-running review never re-records an issue (merge failure falls
 back to the raw union — over-report, never silently drop) → **Gate R3** adversarial verification
 per finding (refuted → dropped; unavailable verdict → kept, marked unverified) →
-`design-review.md` written deterministically from the verified findings (chunked file-writer) →
 findings with `gate != none` at/above `minSeverity` append to `issues-and-improvements.md` (same
-growth-verified, append-only discipline as the classifier/audit) → `designReview` summary +
-handoff (`nextMode:'tune'` when anything was recorded, else `implement`/`design` by
-`designReady`). **Changes nothing**: no artifact edits, no `designReady`/stage mutation — a
+growth-verified, append-only discipline as the classifier/audit; the append runs BEFORE the report
+so the report's recorded count is the persisted truth) → `design-review.md` written
+deterministically from the verified findings (chunked file-writer) → `designReview` summary +
+handoff (`nextMode:'tune'` only when findings were actually persisted, else `implement`/`design`
+by `designReady`). Actionable findings whose append failed block at `review-record-failed`
+(re-run review — dedup-safe) instead of routing tune to a `tune-no-issues` dead end. **Changes nothing**: no artifact edits, no `designReady`/stage mutation — a
 review is safe at any point (pre-implement quality gate, post-extract second opinion, post-tune
 regression check). All lens reviewers failing blocks at `design-review` (re-runnable).
 
