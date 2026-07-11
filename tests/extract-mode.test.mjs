@@ -12,6 +12,7 @@ const {
   gateModeActive,
   seedExtractQueue,
   nextPendingSlice,
+  repairResumeArtifactFlags,
   SCOPE_VERDICT,
   DECOMPOSE_VERDICT,
   AUDIT_VERDICT,
@@ -163,7 +164,47 @@ test('model defaults exist for every new extract gate', () => {
   }
 })
 
+// ---- resume repair: phantom plan.md must not kill persistence ----------------
+
+// States whose Plan gate never ran (extract parents, extract slice-local design-shaped
+// states, design runs blocked before Plan) carry a planPath that is planDir math only.
+// The repair must not verify — and null — that path: consolidate() gates every state/log
+// flush on result.planPath, so nulling it silently disables persistence for the run.
+const missingArtifactStub = async () => ({ exists: false, sizeBytes: 0, hasExpectedHeadings: false, summary: 'missing' })
+
+test('repairResumeArtifactFlags: skips the Plan check when no plan was written (planned falsy)', async () => {
+  globalThis.agent = missingArtifactStub
+  for (const state of [
+    { mode: 'extract', planPath: 'docs/x/extract/leaf/plan.md', designReady: false, logLines: [] },
+    { mode: 'design', planPath: 'docs/x/extract/leaf/slices/auth/plan.md', designReady: true, logLines: [] }, // slice-local shape
+    { mode: 'design', planPath: 'docs/x/feature/leaf/plan.md', planned: false, designReady: false, logLines: [] }, // blocked pre-Plan
+  ]) {
+    const repairs = await repairResumeArtifactFlags(state)
+    assert.deepEqual(repairs, [], `unexpected repairs for mode=${state.mode}`)
+    assert.ok(state.planPath, 'planPath must survive (consolidate flushes depend on it)')
+  }
+})
+
+test('repairResumeArtifactFlags: still repairs a WRITTEN plan whose file went missing', async () => {
+  globalThis.agent = missingArtifactStub
+  const state = { mode: 'design', planPath: 'docs/x/feature/leaf/plan.md', planned: true, designReady: true, logLines: [] }
+  const repairs = await repairResumeArtifactFlags(state)
+  assert.ok(repairs.some((r) => r.includes('planPath')), 'missing written plan must be repaired')
+  assert.equal(state.planPath, null)
+  assert.equal(state.designReady, false)
+})
+
 // ---- structural source assertions -------------------------------------------
+
+test('extract mode re-derives core extraction gates with profile-independent defaults', () => {
+  // Profiles tune the FORWARD flow; without this override a light-profile extract run
+  // would emit only codebase-facts.md (arch/detailed-design/e2e silently dropped).
+  const block = source.slice(source.indexOf("if (config.mode === 'extract') {"))
+  const overrides = block.slice(0, block.indexOf('}'))
+  assert.match(overrides, /config\.useArchDesign = cfgFlag\(args && args\.useArchDesign, persistedConfig\.useArchDesign, true\)/)
+  assert.match(overrides, /config\.useDetailedDesign = cfgFlag\(args && args\.useDetailedDesign, persistedConfig\.useDetailedDesign, true\)/)
+  assert.match(overrides, /config\.useE2eUsecase = cfgFlag\(args && args\.useE2eUsecase, persistedConfig\.useE2eUsecase, true\)/)
+})
 
 test('extract branch is guarded by isExtractMode and returns before Phase E4', () => {
   const branch = source.indexOf('if (isExtractMode) {')

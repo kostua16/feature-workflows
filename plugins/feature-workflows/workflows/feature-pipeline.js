@@ -1497,10 +1497,15 @@ async function repairResumeArtifactFlags(result) {
     { pathKey: 'designPath', flags: ['_design', '_reviewedDesign'], gate: 'Detailed Design' },
     { pathKey: 'planPath', flags: ['planned', '_plan', '_reviewedPlan', 'planAccepted', 'tddEnforced', 'reconcile'], gate: 'Plan' },
   ].filter((a) =>
-    // Extract mode writes no plan.md — planPath is planDir math only. Verifying it on an
-    // extract resume would null result.planPath (disabling every later state flush in
-    // consolidate) and clear designReady. Skip the Plan artifact for extract-mode state.
-    !(result.mode === 'extract' && a.pathKey === 'planPath')
+    // Verify the Plan artifact only when a plan was actually WRITTEN (result.planned).
+    // result.planPath is planDir math, set long before plan.md exists, so checking it
+    // unconditionally nulls result.planPath — which disables every later state flush in
+    // consolidate() and clears designReady. Three states hit this: extract-mode runs
+    // (extract writes no plan.md at all), extract slice-local states (design-shaped,
+    // mode:'design', no plan), and design runs resumed from a block BEFORE the Plan gate.
+    // When planned is falsy the Plan gate re-runs and rewrites plan.md anyway, so
+    // skipping the check loses nothing.
+    !(a.pathKey === 'planPath' && !result.planned)
   )
   for (const artifact of artifacts) {
     const path = result[artifact.pathKey]
@@ -3750,6 +3755,17 @@ async function main() {
     slices: (args && Array.isArray(args.slices) && args.slices.length)
       ? args.slices
       : (Array.isArray(persistedConfig.slices) ? persistedConfig.slices : []),
+  }
+
+  // Profile presets tune the FORWARD design flow (skip designing arch/e2e for a small task).
+  // In extract mode those gates ARE the product being extracted — a profile silently dropping
+  // them would leave a 'light' run emitting only codebase-facts.md. Re-derive the three core
+  // extraction gates with profile-independent defaults; an explicit --no-arch/--no-design/
+  // --no-e2e (or a persisted per-run flag) still wins via the same cfgFlag precedence.
+  if (config.mode === 'extract') {
+    config.useArchDesign = cfgFlag(args && args.useArchDesign, persistedConfig.useArchDesign, true)
+    config.useDetailedDesign = cfgFlag(args && args.useDetailedDesign, persistedConfig.useDetailedDesign, true)
+    config.useE2eUsecase = cfgFlag(args && args.useE2eUsecase, persistedConfig.useE2eUsecase, true)
   }
 
   // R4 adopted-agent gates (full path only; default ON, disable via flags).

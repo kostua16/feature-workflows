@@ -64,6 +64,7 @@ const CANDIDATES = [
   'applyApprovalDecision',
   'seedExtractQueue',
   'nextPendingSlice',
+  'repairResumeArtifactFlags',
   'SCOPE_VERDICT',
   'DECOMPOSE_VERDICT',
   'AUDIT_VERDICT',

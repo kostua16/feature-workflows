@@ -36,7 +36,10 @@ Parse `$ARGUMENTS` into:
   `planPath: ""` so the workflow derives the dynamic planDir `docs/{category}/{sub}/extract/{leaf}/`
   via the feature-categorizer. Ignored on `--resume`.
 - `--profile=full|standard|light`: → `profile` (`standard` drops the fidelity review; `light` also
-  drops reverse requirements + the audit. Default `full`.)
+  drops reverse requirements + the audit. Default `full`. The core extraction gates — code facts,
+  e2e use cases, detailed design, architecture — are profile-independent in extract mode: the
+  engine re-derives them with default ON, so a profile never reduces the run to facts-only; use
+  the explicit `--no-e2e`/`--no-arch`/`--no-design` flags to drop them.)
 - `--no-confirm`: → `useScopeConfirm: false` (skip the scope-confirmation checkpoint; extraction
   runs fully autonomous after scope resolution. Default **enabled**.)
 - `--no-decompose`: → `useDecompose: false` (never slice — extract the whole scope as one docset

@@ -342,6 +342,11 @@ Pass these via the Workflow `args` parameter (as a real JSON object):
 - `maxSlices` / `slices` (optional, defaults `8` / `[]`, **extract mode**): bound or select the slices
   extracted this run; every excess/unselected slice stays in the queue as `skipped` so the index is
   complete and a later `--resume`/`--slices` run can pick it up.
+- **Profiles in extract mode**: profile presets tune the FORWARD flow, so the core extraction gates
+  (code facts, e2e use cases, detailed design, architecture) are re-derived with
+  profile-independent ON defaults — a `light` extract run drops only review/requirements/audit,
+  never the extracted docs themselves. Explicit `--no-e2e`/`--no-arch`/`--no-design` flags (and
+  persisted per-run flags) still win.
 - `planPath` (optional): an explicit plan path. If set it is used verbatim and the
   dynamic planDir (Gate -2) is skipped — if a plan already exists there it is refined instead of
   written from scratch. Absent on a fresh run → `feature-categorizer` derives
