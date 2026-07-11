@@ -7,8 +7,9 @@ allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
 Run the `feature-pipeline` workflow in **design mode** — the THINK-only flow. This is the convenience
 alias that chains the 3 split pipelines (`/design-feature` → `/implement-feature` → `/tune-feature`).
 By default it runs design mode and STOPS pre-execute (the human checkpoint). Add `--auto-implement` to
-chain into implement mode after `designReady`. (A fourth mode exists — `/extract-design`, the reverse
-flow that extracts design docs from existing code — but this alias never chains into it.)
+chain into implement mode after `designReady`. (Two more modes exist — `/extract-design`, the reverse
+flow that extracts design docs from existing code, and `/review-design`, the standalone design-docset
+audit — but this alias never chains into them.)
 
 ## Preflight — engine must be installed
 

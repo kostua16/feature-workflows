@@ -1,5 +1,5 @@
 // feature-pipeline.js
-// engine-version: 1.3.0
+// engine-version: 1.4.0
 // Gate-enforcing pipeline for new features / bug-fixes.
 //
 // Enhancements:
@@ -20,8 +20,8 @@
 
 export const meta = {
   name: 'feature-pipeline',
-  version: '1.3.0',
-  description: '1 engine + 5 modes (design/implement/tune/extract/status) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). EXTRACT reverse-engineers design docs from existing code. Durable cross-mode state via pipeline-state.json; status mode renders it read-only.',
+  version: '1.4.0',
+  description: '1 engine + 6 modes (design/implement/tune/extract/review/status) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). EXTRACT reverse-engineers design docs from existing code. REVIEW audits an existing design docset and collects issues for tune. Durable cross-mode state via pipeline-state.json; status mode renders it read-only.',
   phases: [
     { title: 'Categorize' },
     { title: 'Translate' },
@@ -30,6 +30,7 @@ export const meta = {
     { title: 'Decompose' },
     { title: 'Extract Slice' },
     { title: 'Design Audit' },
+    { title: 'Design Review' },
     { title: 'System Overview' },
     { title: 'Extract' },
     { title: 'Define' },
@@ -728,7 +729,7 @@ const PIPELINE_STATE = {
     lastGate: { type: 'string', description: 'Most recent gate reached' },
     checksum: { type: 'string', description: 'IM-1: djb2 hash of JSON.stringify(result), verified on resume (validatePipelineState) to detect a truncated chunked write. Optional — pre-checksum state files still resume.' },
     result: { type: 'object', description: 'Full pipeline result object (verbatim). Phase F-K split adds optional fields inside result: mode (design|implement|tune|extract), stages[], designReady, issuesPath, tunePlan, handoff. v1.2.0 adds gateTelemetry (per-gate agent-call counters), designApproved + approvalPending (human design-approval checkpoint). v1.3.0 extract mode adds extractScope, scopeManifestPath, scopeConfirmed, extractQueue[], overviewPath, extractReady, auditPath. All default so older state still hydrates.' },
-    config: { type: 'object', description: 'args-derived flags, so resume re-derives without re-parsing. Gains mode/useChunker/useIssues/useTuneConfirm (Phase F-K); useApproval (v1.2.0); useScopeConfirm/useDecompose/useAudit/useExtractRequirements/useExtractReview/maxSlices/slices (v1.3.0 extract).' },
+    config: { type: 'object', description: 'args-derived flags, so resume re-derives without re-parsing. Gains mode/useChunker/useIssues/useTuneConfirm (Phase F-K); useApproval (v1.2.0); useScopeConfirm/useDecompose/useAudit/useExtractRequirements/useExtractReview/maxSlices/slices (v1.3.0 extract); useReviewVerify/minSeverity/reviewLenses (v1.4.0 review).' },
   },
 }
 
@@ -924,6 +925,87 @@ const AUDIT_VERDICT = {
   },
 }
 
+// review-mode lens reviewer (Gate R1): one critical-reviewer pass over the WHOLE design
+// docset through a single review dimension (lens). Finding shape mirrors AUDIT_VERDICT /
+// ISSUE_CLASSIFY_VERDICT (severity/gate/finding/suggestedFix) so confirmed findings append
+// to issues-and-improvements.md in the exact section format the tune planner consumes.
+const REVIEW_FINDINGS_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['findings', 'summary'],
+  properties: {
+    findings: {
+      type: 'array',
+      description: 'Design issues found through this lens across the whole docset',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['severity', 'gate', 'finding'],
+        properties: {
+          severity: { type: 'string', enum: ['blocker', 'high', 'medium', 'low'] },
+          gate: {
+            type: 'string',
+            enum: ['requirements', 'architecture', 'design', 'plan', 'tests', 'none'],
+            description: 'which design gate owns the doc that must change to fix this ("none" if out of the docset\'s control)',
+          },
+          finding: { type: 'string', description: 'the issue, phrased for a design-doc author' },
+          suggestedFix: { type: 'string' },
+          evidence: { type: 'string', description: 'doc file:line (or section) evidence for the finding' },
+        },
+      },
+    },
+    summary: { type: 'string' },
+  },
+}
+
+// review-mode merger (Gate R2): dedup/merge the union of all lens findings against each
+// other AND against issues already recorded in issues-and-improvements.md (so a re-run
+// never re-records the same issue). Gate = findings array present (possibly empty).
+const REVIEW_MERGE_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['findings', 'summary'],
+  properties: {
+    findings: {
+      type: 'array',
+      description: 'Deduplicated findings (overlapping lens findings merged into one)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['severity', 'gate', 'finding'],
+        properties: {
+          severity: { type: 'string', enum: ['blocker', 'high', 'medium', 'low'] },
+          gate: { type: 'string', enum: ['requirements', 'architecture', 'design', 'plan', 'tests', 'none'] },
+          finding: { type: 'string' },
+          suggestedFix: { type: 'string' },
+          evidence: { type: 'string' },
+          lenses: { type: 'array', items: { type: 'string' }, description: 'lens keys that surfaced this finding' },
+        },
+      },
+    },
+    droppedDuplicates: { type: 'number', description: 'raw findings merged away as duplicates (incl. already-recorded issues)' },
+    summary: { type: 'string' },
+  },
+}
+
+// review-mode adversarial verifier (Gate R3): an independent reviewer tries to REFUTE one
+// merged finding against the actual docs. Only confirmed findings reach the issues file —
+// a false positive recorded here would send /tune-feature revising healthy design docs.
+const REVIEW_VERIFY_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['confirmed', 'reasoning'],
+  properties: {
+    confirmed: { type: 'boolean', description: 'true = the finding survives an active refutation attempt' },
+    reasoning: { type: 'string' },
+    adjustedSeverity: {
+      type: 'string',
+      enum: ['blocker', 'high', 'medium', 'low'],
+      description: 'corrected severity when the finding is real but mis-rated (omit to keep the original)',
+    },
+  },
+}
+
 // system-overview synthesizer (extract Gate X8, multi-slice only): synthesize per-slice
 // architectures into <parentPlanDir>/system-overview.md with a slice index table.
 const OVERVIEW_VERDICT = {
@@ -1023,6 +1105,10 @@ const MODEL_DEFAULTS = {
   decomposer: 'opus',      // arch-design-orchestrator slicing a wide scope into subsystems (Gate X1)
   audit: 'opus',           // critical-reviewer auditing the extracted design for debt (Gate X7)
   overview: 'sonnet',      // arch-design-orchestrator synthesizing the multi-slice overview (Gate X8)
+  // Review mode (standalone design-docset audit) gates.
+  reviewLens: 'opus',      // critical-reviewer per review dimension (Gate R1)
+  reviewMerge: 'sonnet',   // dedup/merge of lens findings (Gate R2 — mechanical, cross-checked by R3)
+  reviewVerify: 'opus',    // adversarial verification of merged findings (Gate R3)
 }
 
 // Config profiles: a named preset for the gate-control flag zoo. Individual --no-*
@@ -1120,13 +1206,13 @@ function gm(key) {
 }
 
 // Phase F-K: resolve the pipeline mode. Precedence:
-//   1. explicit args.mode (the slash command sets it: design/implement/tune/extract-feature commands)
+//   1. explicit args.mode (the slash command sets it: design/implement/tune/extract/review commands)
 //   2. persisted config.mode (resume honors the mode that wrote the state)
 //   3. default 'design' (bare /feature-pipeline backward-compat).
 // On --resume with an explicit different mode (e.g. implement after design), the explicit
 // arg wins so the user can drive the design->implement->tune cycle from the command line.
 function resolveMode(args, persistedConfig, resumed) {
-  const VALID = { design: true, implement: true, tune: true, status: true, extract: true }
+  const VALID = { design: true, implement: true, tune: true, status: true, extract: true, review: true }
   if (args && args.mode && VALID[args.mode]) return args.mode
   if (persistedConfig && persistedConfig.mode && VALID[persistedConfig.mode]) return persistedConfig.mode
   if (resumed && resumed.result && resumed.result.mode && VALID[resumed.result.mode]) return resumed.result.mode
@@ -1142,6 +1228,7 @@ function gateModeActive(gateGroup, mode) {
   if (gateGroup === 'design') return mode === 'design' || mode === 'tune'
   if (gateGroup === 'implement') return mode === 'implement'
   if (gateGroup === 'extract') return mode === 'extract'
+  if (gateGroup === 'review') return mode === 'review'
   return true // shared front-matter gates (categorize/translate/resume) always active
 }
 
@@ -1380,6 +1467,7 @@ function deriveNextCommand(state) {
     const dir = handoff.planDir || planDir
     const command = handoff.nextMode === 'implement' ? `/implement-feature ${dir}`
       : handoff.nextMode === 'tune' ? `/tune-feature ${dir}`
+      : handoff.nextMode === 'review' ? `/review-design ${dir}`
       : `/design-feature --resume ${dir}`
     return { command, reason: handoff.message || `handoff from ${handoff.from || 'pipeline'}` }
   }
@@ -1388,6 +1476,7 @@ function deriveNextCommand(state) {
     const mode = r.mode || (s.config && s.config.mode) || 'design'
     const command = mode === 'implement' ? `/implement-feature ${planDir}`
       : mode === 'tune' ? `/tune-feature ${planDir}`
+      : mode === 'review' ? `/review-design ${planDir}`
       : `/design-feature --resume ${planDir}`
     return { command, reason: `blocked at ${r.blockedAt} — resume after addressing it` }
   }
@@ -1988,6 +2077,271 @@ ${sections}`,
   }
   plogFromResult(result, `Design Audit: report at ${verdict.auditPath}; findings=${(verdict.findings || []).length} (${upstream.length} upstream)`)
   return verdict
+}
+
+// ---- Review mode (standalone design-docset audit) ---------------------------
+// Review is the INSPECT flow: it reads an existing planDir docset (forward-designed,
+// extracted, or tuned), fans out one reviewer per review dimension (lens), dedups the
+// union (also against issues already recorded), adversarially verifies each merged
+// finding, writes <planDir>/design-review.md, and appends the confirmed gate-mapped
+// findings to issues-and-improvements.md — the same handoff /tune-feature consumes.
+// It never mutates the docset: no artifact edits, no designReady/stage changes.
+
+// The fixed review dimensions. Each lens is a SEPARATE reviewer agent so one concern
+// cannot crowd out another in a single pass; the merge gate reconciles overlaps.
+const REVIEW_LENSES = [
+  {
+    key: 'consistency',
+    focus: 'Cross-artifact consistency: contradictions between requirements, architecture, detailed design, e2e use cases, plan, and stage files (names, interfaces, data shapes, behaviors, constraints that disagree across docs).',
+  },
+  {
+    key: 'completeness',
+    focus: 'Completeness: requirements or task-definition objectives with no architecture/design/plan coverage; unhandled error paths and edge cases; missing NFRs (performance, security, migration, rollback); undefined interfaces the plan depends on.',
+  },
+  {
+    key: 'feasibility',
+    focus: 'Feasibility against the codebase: design decisions that contradict the recorded codebase facts or the actual code (wrong assumptions about existing modules, APIs, data models, or constraints); integration seams the design ignores.',
+  },
+  {
+    key: 'testability',
+    focus: 'Testability: pass gates that are not objectively verifiable; e2e use cases that do not cover the plan\'s behavior changes; TDD gates with vague RED tests or missing GREEN exit criteria; designs with no observable seam to assert on.',
+  },
+  {
+    key: 'scope',
+    focus: 'Scope discipline: YAGNI violations (speculative abstractions, unused generality) and the inverse — under-specified areas where the plan hand-waves real complexity; stage splits whose size or dependencies look unexecutable.',
+  },
+]
+
+// Severity ordering shared by the --min-severity filter. Higher = more severe.
+const SEVERITY_RANK = { blocker: 3, high: 2, medium: 1, low: 0 }
+function meetsMinSeverity(severity, min) {
+  const s = SEVERITY_RANK[severity]
+  const m = SEVERITY_RANK[min]
+  return (s === undefined ? 0 : s) >= (m === undefined ? 0 : m)
+}
+// Normalize the --min-severity arg; unknown values fall back to 'low' (record everything).
+function resolveMinSeverity(val) {
+  return SEVERITY_RANK[val] !== undefined ? val : 'low'
+}
+// Normalize the --lenses arg to known lens keys; empty/invalid => all lenses.
+function resolveReviewLenses(list) {
+  const known = new Set(REVIEW_LENSES.map((l) => l.key))
+  const picked = (Array.isArray(list) ? list : []).filter((k) => known.has(k))
+  return picked.length ? REVIEW_LENSES.filter((l) => picked.includes(l.key)) : REVIEW_LENSES
+}
+
+// Inventory of reviewable artifacts from the hydrated result. Pure: paths only, existence
+// is judged by the reviewers (a stale path is itself a finding). Stage files are included
+// so reviewers see the executable split, not just the plan prose.
+function collectReviewDocs(result, planPath) {
+  const r = result || {}
+  const docs = [
+    { kind: 'task definition', path: r.definitionPath },
+    { kind: 'requirements', path: r.requirementsPath },
+    { kind: 'architecture', path: r.archPath },
+    { kind: 'detailed design', path: r.designPath },
+    { kind: 'e2e use cases', path: r.useCasePath },
+    { kind: 'codebase facts', path: r.factsPath },
+    // planPath is planDir math (set before plan.md exists), so only a written plan
+    // counts — extract baselines have no plan and must not review a phantom one.
+    { kind: 'plan', path: (r.planned || r.planAccepted) ? planPath : null },
+  ].filter((d) => typeof d.path === 'string' && d.path)
+  for (const stage of Array.isArray(r.stages) ? r.stages : []) {
+    if (stage && typeof stage.file === 'string' && stage.file) docs.push({ kind: `stage ${stage.id || ''}`.trim(), path: stage.file })
+  }
+  return docs
+}
+
+// One issues-file section per finding — MUST stay byte-compatible with the format
+// classifyAndRecordIssue and auditExtractedDesign write, because the tune planner
+// parses these sections to derive its gate-revisit plan.
+function reviewIssueSection(f) {
+  return [
+    `## Upstream issue — gate: ${f.gate}`,
+    '',
+    `**Severity:** ${f.severity || '(unspecified)'}`,
+    `**Finding:** ${f.finding || '(unspecified)'}`,
+    `**Suggested fix:** ${f.suggestedFix || '(none)'}`,
+    '',
+    '---',
+    '',
+  ].join('\n')
+}
+
+// Compose the design-review.md report body deterministically from the verified findings
+// (no extra agent call, and the report can never disagree with what was recorded).
+function buildReviewReport({ task, docs, lenses, findings, recordedCount, droppedDuplicates, refutedCount, minSeverity }) {
+  const bySeverity = { blocker: 0, high: 0, medium: 0, low: 0 }
+  for (const f of findings) if (bySeverity[f.severity] !== undefined) bySeverity[f.severity]++
+  const lines = [
+    '# Design Review',
+    '',
+    `**Task:** ${task}`,
+    `**Lenses:** ${lenses.map((l) => l.key).join(', ')}`,
+    `**Docs reviewed:** ${docs.length}`,
+    docs.map((d) => `- ${d.kind}: ${d.path}`).join('\n'),
+    '',
+    `**Findings:** ${findings.length} confirmed (blocker=${bySeverity.blocker}, high=${bySeverity.high}, medium=${bySeverity.medium}, low=${bySeverity.low}); ${refutedCount} refuted by verification; ${droppedDuplicates} duplicate(s) merged.`,
+    `**Recorded to issues-and-improvements.md:** ${recordedCount} (gate != none, severity >= ${minSeverity}).`,
+    '',
+  ]
+  for (const f of findings) {
+    lines.push(
+      `## [${f.severity}] gate: ${f.gate}${f.lenses && f.lenses.length ? ` (lens: ${f.lenses.join(', ')})` : ''}`,
+      '',
+      `**Finding:** ${f.finding}`,
+      `**Suggested fix:** ${f.suggestedFix || '(none)'}`,
+      `**Evidence:** ${f.evidence || '(none)'}`,
+      f.verification ? `**Verification:** ${f.verification}` : '',
+      '',
+    )
+  }
+  return lines.join('\n')
+}
+
+// Gate R1: one reviewer per lens over the whole docset. A barrier (parallel) is correct
+// here — the merge gate needs EVERY lens's findings at once to dedup across them.
+// Lens keys are attached in-code (not trusted from the agent) so merge attribution is exact.
+async function runReviewLenses({ lenses, docs, task, planDir, result }) {
+  const docList = docs.map((d) => `- ${d.kind}: ${d.path}`).join('\n')
+  const noAsk = `IMPORTANT: You are running inside an automated workflow pipeline. AskUserQuestion is NOT
+available. Record open questions as findings instead of asking.`
+  const runs = await parallel(lenses.map((lens) => () =>
+    safeAgent(
+      `You are the critical-reviewer agent performing a DESIGN-DOCSET REVIEW through ONE lens.
+Read EVERY design artifact listed below (they live under ${planDir}) and report ONLY findings that
+belong to your lens. Do NOT reject or rewrite the docs — you are collecting issues, not fixing them.
+
+Your lens — ${lens.key}:
+${lens.focus}
+
+Design artifacts:
+${docList}
+
+Task context: ${task}
+
+${noAsk}
+
+For each finding set: severity (blocker|high|medium|low), gate = the design doc that would have to
+change to fix it (requirements|architecture|design|plan|tests|none), the finding phrased for a
+design-doc author, a concrete suggestedFix, and evidence (doc file:line or section). A missing or
+unreadable artifact is itself a finding. Do NOT modify any file. Do NOT commit.`,
+      { label: `design-review:${lens.key}`, phase: 'Design Review', schema: REVIEW_FINDINGS_VERDICT, model: gm('reviewLens') },
+      result
+    ).then((v) => (v ? { lens: lens.key, findings: Array.isArray(v.findings) ? v.findings : [] } : null))
+  ))
+  return (runs || []).filter(Boolean)
+}
+
+// Gate R2: dedup/merge the union of lens findings — against each other AND against the
+// issues already in issues-and-improvements.md, so re-running /review-design is additive,
+// never duplicating. Fail-open: a merge failure falls back to the raw union (over-report
+// rather than silently drop, mirroring the issue-classifier's upstream bias).
+async function mergeReviewFindings({ rawFindings, existingIssuesText, task, result }) {
+  const merged = await safeAgent(
+    `You are a review-findings merge agent. Below is the raw union of design-review findings from
+several independent reviewers (each tagged with its lens), plus the issues ALREADY recorded in
+issues-and-improvements.md. Merge duplicates: findings that describe the same underlying defect
+(even in different words or from different lenses) become ONE finding keeping the clearest wording,
+the highest severity, the most specific gate/evidence, and the union of lens tags. DROP findings
+already covered by the previously recorded issues. Do NOT invent new findings and do NOT soften or
+re-judge severities beyond picking the max among duplicates.
+
+Raw findings:
+${JSON.stringify(rawFindings, null, 2)}
+
+Previously recorded issues (issues-and-improvements.md):
+${existingIssuesText || '(none)'}
+
+Task context: ${task}`,
+    { label: 'design-review:merge', phase: 'Design Review', schema: REVIEW_MERGE_VERDICT, model: gm('reviewMerge') },
+    result
+  )
+  if (!merged || !Array.isArray(merged.findings)) {
+    plogFromResult(result, 'Design Review: merge unavailable — falling back to the raw findings union (may contain duplicates)')
+    return { findings: rawFindings, droppedDuplicates: 0 }
+  }
+  return { findings: merged.findings, droppedDuplicates: merged.droppedDuplicates || 0 }
+}
+
+// Gate R3: adversarial verification — an independent reviewer tries to REFUTE each merged
+// finding against the actual docs. Refuted findings are dropped (a false positive here
+// sends /tune-feature revising healthy docs); an unavailable verdict KEEPS the finding
+// (over-report bias) marked unverified. Verifications run concurrently per finding.
+async function verifyReviewFindings({ findings, docs, task, result }) {
+  const docList = docs.map((d) => `- ${d.kind}: ${d.path}`).join('\n')
+  const verdicts = await parallel(findings.map((f, i) => () =>
+    safeAgent(
+      `You are the critical-reviewer agent acting as an ADVERSARIAL VERIFIER. Another reviewer
+claims the design docset below has this defect. Actively try to REFUTE the claim by reading the
+docs: is the "defect" actually addressed somewhere, based on a misreading, out of scope for these
+docs, or too vague to act on? Confirm it ONLY if it survives your refutation attempt. If it is real
+but mis-rated, return adjustedSeverity.
+
+Claimed finding:
+${JSON.stringify(f, null, 2)}
+
+Design artifacts:
+${docList}
+
+Task context: ${task}
+
+Do NOT modify any file. Do NOT commit.`,
+      { label: `design-review:verify#${i + 1}`, phase: 'Design Review', schema: REVIEW_VERIFY_VERDICT, model: gm('reviewVerify') },
+      result
+    )
+  ))
+  const confirmed = []
+  let refuted = 0
+  findings.forEach((f, i) => {
+    const v = verdicts[i]
+    if (v && v.confirmed === false) {
+      refuted++
+      plogFromResult(result, `Design Review: finding refuted by verifier — ${String(f.finding || '').slice(0, 120)}`)
+      return
+    }
+    const out = { ...f }
+    if (v && v.adjustedSeverity && SEVERITY_RANK[v.adjustedSeverity] !== undefined) out.severity = v.adjustedSeverity
+    out.verification = v ? (v.reasoning || 'confirmed') : 'unverified (verifier unavailable — kept, over-report bias)'
+    confirmed.push(out)
+  })
+  return { confirmed, refuted }
+}
+
+// Append the recordable findings to issues-and-improvements.md in the tune-consumable
+// section format (same append-only + growth-verified discipline as the audit/classifier).
+// Returns the count actually persisted (0 on a failed/absent ack) and sets
+// result.issuesPath ONLY on success — the review handoff routes to /tune-feature based on
+// this return value, so a failed append must not claim findings were recorded (tune would
+// dead-end at tune-no-issues).
+async function recordReviewIssues({ findings, planDir, result }) {
+  if (!findings.length) return 0
+  const issuesPath = planDir.replace(/\/$/, '') + '/issues-and-improvements.md'
+  const sections = findings.map(reviewIssueSection).join('\n')
+  try {
+    const ack = await safeAgent(
+      `You are a file-writer agent. APPEND the markdown sections below to ${issuesPath}.
+If the file does not exist, create it with a "# Issues & Improvements" header first, then the sections.
+Do NOT overwrite existing content — append only. Return ok=true and totalBytes = the file's total
+size in bytes AFTER appending.
+
+${sections}`,
+      { label: 'file-writer(review-issues)', phase: 'Design Review', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+      result
+    )
+    if (!ack || ack.ok === false) {
+      plogFromResult(result, `Design Review: issues append FAILED (file-writer returned ${ack ? 'ok=false' : 'null'}) — findings NOT recorded`)
+      return 0
+    }
+    result.issuesPath = issuesPath
+    const growth = verifyAppendGrowth(result, issuesPath, ack)
+    if (growth && growth.ok === false) plogFromResult(result, `Design Review: issues-and-improvements.md DID NOT grow (possible overwrite): ${issuesPath} ${growth.prev}->${growth.now}`)
+    plogFromResult(result, `Design Review: ${findings.length} finding(s) recorded to ${issuesPath} (tune-consumable)`)
+    return findings.length
+  } catch (e) {
+    plogFromResult(result, `Design Review: issues append failed: ${String(e)} — findings NOT recorded`)
+    return 0
+  }
 }
 
 // extractSlice: run the per-slice extraction cycle (facts -> e2e use cases -> detailed
@@ -3755,6 +4109,15 @@ async function main() {
     slices: (args && Array.isArray(args.slices) && args.slices.length)
       ? args.slices
       : (Array.isArray(persistedConfig.slices) ? persistedConfig.slices : []),
+    // Review mode (standalone design-docset audit). minSeverity filters what gets RECORDED
+    // to issues-and-improvements.md (the design-review.md report always carries every
+    // confirmed finding); reviewLenses narrows the dimension fan-out ([] = all lenses);
+    // useReviewVerify gates the adversarial-verification pass.
+    useReviewVerify: cfgFlag(args && args.useReviewVerify, persistedConfig.useReviewVerify, pdef('useReviewVerify', true)),
+    minSeverity: resolveMinSeverity((args && args.minSeverity) || persistedConfig.minSeverity || 'low'),
+    reviewLenses: (args && Array.isArray(args.reviewLenses) && args.reviewLenses.length)
+      ? args.reviewLenses
+      : (Array.isArray(persistedConfig.reviewLenses) ? persistedConfig.reviewLenses : []),
   }
 
   // Profile presets tune the FORWARD design flow (skip designing arch/e2e for a small task).
@@ -3803,6 +4166,28 @@ async function main() {
   const isImplementMode = mode === 'implement'
   const isTuneMode = mode === 'tune'
   const isExtractMode = mode === 'extract'
+  const isReviewMode = mode === 'review'
+
+  // Review mode audits an EXISTING run. Without a hydrated resume there is nothing to
+  // review — and the planDir derivation below would leave planPath undefined for review
+  // mode (a raw pre-try-block throw). Same constraint as missing-task: return a clean
+  // blocked result, never throw.
+  if (isReviewMode && !resumed) {
+    log('main: review mode invoked without a resumable planDir; returning blocked result')
+    await writeFailedLaunch(slug, 'review-requires-plandir', 'review mode without resume/pipeline-state.json', Object.keys(args || {}))
+    return {
+      task: task || '',
+      mode: 'review',
+      ready: false,
+      blockedAt: 'review-requires-plandir',
+      handoff: {
+        from: 'review',
+        message: 'Review mode audits an existing run. Usage: /review-design <planDir> where <planDir> has a pipeline-state.json (written by /design-feature, /extract-design, or /tune-feature).',
+        nextMode: 'review',
+      },
+      logLines: ['main: review-requires-plandir — no resumable state'],
+    }
+  }
 
   // Dynamic planDir (Phase B1). Cases:
   //  - Explicit --plan (fresh OR resume): used verbatim (escapes categorization).
@@ -3985,7 +4370,7 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       logLines: [], // R5: in-memory pipeline log; flushed to <planDir>/pipeline.log at consolidate points
       // Phase F-K (pipeline split): the 3-mode shared contract. All optional/default so
       // pre-split pipeline-state.json hydrates without breakage (backward-compat).
-      mode: mode, // design | implement | tune — which pipeline wrote this result
+      mode: mode, // design | implement | tune | extract | review — which pipeline wrote this result
       stages: [], // design-tail chunker output: [{id,file,name,status,files}]; implement ticks status
       designReady: false, // design sets true on exit; implement asserts it; tune re-sets after revisit
       issuesPath: null, // implement sets on upstream-defect handoff; tune consumes
@@ -4002,6 +4387,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       overviewPath: null, // <planDir>/system-overview.md (multi-slice only)
       extractReady: false, // extract terminal: all pending slices processed
       auditPath: null, // <planDir>/design-audit.md (single-slice; per-slice audits live on queue entries)
+      // Review mode (standalone design-docset audit) state. Defaults keep older
+      // pipeline-state.json hydrating without breakage (same backward-compat rule).
+      reviewPath: null, // <planDir>/design-review.md report
+      designReview: null, // review summary {lenses, docsReviewed, raw, confirmed, refuted, droppedDuplicates, recorded, minSeverity}
     }
   }
 
@@ -4232,6 +4621,134 @@ Task:\n${task}`,
       }
       stateCheckpoint('Tune', 'done')
       plog(`Tune: complete — designReady re-set; ${resetCount} stage(s) reset`)
+      logTelemetrySummary()
+      await consolidate(slug, result, config)
+      return result
+    }
+
+    // ===== Phase L: review-mode design-docset audit branch =====================
+    // Review is the INSPECT flow: it collects design issues from an EXISTING docset
+    // (forward-designed, extracted, or tuned) without mutating anything — no artifact
+    // edits, no designReady/stage changes; fixing stays in /tune-feature. Gates:
+    //   R1 lens fan-out (one reviewer per dimension, whole docset each)
+    //   R2 dedup/merge (across lenses AND against already-recorded issues)
+    //   R3 adversarial verify (refuted findings dropped; unavailable verdict = keep)
+    //   -> design-review.md report + tune-consumable issues-and-improvements.md append.
+    if (isReviewMode) {
+      phase('Design Review')
+      const docs = collectReviewDocs(result, planPath)
+      if (!docs.length) {
+        result.blockedAt = 'review-no-artifacts'
+        result.handoff = {
+          from: 'review',
+          message: `Nothing to review — the state at ${planDir} records no design artifacts. Run /design-feature --resume ${planDir} (or /extract-design) to produce the docset first.`,
+          nextMode: 'design',
+          planDir,
+        }
+        plog('Review: state records no design artifacts — blocking')
+        stateCheckpoint('Design Review', 'blocked')
+        await consolidate(slug, result, config)
+        return result
+      }
+      const lenses = resolveReviewLenses(config.reviewLenses)
+      plog(`Review mode: ${docs.length} artifact(s); lenses=[${lenses.map((l) => l.key).join(', ')}]; minSeverity=${config.minSeverity}; verify=${config.useReviewVerify}`)
+
+      // R1 — the barrier is deliberate: R2 dedups ACROSS lenses, so it needs them all.
+      const lensRuns = await runReviewLenses({ lenses, docs, task, planDir, result })
+      if (!lensRuns.length) {
+        result.blockedAt = 'design-review'
+        result.handoff = {
+          from: 'review',
+          message: `Design review failed — no lens reviewer returned a verdict. Re-run: /review-design ${planDir}`,
+          nextMode: 'review',
+          planDir,
+        }
+        plog('Review: every lens reviewer failed — blocking (resumable)')
+        stateCheckpoint('Design Review', 'blocked')
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
+      const rawFindings = lensRuns.flatMap((r) => r.findings.map((f) => ({ ...f, lenses: [r.lens] })))
+      plog(`Review: ${rawFindings.length} raw finding(s) from ${lensRuns.length}/${lenses.length} lens(es)`)
+
+      // R2 + R3 only have work when something was found.
+      let findings = []
+      let droppedDuplicates = 0
+      let refuted = 0
+      if (rawFindings.length) {
+        const existingIssuesText = await readIssuesFile(planDir, result)
+        const merged = await mergeReviewFindings({ rawFindings, existingIssuesText, task, result })
+        findings = merged.findings
+        droppedDuplicates = merged.droppedDuplicates
+        plog(`Review: ${findings.length} finding(s) after merge (${droppedDuplicates} duplicate(s) dropped)`)
+        if (config.useReviewVerify && findings.length) {
+          const verified = await verifyReviewFindings({ findings, docs, task, result })
+          findings = verified.confirmed
+          refuted = verified.refuted
+          plog(`Review: ${findings.length} finding(s) confirmed by adversarial verification (${refuted} refuted)`)
+        }
+      }
+
+      // Record the actionable subset first — gate-mapped (a "none" gate has no tune
+      // target) and above the severity floor — so the report's recorded count is the
+      // PERSISTED truth, not the intent (a failed append must not read as "recorded").
+      const recordable = findings.filter((f) => f.gate && f.gate !== 'none' && meetsMinSeverity(f.severity, config.minSeverity))
+      const recorded = await recordReviewIssues({ findings: recordable, planDir, result })
+      const reviewPath = planDir + 'design-review.md'
+      const reportBody = buildReviewReport({
+        task, docs, lenses, findings,
+        recordedCount: recorded, droppedDuplicates, refutedCount: refuted,
+        minSeverity: config.minSeverity,
+      })
+      await writeChunkedFile(reviewPath, reportBody, 'file-writer:design-review', result,
+        (n, max) => `design-review.md written in ${n} chunks (>${max} chars)`)
+      result.reviewPath = reviewPath
+      result.designReview = {
+        lenses: lenses.map((l) => l.key),
+        docsReviewed: docs.length,
+        raw: rawFindings.length,
+        confirmed: findings.length,
+        refuted,
+        droppedDuplicates,
+        recorded,
+        minSeverity: config.minSeverity,
+      }
+      // Actionable findings that could NOT be persisted: routing to tune would dead-end
+      // at tune-no-issues, so block resumable at the review command instead (re-running
+      // review is safe — the merge gate dedups against whatever did land in the file).
+      if (recordable.length && !recorded) {
+        result.blockedAt = 'review-record-failed'
+        result.handoff = {
+          from: 'review',
+          message: `Design review found ${recordable.length} actionable finding(s) but the issues-and-improvements.md append failed — nothing was recorded for tune. Report: ${reviewPath}. Re-run: /review-design ${planDir} (re-runs are dedup-safe).`,
+          nextMode: 'review',
+          planDir,
+          recorded: 0,
+        }
+        plog(`Review: issues append failed for ${recordable.length} actionable finding(s) — blocking (resumable)`)
+        stateCheckpoint('Design Review', 'blocked')
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
+      result.handoff = recorded
+        ? {
+          from: 'review',
+          message: `Design review complete — ${findings.length} confirmed finding(s); ${recorded} recorded to ${result.issuesPath}. Report: ${reviewPath}. Fix them with: /tune-feature ${planDir}`,
+          nextMode: 'tune',
+          planDir,
+          recorded,
+        }
+        : {
+          from: 'review',
+          message: `Design review complete — nothing actionable recorded (${findings.length} confirmed finding(s), all gate=none or below minSeverity=${config.minSeverity}). Report: ${reviewPath}. The docset stands as-is${result.designReady ? ` — proceed with /implement-feature ${planDir}` : ''}.`,
+          nextMode: result.designReady ? 'implement' : 'design',
+          planDir,
+          recorded: 0,
+        }
+      stateCheckpoint('Design Review', 'done')
+      plog(`Review: complete — confirmed=${findings.length}; recorded=${recorded}; report=${reviewPath}`)
       logTelemetrySummary()
       await consolidate(slug, result, config)
       return result

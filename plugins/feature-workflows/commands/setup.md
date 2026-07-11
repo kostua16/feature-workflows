@@ -43,5 +43,7 @@ Run these steps via Bash. Stop and report on any failure.
 Finish by telling the user: engine `<version>` installed at `.claude/workflows/feature-pipeline.js`;
 the pipeline commands are now runnable in this project:
 `/feature-workflows:design-feature`, `/feature-workflows:implement-feature`,
-`/feature-workflows:tune-feature`, `/feature-workflows:feature-pipeline`.
+`/feature-workflows:tune-feature`, `/feature-workflows:extract-design`,
+`/feature-workflows:review-design`, `/feature-workflows:feature-pipeline`,
+`/feature-workflows:pipeline-status`.
 Re-run `/feature-workflows:setup` after updating the plugin.

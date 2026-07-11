@@ -2,13 +2,14 @@
 
 Gate-enforced feature-development pipeline for Claude Code: **THINK** (`design`) → **DO**
 (`implement`) → **FIX** (`tune`), plus **EXTRACT** (`extract` — reverse-engineer as-is design
-docs from existing code), driven by one dynamic-workflow engine.
+docs from existing code) and **INSPECT** (`review` — audit an existing design docset and collect
+issues for tune), driven by one dynamic-workflow engine.
 
 ## Components
 
 | Component | Count | Notes |
 |---|---|---|
-| Commands | 7 | `/feature-workflows:setup`, `:design-feature`, `:implement-feature`, `:tune-feature`, `:extract-design`, `:feature-pipeline`, `:pipeline-status` |
+| Commands | 8 | `/feature-workflows:setup`, `:design-feature`, `:implement-feature`, `:tune-feature`, `:extract-design`, `:review-design`, `:feature-pipeline`, `:pipeline-status` |
 | Agents | 31 | Spawned as `feature-workflows:<agent>` (e.g. `feature-workflows:plan-architect`) |
 | Skills | 1 | `compress-md` — in-session markdown caveman compression |
 | Engine asset | `workflows/` | `feature-pipeline.js` + reference docs — **not** auto-loaded; installed per-project by `setup` |

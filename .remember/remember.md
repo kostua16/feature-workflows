@@ -1,40 +1,49 @@
-# Handoff — 2026-07-11 (branch claude/code-design-extraction-190541)
+# Handoff — 2026-07-11 (branch claude/design-review-workflow-hmilx2)
 
 ## What happened this session
-Designed and implemented **extract mode** (engine v1.3.0 after rebase on main's v1.2.0) —
-the fifth pipeline mode: reverse design extraction from existing code. `/extract-design
-<scope>` resolves hybrid input (free text / paths / entry points) into a scope manifest,
-pauses for a **command-layer** scope confirmation (KEY CONSTRAINT, user-confirmed:
-subagents inside the workflow CANNOT AskUserQuestion — the engine returns
-`handoff.status='awaiting-scope-confirm'` and the command re-invokes with transient
-`scopeConfirmed`/`scopeFiles`/`slices` args; same stop/re-invoke pattern main's v1.2.0
-adopted for tune-confirm + the approval gate), then per slice climbs the ladder in
-reverse: deep code facts → observable e2e use cases → detailed design *as built* →
-architecture *as built* → optional fidelity reviews / reverse-derived requirements /
-as-is design audit (findings append to `issues-and-improvements.md` in the
-tune-consumable format). Wide scopes decompose into a resumable slice queue
-(`slices/<id>/` docsets + slice-local design-shaped state files); multi-slice runs
-synthesize `system-overview.md`. Artifact names reuse the forward pipeline's, so extract
-dirs are `/tune-feature` + `/design-feature --resume` baselines.
+Designed and implemented **review mode** (engine v1.4.0) — the sixth pipeline mode: a
+standalone INSPECT flow that audits an EXISTING planDir design docset and COLLECTS all
+design issues without mutating anything. `/review-design <planDir>` complements `/tune-feature`
+(the FIX flow): review finds and records, tune consumes and fixes.
 
-- Engine: `resolveMode`/`gateModeActive` extended; extract branch after Translate;
-  4 new verdict schemas (SCOPE/DECOMPOSE/AUDIT/OVERVIEW); pure helpers
-  `seedExtractQueue`/`nextPendingSlice`; planDir segment `extract/`; version 1.3.0 lockstep.
-- Fixed en passant: `repairResumeArtifactFlags` now skips the Plan artifact for
-  extract-mode state (would null `result.planPath` and kill consolidate flushing), and the
-  Plan gate restores `result.planPath` after a resume repair nulled it.
-- Rebased on main (v1.2.0: status mode, telemetry, --stage/--from-gate, approval gate,
-  tune-confirm→stop/re-invoke, test-writer gate, pytest-runner removed). Merged: 5 modes,
-  FT-6 recorded in TODOs status table; dropped my obsolete FT-7 (main already fixed
-  tune-confirm).
-- Tests green post-rebase; validators green; PR #8 open.
+Flow (own branch right after tune, before Translate; requires a hydrated `--resume`):
+artifact inventory from state (idea/requirements/arch/design/e2e/facts + plan only when
+`planned||planAccepted` — extract baselines have no plan — + stageNN files)
+→ **R1** one `critical-reviewer` per lens in parallel (`consistency`, `completeness`,
+`feasibility`, `testability`, `scope`; barrier deliberate — R2 dedups across lenses)
+→ **R2** merge/dedup, also against the existing `issues-and-improvements.md` (re-runs stay
+additive; merge failure falls back to the raw union — over-report, never drop)
+→ **R3** adversarial verify per finding (refuted → dropped; null verdict → kept unverified)
+→ `design-review.md` composed deterministically (`buildReviewReport`) via `writeChunkedFile`
+→ gate-mapped findings ≥ `minSeverity` appended to `issues-and-improvements.md` in the EXACT
+tune-consumable section format (`reviewIssueSection` mirrors classifier/audit byte-for-byte;
+a source test asserts exactly 3 writers of that header)
+→ `designReview` summary + handoff (`nextMode:'tune'` only when findings actually persisted,
+else implement/design; a failed append with actionable findings blocks at
+`review-record-failed` — PR #9 review fix: recordReviewIssues returns the persisted count,
+sets issuesPath only on success, and runs before the report).
+
+- Engine: `resolveMode`/`gateModeActive` gained `review`; schemas REVIEW_FINDINGS/MERGE/
+  VERIFY_VERDICT; model tiers reviewLens=opus, reviewMerge=sonnet, reviewVerify=opus; config
+  `useReviewVerify`/`minSeverity`/`reviewLenses`; result `reviewPath`/`designReview`; new
+  blocked values `review-requires-plandir` (returned BEFORE planDir derivation — review has
+  no fresh-run planPath, reaching it unresumed would throw), `review-no-artifacts`,
+  `design-review`. Review NEVER touches designReady/stages (tests assert this structurally).
+- Command: `commands/review-design.md` (`--lenses=`, `--min-severity=`, `--no-verify`).
+- Docs: engine reference (what's-new v1.4.0, args, tiers, outputs, modes section, issues
+  lifecycle), READMEs, QUICKSTART, marketplace.json, plugin.json (1.4.0 lockstep),
+  tune-feature/setup/pipeline-status/feature-pipeline command cross-refs.
+- Tests: `tests/review-mode.test.mjs` (24 tests) + harness CANDIDATES extended. 180 tests
+  green; validate:agents (31 agents), validate:versions (1.4.0), ESM check, phase-label
+  validation (`Design Review` declared) all pass.
 
 ## State
-- Worktree branch `claude/code-design-extraction-190541`, rebased on origin/main,
-  force-pushed; PR https://github.com/kostua16/feature-workflows/pull/8.
+- Branch `claude/design-review-workflow-hmilx2`; committed + pushed; PR opened.
 
 ## Next
-- Dogfood: `/feature-workflows:setup` then `/extract-design plugins/feature-workflows/workflows/feature-pipeline.js — the pipeline engine`; verify docset + `/design-feature --resume` baseline compat.
-- Candidate follow-up (from main's Q3 note): convert the user-interviewer Define-clarification
-  gate to the stop/re-invoke pattern too.
-- Known residue (pre-existing): Gate 0.2 facts prompt hardcodes Serena project "log_analysis".
+- Dogfood: `/review-design` against an extract-produced docset; then `/tune-feature` on the
+  recorded findings to verify the tunePlanner parses review-written sections end-to-end.
+- Consider a `--max-findings` cap for R3 verification cost on huge docsets.
+- Known residue (pre-existing): Gate 0.2 facts prompt hardcodes Serena project "log_analysis";
+  `workflows/docs/feature-pipeline-documentation.md` still describes the 3-mode engine
+  (lagged since extract too — needs a refresh pass of its own).
