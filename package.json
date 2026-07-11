@@ -5,6 +5,8 @@
   "description": "Claude Code plugin marketplace shipping the feature-workflows dynamic feature pipeline.",
   "scripts": {
     "test": "node --test \"tests/**/*.test.mjs\"",
+    "build": "node scripts/build-workflows.mjs",
+    "validate:build": "node scripts/build-workflows.mjs --check",
     "validate:versions": "node scripts/validate-plugin-versions.mjs",
     "validate:agents": "node scripts/validate-agent-registry.mjs"
   }

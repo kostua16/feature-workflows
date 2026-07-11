@@ -1,7 +1,7 @@
 # Investigation: splitting `feature-pipeline.js` into smaller composed workflows
 
-_Date: 2026-07-11. Engine at v1.4.0 (6,777 lines, six modes). Status: investigation only — no
-engine changes made._
+_Date: 2026-07-11. Engine at v1.4.0 (6,777 lines, six modes). Status: **stage 1 IMPLEMENTED**
+(engine v1.4.1) — see "Stage-1 implementation notes" at the end; stages 2–3 remain open._
 
 ## Question
 
@@ -244,3 +244,34 @@ generated banner differs). The 180 existing tests plus the post-emit checks are 
    `fp-design-docs` child for design/tune/extract reuse.
 
 Each stage is independently shippable and `--resume`-compatible.
+
+## Stage-1 implementation notes (engine v1.4.1)
+
+Implemented as designed, with four pragmatic deviations from the blueprint above:
+
+1. **Contiguous-range modules.** To make the refactor *verifiable* (rebuilt dist byte-identical
+   to the v1.4.0 body), each src module is a contiguous line range of the original file. So the
+   cut is `schemas / config / text-utils / state / stages-issues / tune / extract-scope /
+   review-mode / extract-slice / publish-persist / test-run / agent-core / json-repair /
+   review-loop / decisions / main` (16 modules + `meta/`) rather than the idealized layout —
+   e.g. `normalizePath`/`compactList` live in `decisions.mjs` because that's where they sit in
+   the original order. Re-homing utilities is trivial follow-up work now that the build exists.
+2. **`main()` stays whole in `main.mjs` (~2.9k lines).** Carving the six mode branches out of
+   the shared-closure `main()` is real behavioral surgery, not a mechanical move — it belongs to
+   stage 2 (per-mode entries), where each branch becomes its own entry's `main()`.
+3. **Manifest order instead of an import-graph walk.** The builder emits modules in explicit
+   manifest order (the original file order), which guarantees byte-stability and keeps top-level
+   const initializers safe (they may only reference earlier modules). Graph-walk reachability
+   (module-level tree-shaking) becomes useful — and will be added — when stage 2 introduces
+   multiple entries.
+4. **The test harness still reads the DIST, not src.** Deliberate: 183 tests against the built
+   artifact is a *stronger* check than testing src (it validates exactly what users install),
+   and `tests/build-drift.test.mjs` + the CI `--check` step pin dist ≡ build(src). Switching the
+   harness to src imports remains optional cleanup.
+
+What shipped: `workflows/src/*.mjs` (ESM, Node-importable, smoke-imported in CI),
+`scripts/build-workflows.mjs` (zero-dep builder + self-checks), `npm run build` /
+`npm run validate:build`, `tests/build-drift.test.mjs`, CI dist-freshness + src-import steps,
+and single-site versioning (bump `plugin.json`, build injects header + `meta.version` — the
+3-way lockstep now holds by construction). The v1.4.1 dist differs from v1.4.0 only in the
+header banner; the 6.7k-line body is byte-identical.
