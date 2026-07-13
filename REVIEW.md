@@ -1,0 +1,3 @@
+# Code Review Guidelines
+
+- **Version-lockstep enforcement:** Any preflight or CI workflow must treat a mismatch between `plugin.json` `version`, the `// engine-version:` comment header, and `meta.version` as a hard failure. Use `scripts/validate-plugin-versions.mjs` (wired into the `validate-plugin` GitHub Actions workflow) to assert all three markers agree before a command proceeds, rather than relying on manual diligence.
