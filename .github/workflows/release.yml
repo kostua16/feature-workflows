@@ -51,10 +51,24 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Two supported flows land here:
+        #   CLI  — `npm run release` + `git push --follow-tags`: the tag arrives with no
+        #          Release object yet, so we create one with generated notes + assets.
+        #   UI   — "Draft a new release" creates the Release FIRST and pushing its tag
+        #          triggers this run: attach the validated artifacts to the existing
+        #          Release (keeping its author-written notes) instead of colliding.
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "feature-workflows $GITHUB_REF_NAME" \
-            --generate-notes \
-            plugins/feature-workflows/workflows/feature-pipeline.js \
-            plugins/feature-workflows/workflows/feature-pipeline.md \
+          assets=(
+            plugins/feature-workflows/workflows/feature-pipeline.js
+            plugins/feature-workflows/workflows/feature-pipeline.md
             plugins/feature-workflows/workflows/checksums.txt
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists (UI flow) — attaching validated assets"
+            gh release upload "$GITHUB_REF_NAME" --clobber "${assets[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "feature-workflows $GITHUB_REF_NAME" \
+              --generate-notes \
+              "${assets[@]}"
+          fi
