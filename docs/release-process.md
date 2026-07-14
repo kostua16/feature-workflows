@@ -38,10 +38,13 @@ npm run release -- 1.5.0
 git push --follow-tags origin main
 ```
 
-`scripts/release.mjs` does, locally and atomically re-runnable:
+`scripts/release.mjs` does, locally (nothing pushed) and safely re-runnable — if any
+validation step fails, the version bump and rebuilt dist are **auto-reverted** (tree clean
+again), so fixing the failure and re-running is always possible:
 
 1. Guards: clean tree, on `main` (`--allow-branch` to override for testing), tag free,
-   version actually new.
+   version **strictly greater** than the current one (a downgrade is never a release —
+   rollbacks repoint the pin instead, see below).
 2. Bumps `plugin.json` (the **single** version bump site — the build injects the
    `// engine-version:` header and `meta.version` into the dist).
 3. `npm run build` + the full validation suite (`validate:build`, `validate:versions`,
@@ -71,6 +74,16 @@ git push origin main
 
 Users pick it up on their next `/plugin marketplace update`. The bad release's tag/Release can
 stay for the record (or be yanked independently).
+
+## Pin integrity check (CI)
+
+Because end users install whatever the pin points at, `scripts/validate-marketplace-pin.mjs`
+(`npm run validate:pin`) runs in the PR/main CI (`validate-plugin.yml`) and hard-fails if the
+pinned source is inconsistent: the `ref` must be an existing `vX.Y.Z` tag (fetched on demand in
+shallow CI checkouts), the `sha` must be exactly the commit that tag points at, and
+`plugin.json` **at the pinned commit** must carry the version the tag names. A typo'd or
+hand-edited `ref`/`sha` therefore cannot reach `main` unnoticed. Before the first release
+(relative-path source) the check passes trivially.
 
 ## Dogfooding after the first release
 

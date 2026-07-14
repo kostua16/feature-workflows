@@ -40,22 +40,44 @@ if (capture('git', ['tag', '--list', tag]) !== '')
 
 const manifestPath = new URL('../plugins/feature-workflows/.claude-plugin/plugin.json', import.meta.url)
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-if (manifest.version === version) throw new Error(`plugin.json is already at ${version} — pick a new version`)
+// strictly increasing semver only — rollbacks repoint the marketplace pin
+// (scripts/pin-marketplace.mjs --release <prev-tag>), they never cut a lower release
+const semverCmp = (a, b) => {
+  const pa = a.split('.').map(Number)
+  const pb = b.split('.').map(Number)
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i]
+  return 0
+}
+if (semverCmp(version, manifest.version) <= 0)
+  throw new Error(`version ${version} must be greater than the current ${manifest.version} (rollback = repoint the pin, not a lower release)`)
 
 const branch = capture('git', ['branch', '--show-current'])
 if (branch !== 'main' && !process.argv.includes('--allow-branch'))
   throw new Error(`releases are cut from main (on '${branch}'); pass --allow-branch to override`)
 
 // ---- bump + build + validate --------------------------------------------------
+// A failure anywhere in this phase auto-reverts the bump and the rebuilt dist, so
+// the tree is clean again and the release is safely re-runnable after the fix.
 console.log(`\n== release ${tag}: bump ${manifest.version} -> ${version}`)
+const currentVersion = manifest.version
 manifest.version = version
 writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
 
-run(process.execPath, ['scripts/build-workflows.mjs'])
-run(process.execPath, ['scripts/build-workflows.mjs', '--check'])
-run(process.execPath, ['scripts/validate-plugin-versions.mjs'])
-run(process.execPath, ['scripts/validate-agent-registry.mjs'])
-run('npm', ['test'])
+const MUTATED = [
+  'plugins/feature-workflows/.claude-plugin/plugin.json',
+  'plugins/feature-workflows/workflows/feature-pipeline.js',
+]
+try {
+  run(process.execPath, ['scripts/build-workflows.mjs'])
+  run(process.execPath, ['scripts/build-workflows.mjs', '--check'])
+  run(process.execPath, ['scripts/validate-plugin-versions.mjs'])
+  run(process.execPath, ['scripts/validate-agent-registry.mjs'])
+  run('npm', ['test'])
+} catch (err) {
+  run('git', ['checkout', '--', ...MUTATED])
+  console.error(`\n== release ${tag} ABORTED: validation failed. The version bump and rebuilt dist were reverted (back at ${currentVersion}, tree clean) — fix the failure and re-run.`)
+  throw err
+}
 
 // ---- release commit + tag ------------------------------------------------------
 run('git', ['add', 'plugins/feature-workflows/.claude-plugin/plugin.json', 'plugins/feature-workflows/workflows/feature-pipeline.js'])

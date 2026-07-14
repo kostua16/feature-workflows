@@ -17,6 +17,8 @@ jobs:
         run: node scripts/build-workflows.mjs --check
       - name: Engine version lockstep (plugin.json / engine-version header / meta.version)
         run: node scripts/validate-plugin-versions.mjs
+      - name: Marketplace pin integrity (ref is a release tag, sha matches it, pinned version agrees)
+        run: node scripts/validate-marketplace-pin.mjs
       - name: Source modules import cleanly (no cycles/TDZ at module init)
         working-directory: plugins/feature-workflows/workflows/src
         run: |

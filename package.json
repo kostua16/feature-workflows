@@ -9,6 +9,7 @@
     "validate:build": "node scripts/build-workflows.mjs --check",
     "release": "node scripts/release.mjs",
     "marketplace:pin": "node scripts/pin-marketplace.mjs",
+    "validate:pin": "node scripts/validate-marketplace-pin.mjs",
     "validate:versions": "node scripts/validate-plugin-versions.mjs",
     "validate:agents": "node scripts/validate-agent-registry.mjs"
   }
