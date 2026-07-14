@@ -62,6 +62,23 @@ Release** with auto-generated notes and attached artifacts: `feature-pipeline.js
 `feature-pipeline.md`, `checksums.txt` (SHA-256). The workflow never writes to branches — it
 only verifies and publishes, so a failed run is safely re-runnable.
 
+## Creating the Release from the GitHub UI
+
+"Releases → Draft a new release" is also supported, with two things to know:
+
+1. **The tag must target a commit whose `plugin.json` already carries that version** — the
+   workflow's first gate rejects any tag whose tree says otherwise. In practice that means the
+   release-prep commit must already be on `main` (the `npm run release` commit, or a
+   version-consistent merge like tagging `v1.4.1` on a tree at 1.4.1). You cannot invent
+   `vX.Y.Z` from the UI for a version that no commit carries.
+2. UI release creation makes the Release object first and the tag push triggers the workflow —
+   which detects the existing Release and **attaches the validated artifacts to it** (keeping
+   your notes) instead of creating a duplicate.
+
+After a UI-created release, the **catalog pin is still your step** (the release script normally
+does it): `npm run marketplace:pin -- --release vX.Y.Z`, commit, push — otherwise end users
+keep installing the previous pin (or track `main` before the first release).
+
 ## Rollback
 
 One command + one commit — repoint the pin at any previous tag:
