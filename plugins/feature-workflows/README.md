@@ -50,7 +50,9 @@ sandbox-forbidden tokens (`require`, `Date.now`, `Math.random`, argless `new Dat
 
 `.claude-plugin/plugin.json` → `version` is the **single bump site**. The build injects it into
 the dist's `// engine-version:` header and `meta.version`, so all three markers agree by
-construction — bump `plugin.json`, run `npm run build`, commit both.
+construction. Version bumps happen through the release flow — `npm run release -- X.Y.Z` bumps,
+builds, validates, commits, tags, and pins the marketplace catalog to the tag (end users
+install pinned releases, not `main`). See `docs/release-process.md`.
 
 Enforcement:
 
