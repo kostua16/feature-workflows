@@ -54,7 +54,7 @@ From a clean checkout of `main`:
 
 ```bash
 npm run release -- 1.5.0
-git push --follow-tags origin main
+git push --atomic --follow-tags origin main
 ```
 
 `scripts/release.mjs` does, locally (nothing pushed) and safely re-runnable — if any

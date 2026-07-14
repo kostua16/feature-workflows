@@ -60,7 +60,11 @@ jobs:
             echo "tag v$VERSION already exists — recovery mode: skipping prep, proceeding to re-validate + publish"
           else
             node scripts/release.mjs "$VERSION"
-            git push --follow-tags origin main
+            # --atomic: branch + tag update all-or-nothing. Without it a concurrent
+            # push to main could reject the branch update while the tag still lands,
+            # and the recovery branch above (tag exists => prep fully pushed) would
+            # then publish a release whose catalog pin never reached main.
+            git push --atomic --follow-tags origin main
           fi
       - name: Re-validate the tagged tree
         run: |

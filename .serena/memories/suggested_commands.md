@@ -22,7 +22,7 @@ bump+build+validate+commit+tag+pin+publish; re-run same version = idempotent rec
 Fallback (local CLI):
 ```bash
 npm run release -- X.Y.Z              # bump+build+validate+commit+tag+pin catalog (local)
-git push --follow-tags origin main    # tag triggers release.yml -> GitHub Release + assets
+git push --atomic --follow-tags origin main   # tag triggers release.yml -> GitHub Release + assets
 npm run marketplace:pin -- --release vX.Y.Z   # rollback/repoint the catalog pin
 npm run marketplace:pin -- --dev              # local dogfooding (don't commit)
 ```
