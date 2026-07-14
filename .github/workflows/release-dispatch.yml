@@ -1,0 +1,97 @@
+name: release-dispatch
+
+# One-click release: Actions -> release-dispatch -> "Run workflow" -> enter X.Y.Z.
+# CI runs the ENTIRE release sequence itself (no local scripts):
+#   bump plugin.json -> build -> validate -> commit + tag -> pin catalog -> push
+#   -> re-validate the tagged tree -> publish the GitHub Release with assets.
+#
+# Notes:
+# - Commits/tags pushed with GITHUB_TOKEN do not trigger other workflows, so the
+#   tag-push release.yml stays idle here (no double publish) and the bot commits
+#   cannot start a workflow loop. release.yml remains the publisher for the
+#   local-CLI flow (`npm run release` + `git push --follow-tags`).
+# - Recovery: if a previous dispatch died after pushing the tag but before
+#   publishing, re-running with the same version skips the prep (tag exists),
+#   re-validates the tagged tree, and publishes idempotently.
+# - The version input is only ever read via the VERSION env var (never inlined
+#   into scripts) to keep shell-injection out of reach.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (X.Y.Z), strictly greater than the current plugin.json version'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate version input
+        run: |
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "version '$VERSION' is not X.Y.Z" >&2
+            exit 1
+          fi
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Prepare release (bump, build, validate, commit, tag, pin catalog) and push
+        run: |
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "tag v$VERSION already exists — recovery mode: skipping prep, proceeding to re-validate + publish"
+          else
+            node scripts/release.mjs "$VERSION"
+            git push --follow-tags origin main
+          fi
+      - name: Re-validate the tagged tree
+        run: |
+          git checkout -q "refs/tags/v$VERSION"
+          version=$(node -p "JSON.parse(require('fs').readFileSync('plugins/feature-workflows/.claude-plugin/plugin.json','utf8')).version")
+          if [ "$version" != "$VERSION" ]; then
+            echo "tag v$VERSION does not match plugin.json version $version" >&2
+            exit 1
+          fi
+          node scripts/build-workflows.mjs --check
+          node scripts/validate-plugin-versions.mjs
+          node scripts/validate-agent-registry.mjs
+          node --test "tests/**/*.test.mjs"
+      - name: Checksums
+        working-directory: plugins/feature-workflows/workflows
+        run: sha256sum feature-pipeline.js feature-pipeline.md > checksums.txt
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets=(
+            plugins/feature-workflows/workflows/feature-pipeline.js
+            plugins/feature-workflows/workflows/feature-pipeline.md
+            plugins/feature-workflows/workflows/checksums.txt
+          )
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "release v$VERSION already exists — attaching validated assets"
+            gh release upload "v$VERSION" --clobber "${assets[@]}"
+          else
+            gh release create "v$VERSION" \
+              --title "feature-workflows v$VERSION" \
+              --generate-notes \
+              "${assets[@]}"
+          fi

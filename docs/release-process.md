@@ -29,7 +29,26 @@ unreleased `main` state — and never build anything themselves._
 - So `main` can move freely between releases: users' catalogs refresh, but plugin content stays
   at the pinned release commit until a new pin commit lands.
 
-## Cutting a release
+## Cutting a release — one-click from GitHub (primary)
+
+**Actions → `release-dispatch` → "Run workflow" → enter `X.Y.Z`.** No local steps: CI runs the
+entire sequence itself — bump `plugin.json` → build → full validation → `chore(release)` commit
++ annotated tag → catalog pin commit → push to `main` → re-validate the tagged tree → publish
+the GitHub Release with assets. Guards are the same as the local script (strictly increasing
+version, free tag); the version input is X.Y.Z-validated and only ever passed via env.
+
+Failure recovery is built in: re-running the dispatch with the same version after a partial
+failure (e.g. it died after pushing the tag) skips the prep, re-validates the tagged tree, and
+publishes idempotently.
+
+Two things to know about the bot-driven path:
+- Commits/tags pushed with `GITHUB_TOKEN` don't trigger other workflows — so the tag-push
+  `release.yml` stays idle (no double publish), but the `main`-push CI (including the pin
+  integrity check) also doesn't run on the bot commits; the next human PR/push re-checks them.
+- The shipped dist for that version is produced by the bot commit rather than inside a reviewed
+  PR diff. The dist-freshness re-validation keeps it honest (dist ≡ build of tagged src).
+
+## Cutting a release — local CLI (fallback)
 
 From a clean checkout of `main`:
 

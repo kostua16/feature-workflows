@@ -17,12 +17,17 @@ The builder self-checks: dup top-level names, unstripped import/export, forbidde
 Version bump = plugin.json ONLY, then `npm run build` (header + meta.version injected).
 
 ## Release (see docs/release-process.md; users install pinned tags, not main)
+PRIMARY: GitHub Actions -> release-dispatch -> "Run workflow" -> enter X.Y.Z (CI does
+bump+build+validate+commit+tag+pin+publish; re-run same version = idempotent recovery).
+Fallback (local CLI):
 ```bash
 npm run release -- X.Y.Z              # bump+build+validate+commit+tag+pin catalog (local)
 git push --follow-tags origin main    # tag triggers release.yml -> GitHub Release + assets
 npm run marketplace:pin -- --release vX.Y.Z   # rollback/repoint the catalog pin
 npm run marketplace:pin -- --dev              # local dogfooding (don't commit)
 ```
+UI "Draft a new release" also works ONLY for a version-consistent commit (tag tree's
+plugin.json == tag); release.yml then attaches assets to the existing Release; pin stays manual.
 
 ## Validate the workflow engine (run after every edit to feature-pipeline.js)
 ```bash
