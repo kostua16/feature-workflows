@@ -24,6 +24,9 @@
    inside sub-agents spawned via `agent()`.
 2. **`feature-pipeline.js` is an ES module.** Validate with the `--input-type=module` recipe (see
    `mem:suggested_commands`). Plain `node --check` silently passes invalid ESM.
+   **v1.4.1+: the dist is GENERATED** — edit `plugins/feature-workflows/workflows/src/*.mjs`,
+   run `npm run build` (never hand-edit the dist; `validate:build` + a test + CI catch drift).
+   Version bump site is plugin.json ONLY (build injects header + meta.version).
 3. **ONE engine, THREE modes** sharing `<planDir>/pipeline-state.json` — the `--resume` contract.
    Gates are idempotent; a mode runs a subset of the gate sequence.
 4. **Committing is opt-in** — `autoCommit` defaults `false`.

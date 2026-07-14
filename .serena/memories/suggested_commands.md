@@ -5,6 +5,17 @@ Platform: macOS (darwin), shell **zsh**. Node **v25**, Python **3.14** available
 Note: project `CLAUDE.md` asks to run shell via the Serena `execute_shell_command` tool rather than
 a raw Bash tool.
 
+## Build the workflow engine (v1.4.1+: dist is GENERATED from workflows/src/)
+```bash
+# EDIT plugins/feature-workflows/workflows/src/*.mjs — NEVER the dist feature-pipeline.js
+npm run build            # regenerate the dist (injects version from plugin.json)
+npm run validate:build   # fail if committed dist is stale (also tests/build-drift.test.mjs + CI)
+npm test                 # 183 tests (harness reads the DIST — validates the shipped artifact)
+```
+The builder self-checks: dup top-level names, unstripped import/export, forbidden tokens
+(require/Date.now/Math.random/new Date()), phase-labels ⊆ meta.phases, neutralized ESM check.
+Version bump = plugin.json ONLY, then `npm run build` (header + meta.version injected).
+
 ## Validate the workflow engine (run after every edit to feature-pipeline.js)
 ```bash
 cd .claude/workflows

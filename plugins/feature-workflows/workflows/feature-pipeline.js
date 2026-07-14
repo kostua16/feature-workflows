@@ -1,18 +1,7 @@
 // feature-pipeline.js
-// engine-version: 1.4.0
+// engine-version: 1.4.1
+// GENERATED FILE — do not edit. Source: workflows/src/*.mjs; rebuild with `npm run build`.
 // Gate-enforcing pipeline for new features / bug-fixes.
-//
-// Enhancements:
-//   - Per-gate todo-store checkpoints: each gate writes a compact note
-//     (status/result/evidence/notes) to .planning/todos/ via the todo-store
-//     agent, and the next gate reads the prior summary instead of
-//     re-deriving it. This is the explicit compaction boundary between stages.
-//   - gsd-quick fast-path: simple tasks can be routed through the gsd-quick
-//     skill as an alternate executor; our own Test + Code-Review gates still
-//     run afterward so the flow stays authoritative.
-//   - gsd-debug recovery: on Gate 4 (Test) failure, the gsd-debug skill is
-//     invoked to diagnose+fix and tests are re-run up to maxDebugRetries
-//     before the gate hard-blocks.
 //
 // Run via:
 //   Workflow({ scriptPath: ".claude/workflows/feature-pipeline.js",
@@ -20,7 +9,7 @@
 
 export const meta = {
   name: 'feature-pipeline',
-  version: '1.4.0',
+  version: '1.4.1',
   description: '1 engine + 6 modes (design/implement/tune/extract/review/status) gate-enforcing feature/bug-fix pipeline: THINK docs + plan + stageNN.md -> DO execute -> test -> review -> commit (or issues-handoff -> tune). EXTRACT reverse-engineers design docs from existing code. REVIEW audits an existing design docset and collects issues for tune. Durable cross-mode state via pipeline-state.json; status mode renders it read-only.',
   phases: [
     { title: 'Categorize' },

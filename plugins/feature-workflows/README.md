@@ -28,17 +28,34 @@ Commands and agents are namespaced by the plugin name. The engine spawns its nam
 through the `nsAgent()` helper (single `AGENT_NS` constant in `workflows/feature-pipeline.js`);
 if you fork/rename the plugin, change that one constant.
 
+## Engine source layout & build
+
+`workflows/feature-pipeline.js` is a **GENERATED** file — do not edit it directly. The source
+lives in `workflows/src/` as real ESM modules (`schemas.mjs`, `config.mjs`, `agent-core.mjs`,
+`state.mjs`, the mode-support modules, `main.mjs`, and the `meta/` literal); the Workflow sandbox
+cannot resolve imports, so `scripts/build-workflows.mjs` (repo root, zero-dep) concatenates them
+into the flat dist script: banner + `export const meta` (version injected from `plugin.json`) +
+module bodies + the sandbox tail. Edit src, then:
+
+```
+npm run build            # regenerate workflows/feature-pipeline.js
+npm run validate:build   # fail if the committed dist is stale (also a test + CI step)
+```
+
+The builder self-checks every output: duplicate top-level names, unstripped import/export,
+sandbox-forbidden tokens (`require`, `Date.now`, `Math.random`, argless `new Date`), phase-label
+↔ `meta.phases` agreement, and the neutralized ESM syntax check.
+
 ## Versioning rule
 
-Keep these three in lockstep when releasing:
-
-1. `.claude-plugin/plugin.json` → `version`
-2. `workflows/feature-pipeline.js` → `// engine-version:` header comment
-3. `workflows/feature-pipeline.js` → `meta.version`
+`.claude-plugin/plugin.json` → `version` is the **single bump site**. The build injects it into
+the dist's `// engine-version:` header and `meta.version`, so all three markers agree by
+construction — bump `plugin.json`, run `npm run build`, commit both.
 
 Enforcement:
 
-- CI runs `scripts/validate-plugin-versions.mjs` (repo root), which fails the build unless all
+- CI runs `scripts/build-workflows.mjs --check` (dist freshness) and
+  `scripts/validate-plugin-versions.mjs` (repo root), which fails the build unless all
   three markers agree, plus the ESM syntax check on the engine.
 - `setup` reports the installed version and sanity-checks it against the plugin manifest.
 - Pipeline-command preflights compare installed vs bundled engine versions and **stop** on

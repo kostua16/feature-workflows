@@ -13,8 +13,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Dist freshness (workflows/src/ builds byte-identical to the committed engine)
+        run: node scripts/build-workflows.mjs --check
       - name: Engine version lockstep (plugin.json / engine-version header / meta.version)
         run: node scripts/validate-plugin-versions.mjs
+      - name: Source modules import cleanly (no cycles/TDZ at module init)
+        working-directory: plugins/feature-workflows/workflows/src
+        run: |
+          for f in *.mjs meta/*.mjs; do node -e "await import('./$f')" || exit 1; done
       - name: Agent registry (engine agent references resolve to agents/*.md)
         run: node scripts/validate-agent-registry.mjs
       - name: Engine unit tests (pure logic)

@@ -1,8 +1,24 @@
 # Handoff — current state & next actions
 
-_Last updated: 2026-07-11 (review mode — standalone design-docset audit, engine v1.4.0)._
+_Last updated: 2026-07-11 (workflow-decomposition investigation; engine still v1.4.0, unchanged)._
 
 ## Current state
+- Investigated splitting the monolithic engine into smaller composed workflows —
+  see `docs/workflow-decomposition-investigation.md`. Verdict: feasible; hard constraints are
+  ONE-level `workflow()` nesting and no code sharing between scripts (needs a src→dist build
+  step to avoid duplicating the ~2.8k-line helper stack). Staging: (1) modularize
+  source + build to the same single dist engine, (2) split per MODE (six sibling workflows,
+  `pipeline-state.json` contract unchanged), (3) selective `workflow()` children —
+  extract-slice first, then a shared design-docs child for design/tune/extract reuse.
+- **STAGE 1 IMPLEMENTED (engine v1.4.1, PR #10):** `workflows/src/` = 16 contiguous-range ESM
+  modules + `meta/feature-pipeline.meta.mjs`; `scripts/build-workflows.mjs` (zero-dep concat
+  builder, manifest order, self-checks: dup names, unstripped import/export, forbidden tokens,
+  phase-labels ⊆ meta.phases, neutralized ESM check); `npm run build` / `validate:build`;
+  `tests/build-drift.test.mjs`; CI adds dist-freshness + src smoke-import steps. Versioning is
+  single-site (plugin.json → build injects header + meta.version). Verified pure refactor: the
+  v1.4.1 dist body is byte-identical to v1.4.0 (banner only differs); 183 tests pass; harness
+  deliberately still reads the DIST (tests the shipped artifact). `main()` stays whole in
+  `main.mjs` — carving mode branches is stage 2.
 - Implemented **review mode** (`mode: 'review'`, engine/plugin v1.4.0) — the sixth pipeline
   mode and the INSPECT flow: `/review-design <planDir>` audits an existing design docset
   (forward-designed, extracted, or tuned) and collects ALL design issues without mutating
