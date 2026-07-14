@@ -48,10 +48,20 @@ try {
   }
 }
 
-const tagCommit = git('rev-list', '-n1', src.ref)
+let tagCommit
+try {
+  tagCommit = git('rev-list', '-n1', src.ref)
+} catch {
+  fail(`tag ${src.ref} could not be resolved to a commit`)
+}
 if (tagCommit !== src.sha) fail(`sha ${src.sha} does not match tag ${src.ref} -> ${tagCommit}`)
 
-const pinnedManifest = JSON.parse(git('show', `${src.sha}:${PLUGIN_PATH}/.claude-plugin/plugin.json`))
+let pinnedManifest
+try {
+  pinnedManifest = JSON.parse(git('show', `${src.sha}:${PLUGIN_PATH}/.claude-plugin/plugin.json`))
+} catch {
+  fail(`could not read ${PLUGIN_PATH}/.claude-plugin/plugin.json at the pinned commit ${src.sha.slice(0, 12)} (missing path or unparsable manifest)`)
+}
 if (`v${pinnedManifest.version}` !== src.ref)
   fail(`plugin.json at the pinned commit is version ${pinnedManifest.version}, but the pin claims ${src.ref}`)
 
