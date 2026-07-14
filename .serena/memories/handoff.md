@@ -29,6 +29,13 @@ _Last updated: 2026-07-11 (workflow-decomposition investigation; engine still v1
   marketplace:pin -- --release <prev-tag>` + commit. Dogfooding after first release:
   `marketplace:pin -- --dev` locally, don't commit. Catalog stays relative-path until the
   FIRST release flips it. See docs/release-process.md.
+- **One-click release (PR #13):** `.github/workflows/release-dispatch.yml` — Actions "Run
+  workflow" button with a version input; CI runs the whole sequence (reuses release.mjs) and
+  publishes. GITHUB_TOKEN pushes trigger no other workflows → no double publish, no loops,
+  but also no main-push CI on bot commits. Re-run same version = idempotent recovery.
+  release.yml publish step is UI-flow-aware (existing Release -> upload assets, keep notes).
+  v1.4.1 aftercare pending: re-push tag (or manual asset upload) + `marketplace:pin --release
+  v1.4.1` commit.
 - Implemented **review mode** (`mode: 'review'`, engine/plugin v1.4.0) — the sixth pipeline
   mode and the INSPECT flow: `/review-design <planDir>` audits an existing design docset
   (forward-designed, extracted, or tuned) and collects ALL design issues without mutating

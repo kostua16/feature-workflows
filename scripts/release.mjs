@@ -10,7 +10,7 @@
 //   5. commit `chore(release): vX.Y.Z` and create the annotated tag vX.Y.Z
 //   6. pin the marketplace catalog to the tag (git-subdir ref+sha) and commit
 //
-// Then publish with:  git push --follow-tags origin main
+// Then publish with:  git push --atomic --follow-tags origin main
 // (the tag push triggers .github/workflows/release.yml -> GitHub Release + assets)
 //
 // The pin commit intentionally lands AFTER the tag: users' catalogs refresh from the
@@ -93,7 +93,7 @@ console.log(`
 == ${tag} prepared (2 commits + tag, nothing pushed).
 Publish with:
 
-  git push --follow-tags origin ${branch}
+  git push --atomic --follow-tags origin ${branch}
 
 The tag push triggers the release workflow (GitHub Release + dist assets + checksums).
 Rollback after publishing: node scripts/pin-marketplace.mjs --release <previous-tag> && commit.`)
