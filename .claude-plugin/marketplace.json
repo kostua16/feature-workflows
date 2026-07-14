@@ -1,16 +1,30 @@
 {
   "name": "feature-workflows",
-  "owner": { "name": "Konstantin Leontyev", "email": "koleo169kzai@gmail.com" },
+  "owner": {
+    "name": "Konstantin Leontyev",
+    "email": "koleo169kzai@gmail.com"
+  },
   "metadata": {
     "description": "Gate-enforced feature-development pipeline for Claude Code: design/implement/tune/extract/review modes driven by a dynamic workflow engine."
   },
   "plugins": [
     {
       "name": "feature-workflows",
-      "source": "./plugins/feature-workflows",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/kostua16/feature-workflows",
+        "path": "plugins/feature-workflows",
+        "ref": "v1.4.2",
+        "sha": "c8e203abb70bda7004f3db9161f1b9a9ec552c9f"
+      },
       "description": "Gate-enforced feature pipeline: 8 commands, 31 sub-agents, the feature-pipeline dynamic-workflow engine, compress-md skill.",
       "category": "workflows",
-      "tags": ["pipeline", "tdd", "planning", "agents"],
+      "tags": [
+        "pipeline",
+        "tdd",
+        "planning",
+        "agents"
+      ],
       "strict": true
     }
   ]
