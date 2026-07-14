@@ -19,6 +19,16 @@ _Last updated: 2026-07-11 (workflow-decomposition investigation; engine still v1
   v1.4.1 dist body is byte-identical to v1.4.0 (banner only differs); 183 tests pass; harness
   deliberately still reads the DIST (tests the shipped artifact). `main()` stays whole in
   `main.mjs` — carving mode branches is stage 2.
+- **RELEASE CHANNEL (option 2+4, second PR stacked on #10):** end users install PINNED
+  releases, not main. `npm run release -- X.Y.Z` (scripts/release.mjs): bump plugin.json →
+  build → full validation → commit + annotated tag vX.Y.Z → pin marketplace.json to the tag
+  (scripts/pin-marketplace.mjs, `git-subdir` source {url, path, ref, sha} — NOT `github`,
+  the plugin lives in a subdir; sha is the effective pin). Push with --follow-tags; the tag
+  triggers .github/workflows/release.yml (re-validates the tagged tree, publishes GitHub
+  Release + dist/doc/checksums assets; never writes to branches). Rollback = `npm run
+  marketplace:pin -- --release <prev-tag>` + commit. Dogfooding after first release:
+  `marketplace:pin -- --dev` locally, don't commit. Catalog stays relative-path until the
+  FIRST release flips it. See docs/release-process.md.
 - Implemented **review mode** (`mode: 'review'`, engine/plugin v1.4.0) — the sixth pipeline
   mode and the INSPECT flow: `/review-design <planDir>` audits an existing design docset
   (forward-designed, extracted, or tuned) and collects ALL design issues without mutating

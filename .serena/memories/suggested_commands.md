@@ -16,6 +16,14 @@ The builder self-checks: dup top-level names, unstripped import/export, forbidde
 (require/Date.now/Math.random/new Date()), phase-labels ⊆ meta.phases, neutralized ESM check.
 Version bump = plugin.json ONLY, then `npm run build` (header + meta.version injected).
 
+## Release (see docs/release-process.md; users install pinned tags, not main)
+```bash
+npm run release -- X.Y.Z              # bump+build+validate+commit+tag+pin catalog (local)
+git push --follow-tags origin main    # tag triggers release.yml -> GitHub Release + assets
+npm run marketplace:pin -- --release vX.Y.Z   # rollback/repoint the catalog pin
+npm run marketplace:pin -- --dev              # local dogfooding (don't commit)
+```
+
 ## Validate the workflow engine (run after every edit to feature-pipeline.js)
 ```bash
 cd .claude/workflows

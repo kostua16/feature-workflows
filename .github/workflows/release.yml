@@ -1,0 +1,60 @@
+name: release
+
+# Option 2+4 release channel (docs/release-process.md): a pushed vX.Y.Z tag is
+# re-validated from scratch and published as a GitHub Release with the built
+# engine + reference doc + SHA-256 checksums attached. The marketplace catalog
+# pin (git-subdir ref+sha) is committed by scripts/release.mjs, not here — this
+# workflow only verifies and publishes, it never writes to branches.
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Tag matches plugin.json version
+        run: |
+          version=$(node -p "JSON.parse(require('fs').readFileSync('plugins/feature-workflows/.claude-plugin/plugin.json','utf8')).version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match plugin.json version $version" >&2
+            exit 1
+          fi
+      - name: Dist freshness (released artifact == build of tagged src)
+        run: node scripts/build-workflows.mjs --check
+      - name: Version lockstep
+        run: node scripts/validate-plugin-versions.mjs
+      - name: Agent registry
+        run: node scripts/validate-agent-registry.mjs
+      - name: Tests
+        run: node --test "tests/**/*.test.mjs"
+      - name: Engine ESM syntax check
+        working-directory: plugins/feature-workflows/workflows
+        run: |
+          sed 's/^return final$/\/\/ __sandbox_return__ final/' feature-pipeline.js \
+            | node --input-type=module --check
+      - name: Checksums
+        working-directory: plugins/feature-workflows/workflows
+        run: sha256sum feature-pipeline.js feature-pipeline.md > checksums.txt
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "feature-workflows $GITHUB_REF_NAME" \
+            --generate-notes \
+            plugins/feature-workflows/workflows/feature-pipeline.js \
+            plugins/feature-workflows/workflows/feature-pipeline.md \
+            plugins/feature-workflows/workflows/checksums.txt
