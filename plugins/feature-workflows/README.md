@@ -12,15 +12,25 @@ issues for tune), driven by one dynamic-workflow engine.
 | Commands | 8 | `/feature-workflows:setup`, `:design-feature`, `:implement-feature`, `:tune-feature`, `:extract-design`, `:review-design`, `:feature-pipeline`, `:pipeline-status` |
 | Agents | 31 | Spawned as `feature-workflows:<agent>` (e.g. `feature-workflows:plan-architect`) |
 | Skills | 1 | `compress-md` — in-session markdown caveman compression |
-| Engine asset | `workflows/` | `feature-pipeline.js` + reference docs — **not** auto-loaded; installed per-project by `setup` |
+| Engine asset | `workflows/` | `feature-pipeline.js` + reference docs — **not** auto-loaded; auto-symlinked user-level (`~/.claude/workflows/`) by the command preflights |
 
-## Why a setup command
+## Why a doctor command
 
-Dynamic workflows are not a plugin component: the Workflow tool resolves only from a project's
-`.claude/workflows/`. `/feature-workflows:setup` copies
-`${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js` (+ docs) into the current project and
-ESM-validates it. Every pipeline command preflights that the engine exists and that its
-`engine-version:` matches the plugin's bundled copy, warning on drift.
+Dynamic workflows are not a plugin component, but the Workflow tool resolves user-level
+`~/.claude/workflows/` — so the pipeline commands auto-create symlinks there pointing at
+`${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js` (+ docs) and self-repair them when they
+go missing, dangle after a plugin move, or (in the copy-fallback mode used where symlinks are
+unavailable, e.g. Windows) drift in `engine-version:`. Nothing is installed into projects.
+`/feature-workflows:setup` is the explicit doctor: it diagnoses the links, recreates them,
+ESM-validates the plugin engine, and removes legacy pre-1.5.0 per-project copies (which shadow the
+user-level engine) after confirmation. Uninstalling the plugin can leave dangling user-level
+symlinks behind — harmless; a reinstall's first preflight (or `setup`) repairs them.
+
+The install is cross-platform: the preflight and `setup` try `ln -sfn` (Linux/macOS and Git-Bash on
+Windows with Developer Mode), then a native `powershell New-Item -ItemType SymbolicLink`, then a
+plain `cp` as the universal fallback (used on Windows without Developer Mode, where it auto-resyncs
+on `engine-version:` drift). `$ErrorActionPreference='Stop'` makes any powershell-tier failure fall
+through to the copy.
 
 ## Namespacing
 
@@ -59,6 +69,8 @@ Enforcement:
 - CI runs `scripts/build-workflows.mjs --check` (dist freshness) and
   `scripts/validate-plugin-versions.mjs` (repo root), which fails the build unless all
   three markers agree, plus the ESM syntax check on the engine.
-- `setup` reports the installed version and sanity-checks it against the plugin manifest.
-- Pipeline-command preflights compare installed vs bundled engine versions and **stop** on
-  mismatch (the user must re-run setup or explicitly confirm running the outdated engine).
+- `setup` reports the engine version and sanity-checks it against the plugin manifest.
+- Pipeline-command preflights compare the user-level install to the plugin engine and
+  **auto-repair** on mismatch (re-link, or re-copy in copy-fallback mode); with symlinks the
+  versions agree by construction. Only a legacy per-project copy with a differing version
+  stops the command (it would shadow the current engine).

@@ -3,8 +3,8 @@
 > Engine-internal architecture doc for the **3-mode feature pipeline**
 > (`design` / `implement` / `tune`). Source of truth:
 > `plugins/feature-workflows/workflows/feature-pipeline.js` in the plugin repo (ES module;
-> installed into a project as `.claude/workflows/feature-pipeline.js` by
-> `/feature-workflows:setup`). This doc describes
+> resolved at run time via the user-level symlink `~/.claude/workflows/feature-pipeline.js`,
+> auto-created by the pipeline commands). This doc describes
 > what the engine *actually does* — including caveats, hidden limits, and failure modes
 > — so future maintainers can extend it without re-deriving the design from the code.
 
@@ -546,7 +546,7 @@ TUNE (own branch):     read issues → tunePlanner → confirm → revisit planG
 
 ```bash
 # 1. ESM validity (exit 0 required) + bogus-injection trap (must be non-zero)
-cd .claude/workflows   # or, in the plugin repo: cd plugins/feature-workflows/workflows
+cd plugins/feature-workflows/workflows   # or, on an installed setup: cd ~/.claude/workflows
 sed 's/^return final$/\/\/ __sandbox_return__ final/' feature-pipeline.js \
   | node --input-type=module --check
 printf 'export const meta={name:"x"}\nNOTVALID ESM !!@#' | node --input-type=module --check

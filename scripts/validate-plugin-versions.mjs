@@ -2,8 +2,9 @@
 //   1. plugins/feature-workflows/.claude-plugin/plugin.json -> "version"
 //   2. plugins/feature-workflows/workflows/feature-pipeline.js -> "// engine-version:" header
 //   3. plugins/feature-workflows/workflows/feature-pipeline.js -> meta.version
-// The setup command and the pipeline-command preflights compare copies by the header
-// alone, so a header that drifts from the manifest silently disables drift detection.
+// The pipeline-command preflights compare the user-level install (~/.claude/workflows/
+// symlink, or its copy fallback) to the plugin by the header alone and auto-repair on
+// drift, so a header that drifts from the manifest silently disables drift detection.
 // Exit 0 = all three match; exit 1 = mismatch or a marker is missing.
 import { readFileSync } from 'node:fs'
 

@@ -871,11 +871,12 @@ Syntax-checking requires ESM mode — plain `node --check` parses as CommonJS an
 invalid ESM** (verified: a missing colon returns exit 0).
 
 The canonical source lives in the plugin repo at `plugins/feature-workflows/workflows/`; the
-project copy at `.claude/workflows/` is installed by `/feature-workflows:setup`. Edit the plugin
-source and re-run setup — the recipes below work from whichever directory holds the copy you edited.
+user-level install at `~/.claude/workflows/` is a symlink to it (auto-created by the pipeline
+commands). Edit the plugin source — the symlink follows automatically, and the recipes below
+work from either directory.
 
 ```bash
-cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
+cd plugins/feature-workflows/workflows   # or: cd ~/.claude/workflows
 sed 's/^return final$/\/\/ __sandbox_return__ final/' feature-pipeline.js \
   | node --input-type=module --check
 ```
@@ -900,7 +901,7 @@ collides the progress-tree grouping and mislabels the pipeline log. Catch this
 at CI time:
 
 ```bash
-cd .claude/workflows   # or: cd plugins/feature-workflows/workflows
+cd plugins/feature-workflows/workflows   # or: cd ~/.claude/workflows
 # 1. labels actually emitted by the script:
 #    phase('...') + stateCheckpoint('...', ...) calls AND literal phase: '...' agent() opts
 { grep -oE "(phase|stateCheckpoint)\('[^']+'" feature-pipeline.js \

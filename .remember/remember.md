@@ -1,49 +1,52 @@
-# Handoff — 2026-07-11 (branch claude/design-review-workflow-hmilx2)
+# Handoff — 2026-07-15 (branch claude/setup-command-org-37b6c9)
 
 ## What happened this session
-Designed and implemented **review mode** (engine v1.4.0) — the sixth pipeline mode: a
-standalone INSPECT flow that audits an EXISTING planDir design docset and COLLECTS all
-design issues without mutating anything. `/review-design <planDir>` complements `/tune-feature`
-(the FIX flow): review finds and records, tune consumes and fixes.
+Replaced the per-project engine install with a **user-level symlink install** (target: v1.5.0).
+User disliked `/setup` copying the 340KB engine into every project's `.claude/workflows/`.
+Decision (user-confirmed via plan mode): engine lives as symlinks in `~/.claude/workflows/`
+pointing at `${CLAUDE_PLUGIN_ROOT}/workflows/…`; NOTHING is created in consuming projects;
+commands self-repair; `/setup` becomes a doctor/repair command.
+Basis: docs/dynamic-workflows.md:182 — Workflow tool resolves `~/.claude/workflows/` too.
 
-Flow (own branch right after tune, before Translate; requires a hydrated `--resume`):
-artifact inventory from state (idea/requirements/arch/design/e2e/facts + plan only when
-`planned||planAccepted` — extract baselines have no plan — + stageNN files)
-→ **R1** one `critical-reviewer` per lens in parallel (`consistency`, `completeness`,
-`feasibility`, `testability`, `scope`; barrier deliberate — R2 dedups across lenses)
-→ **R2** merge/dedup, also against the existing `issues-and-improvements.md` (re-runs stay
-additive; merge failure falls back to the raw union — over-report, never drop)
-→ **R3** adversarial verify per finding (refuted → dropped; null verdict → kept unverified)
-→ `design-review.md` composed deterministically (`buildReviewReport`) via `writeChunkedFile`
-→ gate-mapped findings ≥ `minSeverity` appended to `issues-and-improvements.md` in the EXACT
-tune-consumable section format (`reviewIssueSection` mirrors classifier/audit byte-for-byte;
-a source test asserts exactly 3 writers of that header)
-→ `designReview` summary + handoff (`nextMode:'tune'` only when findings actually persisted,
-else implement/design; a failed append with actionable findings blocks at
-`review-record-failed` — PR #9 review fix: recordReviewIssues returns the persisted count,
-sets issuesPath only on success, and runs before the report).
-
-- Engine: `resolveMode`/`gateModeActive` gained `review`; schemas REVIEW_FINDINGS/MERGE/
-  VERIFY_VERDICT; model tiers reviewLens=opus, reviewMerge=sonnet, reviewVerify=opus; config
-  `useReviewVerify`/`minSeverity`/`reviewLenses`; result `reviewPath`/`designReview`; new
-  blocked values `review-requires-plandir` (returned BEFORE planDir derivation — review has
-  no fresh-run planPath, reaching it unresumed would throw), `review-no-artifacts`,
-  `design-review`. Review NEVER touches designReady/stages (tests assert this structurally).
-- Command: `commands/review-design.md` (`--lenses=`, `--min-severity=`, `--no-verify`).
-- Docs: engine reference (what's-new v1.4.0, args, tiers, outputs, modes section, issues
-  lifecycle), READMEs, QUICKSTART, marketplace.json, plugin.json (1.4.0 lockstep),
-  tune-feature/setup/pipeline-status/feature-pipeline command cross-refs.
-- Tests: `tests/review-mode.test.mjs` (24 tests) + harness CANDIDATES extended. 180 tests
-  green; validate:agents (31 agents), validate:versions (1.4.0), ESM check, phase-label
-  validation (`Design Review` declared) all pass.
+- `commands/setup.md` rewritten as doctor: diagnose (SYMLINK-OK/STALE/DANGLING/PLAIN-COPY/
+  MISSING), repair via `ln -sfn` (cp fallback for Windows), ESM-validate the PLUGIN engine
+  (no delete-on-failure anymore), version report, interactive removal of legacy pre-1.5.0
+  project copies (they SHADOW the user-level engine). allowed-tools: Bash, AskUserQuestion.
+- All 7 pipeline commands: one **byte-identical** preflight `## Preflight — engine link must
+  be healthy` (6 inline checks incl. legacy-copy detection) + silent auto-repair (ln||cp) +
+  legacy-shadow rule (proceed+note on version match, STOP→/setup on drift). Old
+  drift-AskUserQuestion flow deleted; pipeline-status's soft variant folded in. Frontmatter
+  gained Bash(ln/mkdir/cp/readlink:*). Rewrite done via scratchpad script for byte-identity.
+- Engine: `state.mjs` flushPipelineState now stamps `engineVersion: meta.version`;
+  `main.mjs` resume warns (non-blocking) + sets `result._resumeEngineSkew` on skew (symlink
+  tracks plugin, so resume-after-update runs a newer engine). Old states lack the field →
+  silent. Both files now import meta (build strips imports; meta literal emitted first).
+- `build-workflows.mjs` banner scriptPath → `~/.claude/workflows/…`; validate-plugin-versions
+  comment reworded; plugin.json description updated; docs updated (QUICKSTART §2 "No project
+  setup" + upgrade note + new troubleshooting rows, root README, plugin README "Why a doctor
+  command", feature-pipeline.md + feature-pipeline-documentation.md recipes → plugin dir /
+  `~/.claude/workflows`).
+- Tests: new `tests/command-preflight.test.mjs` (byte-identity across 7, user-level markers,
+  no project-path refs except Legacy lines, Bash perms, setup-is-doctor assertions);
+  config-and-state extended (engineVersion optional in validate; flushPipelineState stamp ==
+  engine header); harness CANDIDATES += flushPipelineState. **190 tests green**, rebuild done,
+  validate:build/versions/agents + ESM check all pass at 1.4.2.
 
 ## State
-- Branch `claude/design-review-workflow-hmilx2`; committed + pushed; PR opened.
+- All changes UNCOMMITTED on branch `claude/setup-command-org-37b6c9` (22 modified + 1 new file).
+- Version still 1.4.2 — bump happens via `npm run release -- 1.5.0` (single bump site), NOT hand-edit.
 
 ## Next
-- Dogfood: `/review-design` against an extract-produced docset; then `/tune-feature` on the
-  recorded findings to verify the tunePlanner parses review-written sections end-to-end.
-- Consider a `--max-findings` cap for R3 verification cost on huge docsets.
+1. **SPIKE GATE (required, manual, live session with Workflow tool)** — could not run here (no
+   Workflow tool in this session): (a) `~/.claude/workflows/wf-spike.js` resolves by name?
+   (b) symlink followed? (c) project vs user precedence (expected: project wins → calibrates
+   legacy-shadow warning). If symlinks fail but user-level copies work → Branch B: make the
+   preflight's cp fallback primary (drop readlink/target lines). If user-level fails entirely →
+   design not implementable, revert.
+2. After spike passes: commit, then `npm run release -- 1.5.0`.
+3. Dogfood per plan §verification: fresh project → pipeline-status auto-creates links; break
+   link → self-repair; plant stale legacy copy → STOP→/setup; full /design-feature run;
+   --resume on pre-engineVersion state stays silent.
 - Known residue (pre-existing): Gate 0.2 facts prompt hardcodes Serena project "log_analysis";
-  `workflows/docs/feature-pipeline-documentation.md` still describes the 3-mode engine
-  (lagged since extract too — needs a refresh pass of its own).
+  feature-pipeline-documentation.md still describes the 3-mode engine (needs its own refresh).
+- Plan file: ~/.claude/plans/i-dont-like-how-jolly-widget.md

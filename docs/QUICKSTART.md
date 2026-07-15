@@ -17,20 +17,24 @@ For local development of this repo, add the marketplace from a path instead:
 
 Restart the session so the plugin's commands and agents load.
 
-## 2. One-time project setup
+## 2. No project setup
 
-```
-/feature-workflows:setup
-```
+There is nothing to install into your project. Claude Code's Workflow tool resolves dynamic
+workflows from user-level `~/.claude/workflows/` as well as the project's `.claude/workflows/`;
+the pipeline commands automatically create (and repair) symlinks in `~/.claude/workflows/`
+pointing at the plugin's `feature-pipeline.js` engine and reference docs. Plugin updates
+propagate through the symlinks instantly — no re-install step, no files in your repo.
 
-Why: Claude Code's Workflow tool resolves dynamic workflows **only** from the project's
-`.claude/workflows/` directory — plugins cannot ship workflows directly. `setup` copies the
-`feature-pipeline.js` engine (plus its reference docs) from the plugin into your project and
-validates it as an ES module. Until you run it, the pipeline commands stop at their preflight
-with a "run `/feature-workflows:setup` first" message.
+`/feature-workflows:setup` still exists as a **doctor/repair** command: it diagnoses the
+user-level links (dangling/stale/copy-fallback), recreates them, validates the plugin engine as
+an ES module, and offers to remove legacy per-project copies left by pre-1.5.0 installs.
 
-Consider adding `.claude/workflows/` to your project's `.gitignore` — the installed copy is
-derived from the plugin, not a source of truth.
+### Upgrading from ≤1.4.x
+
+Older versions copied the engine into each project's `.claude/workflows/`. A leftover project
+copy **shadows** the user-level engine, so the command preflights detect it and point you at
+`/feature-workflows:setup`, which removes it (with confirmation). The old advice to gitignore
+`.claude/workflows/` is obsolete — that entry can be dropped once the legacy copy is gone.
 
 ## 3. The design → implement → tune loop
 
@@ -102,15 +106,20 @@ wide scopes are split into per-subsystem slices. The output dir is a ready basel
 
 ```
 /plugin update feature-workflows
-/feature-workflows:setup        # re-copy the engine; preflights warn on version drift until you do
 ```
+
+Nothing else to do — the user-level symlink tracks the plugin, so the next pipeline command
+runs the updated engine (and self-repairs the link if the plugin path changed). Note this also
+means a `--resume` after an update runs the newer engine against state written by the older
+one; the engine logs a version-skew warning on the resumed run when that happens.
 
 ## 5. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| Pipeline command stops with "run /feature-workflows:setup first" | Engine not installed in this project — run `/feature-workflows:setup`. |
-| Preflight warns "installed engine is outdated" | Plugin updated but project copy stale — re-run `/feature-workflows:setup`. |
-| `setup` reports a SyntaxError | The copied engine failed ESM validation — re-install the plugin; if it persists, file an issue. |
+| Pipeline command stops directing you to `/feature-workflows:setup` | Auto-repair could not create the user-level link/copy — run `/feature-workflows:setup` for a diagnosis. |
+| Preflight reports a legacy project copy | Pre-1.5.0 install left `.claude/workflows/` files that shadow the user-level engine — run `/feature-workflows:setup` to remove them. |
+| Symlink creation fails (e.g. Windows without developer mode) | The preflight runs a three-tier repair — `ln -sfn`, then a native Windows `powershell New-Item -ItemType SymbolicLink`, then a `cp` copy — and lands in copy-fallback automatically, re-copying on version drift. Nothing to do; `/feature-workflows:setup` reports which mode is active. To get real symlinks on Windows, enable Developer Mode (Settings → Update & Security → For developers). |
+| `setup` reports a SyntaxError | The plugin engine failed ESM validation — re-install/update the plugin; if it persists, file an issue. |
 | `Workflow` tool not found / workflows disabled | Enable Dynamic workflows in `/config` (requires Claude Code v2.1.154+). |
 | Agents like `feature-workflows:plan-architect` missing | Plugin not installed/enabled, or session not restarted after install. |

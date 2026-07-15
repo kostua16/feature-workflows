@@ -33,7 +33,7 @@ const ENTRIES = [
       '// Gate-enforcing pipeline for new features / bug-fixes.',
       '//',
       '// Run via:',
-      '//   Workflow({ scriptPath: ".claude/workflows/feature-pipeline.js",',
+      '//   Workflow({ scriptPath: "~/.claude/workflows/feature-pipeline.js",  // user-level symlink to the plugin engine',
       '//              args: { task: "...", autoCommit: false, gsdQuick: false } })',
     ],
     modules: [
