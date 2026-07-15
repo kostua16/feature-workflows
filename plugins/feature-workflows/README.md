@@ -22,9 +22,15 @@ Dynamic workflows are not a plugin component, but the Workflow tool resolves use
 go missing, dangle after a plugin move, or (in the copy-fallback mode used where symlinks are
 unavailable, e.g. Windows) drift in `engine-version:`. Nothing is installed into projects.
 `/feature-workflows:setup` is the explicit doctor: it diagnoses the links, recreates them,
-ESM-validates the plugin engine, and removes legacy pre-1.5.0 per-project copies (which shadow
-the user-level engine) after confirmation. Uninstalling the plugin can leave dangling user-level
+ESM-validates the plugin engine, and removes legacy pre-1.5.0 per-project copies (which shadow the
+user-level engine) after confirmation. Uninstalling the plugin can leave dangling user-level
 symlinks behind — harmless; a reinstall's first preflight (or `setup`) repairs them.
+
+The install is cross-platform: the preflight and `setup` try `ln -sfn` (Linux/macOS and Git-Bash on
+Windows with Developer Mode), then a native `powershell New-Item -ItemType SymbolicLink`, then a
+plain `cp` as the universal fallback (used on Windows without Developer Mode, where it auto-resyncs
+on `engine-version:` drift). `$ErrorActionPreference='Stop'` makes any powershell-tier failure fall
+through to the copy.
 
 ## Namespacing
 

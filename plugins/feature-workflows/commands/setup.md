@@ -1,5 +1,5 @@
 ---
-description: Doctor/repair for the feature-pipeline engine install — diagnoses the user-level ~/.claude/workflows/ symlinks, recreates them, validates the plugin engine, and cleans up legacy per-project copies. The pipeline commands self-repair automatically; run this when something looks wrong.
+description: Doctor/repair for the feature-pipeline engine install — diagnoses the user-level ~/.claude/workflows/ symlinks (cross-platform: symlink on Linux/macOS, native Windows symlink attempt, copy fallback), recreates them, validates the plugin engine, and cleans up legacy per-project copies. The pipeline commands self-repair automatically; run this when something looks wrong.
 argument-hint: (no arguments)
 allowed-tools: Bash, AskUserQuestion
 ---
@@ -19,22 +19,39 @@ The three managed targets (paths relative to `~/.claude/workflows/`):
 
 Run these steps via Bash. Report each step's outcome.
 
-1. Diagnose each of the three targets `p` and report one state per file:
+1. Report the environment and diagnose each of the three targets `p`:
+   - OS: `uname -s` (e.g. `Linux`, `Darwin`, `MINGW64_NT-*` = Git Bash on Windows)
+   - Symlink capability:
+     ```
+     d=$(mktemp -d); ln -s "$d" "$d/t" 2>/dev/null && echo SYMLINKS-OK || echo SYMLINKS-UNAVAILABLE; rm -rf "$d"
+     ```
+   - One state per target file:
    - SYMLINK-OK — `[ -L p ]`, target exists, and `readlink p` equals the current plugin path
    - SYMLINK-STALE — `[ -L p ]`, target exists, but `readlink p` points somewhere else
    - DANGLING — `[ -L p ] && [ ! -e p ]` (plugin moved or uninstalled since the link was made)
    - PLAIN-COPY — `[ -e p ] && [ ! -L p ]` (copy fallback in use, e.g. symlinks unavailable)
    - MISSING — `[ ! -e p ] && [ ! -L p ]`
-2. Repair anything that is not SYMLINK-OK:
+2. Repair anything that is not SYMLINK-OK. This runs the same cross-platform three-tier repair the
+   pipeline-command preflights use (tries symlink, then native Windows symlink, then copy):
    ```
-   mkdir -p ~/.claude/workflows/docs
-   ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" ~/.claude/workflows/feature-pipeline.js
-   ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.md" ~/.claude/workflows/feature-pipeline.md
-   ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/docs/feature-pipeline-documentation.md" ~/.claude/workflows/docs/feature-pipeline-documentation.md
+   mkdir -p ~/.claude/workflows/docs \
+     && { ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" ~/.claude/workflows/feature-pipeline.js \
+          && ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.md" ~/.claude/workflows/feature-pipeline.md \
+          && ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/docs/feature-pipeline-documentation.md" ~/.claude/workflows/docs/feature-pipeline-documentation.md ; } \
+     || { command -v powershell >/dev/null 2>&1 && powershell -NoProfile -Command "\$ErrorActionPreference='Stop'; New-Item -ItemType SymbolicLink -Path '$USERPROFILE/.claude/workflows/feature-pipeline.js' -Target '$CLAUDE_PLUGIN_ROOT/workflows/feature-pipeline.js' -Force; New-Item -ItemType SymbolicLink -Path '$USERPROFILE/.claude/workflows/feature-pipeline.md' -Target '$CLAUDE_PLUGIN_ROOT/workflows/feature-pipeline.md' -Force; New-Item -ItemType SymbolicLink -Path '$USERPROFILE/.claude/workflows/docs/feature-pipeline-documentation.md' -Target '$CLAUDE_PLUGIN_ROOT/workflows/docs/feature-pipeline-documentation.md' -Force" ; } \
+     || { cp "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" ~/.claude/workflows/feature-pipeline.js \
+          && cp "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.md" ~/.claude/workflows/feature-pipeline.md \
+          && cp "${CLAUDE_PLUGIN_ROOT}/workflows/docs/feature-pipeline-documentation.md" ~/.claude/workflows/docs/feature-pipeline-documentation.md ; }
    ```
-   If `ln -sfn` fails (e.g. Windows without developer mode), fall back to `cp` of the same three
-   files and report that the install is in copy-fallback mode: the pipeline-command preflights
-   re-copy automatically whenever the copy's `engine-version:` drifts from the plugin's.
+   Then re-check each target: `[ -L p ]` ⇒ SYMLINK mode (real symlink via `ln` tier, or native
+   Windows symlink via the powershell tier); else `[ -e p ]` ⇒ COPY-FALLBACK mode. Report which
+   mode took effect.
+   - **Windows guidance:** to get real symlinks, enable Developer Mode (Settings → Update &
+     Security → For developers). Without it BOTH the `ln` tier and the native `powershell` tier are
+     rejected, so the install lands in copy-fallback mode automatically — that is expected and safe:
+     the pipeline-command preflights re-copy on `engine-version:` drift, so plugin updates still
+     propagate. `$ErrorActionPreference='Stop'` makes any powershell-tier failure fall through to
+     `cp` rather than reporting a misleading success.
 3. Validate the plugin engine as an **ES module**. Plain `node --check` parses CommonJS and
    silently passes invalid ESM — do NOT use it. Run:
    ```
@@ -65,8 +82,9 @@ Run these steps via Bash. Report each step's outcome.
    `.claude/workflows/docs` / `.claude/workflows` directories if now empty). Never delete without
    a yes. Mention that a leftover `.claude/workflows/` entry in the project's `.gitignore` (old
    setup advice) is now unnecessary and can optionally be removed.
-6. Finish with a summary: state of each target (symlink or copy-fallback), engine `<version>`, any
-   legacy copies found/removed, and a reminder that the pipeline commands
+6. Finish with a summary: detected OS + symlink capability, state of each target (symlink or
+   copy-fallback, and which tier took effect), engine `<version>`, any legacy copies found/removed,
+   and a reminder that the pipeline commands
    (`/feature-workflows:design-feature`, `/feature-workflows:implement-feature`,
    `/feature-workflows:tune-feature`, `/feature-workflows:extract-design`,
    `/feature-workflows:review-design`, `/feature-workflows:feature-pipeline`,

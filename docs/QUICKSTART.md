@@ -119,7 +119,7 @@ one; the engine logs a version-skew warning on the resumed run when that happens
 |---|---|
 | Pipeline command stops directing you to `/feature-workflows:setup` | Auto-repair could not create the user-level link/copy — run `/feature-workflows:setup` for a diagnosis. |
 | Preflight reports a legacy project copy | Pre-1.5.0 install left `.claude/workflows/` files that shadow the user-level engine — run `/feature-workflows:setup` to remove them. |
-| Symlink creation fails (e.g. Windows without developer mode) | The preflight falls back to a user-level copy automatically and re-copies on version drift — nothing to do; `/feature-workflows:setup` reports which mode is active. |
+| Symlink creation fails (e.g. Windows without developer mode) | The preflight runs a three-tier repair — `ln -sfn`, then a native Windows `powershell New-Item -ItemType SymbolicLink`, then a `cp` copy — and lands in copy-fallback automatically, re-copying on version drift. Nothing to do; `/feature-workflows:setup` reports which mode is active. To get real symlinks on Windows, enable Developer Mode (Settings → Update & Security → For developers). |
 | `setup` reports a SyntaxError | The plugin engine failed ESM validation — re-install/update the plugin; if it persists, file an issue. |
 | `Workflow` tool not found / workflows disabled | Enable Dynamic workflows in `/config` (requires Claude Code v2.1.154+). |
 | Agents like `feature-workflows:plan-architect` missing | Plugin not installed/enabled, or session not restarted after install. |

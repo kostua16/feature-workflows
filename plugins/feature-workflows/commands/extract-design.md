@@ -1,7 +1,7 @@
 ---
 description: EXTRACT flow — reverse-engineer design docs (code facts -> e2e use cases -> detailed design -> architecture [-> requirements]) from existing code, slice by slice; audit for design debt. Output is a /tune-feature- and /design-feature-compatible baseline.
 argument-hint: <scope: free text, paths/globs, or entry points> [--plan=PLAN_PATH] [--profile=full|standard|light] [--no-confirm] [--no-decompose] [--max-slices=N] [--slices=id1,id2] [--no-audit] [--no-requirements] [--no-review] [--no-e2e] [--no-arch] [--no-design] [--no-enhancer] [--no-quick-decider] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--decision-cap=N] [--retries=N] [--timestamp=TS] [--resume <planDir>]
-allowed-tools: Workflow, AskUserQuestion, Read, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*)
+allowed-tools: Workflow, AskUserQuestion, Read, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*)
 ---
 
 Run the `feature-pipeline` workflow in **extract mode** — the reverse flow that explores EXISTING
@@ -21,24 +21,31 @@ ready baseline for `/tune-feature <dir>` (fix audit findings) and `/design-featu
 - Plugin engine version: !`grep -m1 "engine-version:" "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" 2>/dev/null || echo unknown`
 - Legacy project copy: !`test -e .claude/workflows/feature-pipeline.js && echo LEGACY-COPY-PRESENT || echo none`
 - Legacy copy version: !`grep -m1 "engine-version:" .claude/workflows/feature-pipeline.js 2>/dev/null || echo none`
+- OS: !`uname -s 2>/dev/null || echo unknown`
+- Symlink capability: !`d=$(mktemp -d); ln -s "$d" "$d/t" 2>/dev/null && echo SYMLINKS-OK || echo SYMLINKS-UNAVAILABLE; rm -rf "$d"`
 
 (`test -e` follows symlinks, so a dangling link reports ABSENT.) Then:
 
 1. **Auto-repair (silent — do not ask):** if the engine link is ABSENT, or the link target differs
    from `${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js`, or it is `not-a-symlink` (copy
-   fallback) and the installed/plugin versions differ, run:
+   fallback) and the installed/plugin versions differ, run the cross-platform repair (tries
+   symlink, then native Windows symlink, then copy):
    ```
    mkdir -p ~/.claude/workflows/docs \
      && { ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" ~/.claude/workflows/feature-pipeline.js \
           && ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.md" ~/.claude/workflows/feature-pipeline.md \
           && ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/docs/feature-pipeline-documentation.md" ~/.claude/workflows/docs/feature-pipeline-documentation.md ; } \
+     || { command -v powershell >/dev/null 2>&1 && powershell -NoProfile -Command "\$ErrorActionPreference='Stop'; New-Item -ItemType SymbolicLink -Path '$USERPROFILE/.claude/workflows/feature-pipeline.js' -Target '$CLAUDE_PLUGIN_ROOT/workflows/feature-pipeline.js' -Force; New-Item -ItemType SymbolicLink -Path '$USERPROFILE/.claude/workflows/feature-pipeline.md' -Target '$CLAUDE_PLUGIN_ROOT/workflows/feature-pipeline.md' -Force; New-Item -ItemType SymbolicLink -Path '$USERPROFILE/.claude/workflows/docs/feature-pipeline-documentation.md' -Target '$CLAUDE_PLUGIN_ROOT/workflows/docs/feature-pipeline-documentation.md' -Force" ; } \
      || { cp "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" ~/.claude/workflows/feature-pipeline.js \
           && cp "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.md" ~/.claude/workflows/feature-pipeline.md \
           && cp "${CLAUDE_PLUGIN_ROOT}/workflows/docs/feature-pipeline-documentation.md" ~/.claude/workflows/docs/feature-pipeline-documentation.md ; }
    ```
-   Symlink is preferred; the plain copy is the fallback where symlinks are unavailable (e.g.
-   Windows without developer mode) — in copy mode this same rule re-copies on version drift. Only
-   if BOTH the `ln` and `cp` forms fail: STOP and direct the user to `/feature-workflows:setup`.
+   Tier 1 (`ln -sfn`) covers Linux/macOS and Git-Bash-with-Windows-developer-mode; tier 2
+   (`powershell New-Item -ItemType SymbolicLink`) is the native Windows attempt, tried only where
+   `ln` fails but symlink privilege still exists; tier 3 (`cp`) is the universal fallback used when
+   symlinks are unavailable (Windows without developer mode). `$ErrorActionPreference='Stop'` makes
+   any tier-2 failure fall through to `cp`. In copy mode this same rule re-copies on version drift.
+   Only if ALL THREE tiers fail: STOP and direct the user to `/feature-workflows:setup`.
 2. **Legacy shadow:** if LEGACY-COPY-PRESENT, a pre-1.5.0 project-level copy shadows the
    user-level engine. If the legacy copy version matches the plugin engine version, proceed but
    note the leftover copy and recommend `/feature-workflows:setup` to clean it up. If it differs,
