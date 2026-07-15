@@ -1,7 +1,7 @@
 ---
 description: FIX flow — read issues-and-improvements.md -> derive minimal gate-revisit plan -> refine those design gates in place -> preserve done stages -> re-enable designReady. Then re-run /implement-feature.
 argument-hint: <planDir> [--no-confirm] [--no-reconcile] [--no-enhancer] [--no-quick-decider] [--decision-cap=N] [--retries=N] [--max-reconcile-iterations=N]
-allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*)
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*), Bash(mktemp:*), Bash(rm:*)
 ---
 
 Run the `feature-pipeline` workflow in **tune mode** — the FIX flow that consumes

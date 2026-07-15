@@ -73,7 +73,7 @@ test('every pipeline command grants the Bash verbs the auto-repair needs', () =>
   for (const file of PIPELINE_COMMANDS) {
     const tools = read(file).match(/^allowed-tools: (.+)$/m)
     assert.ok(tools, `${file}: allowed-tools line missing`)
-    for (const perm of ['Bash(ln:*)', 'Bash(mkdir:*)', 'Bash(cp:*)', 'Bash(readlink:*)', 'Bash(test:*)', 'Bash(grep:*)', 'Bash(uname:*)', 'Bash(powershell:*)']) {
+    for (const perm of ['Bash(ln:*)', 'Bash(mkdir:*)', 'Bash(cp:*)', 'Bash(readlink:*)', 'Bash(test:*)', 'Bash(grep:*)', 'Bash(uname:*)', 'Bash(powershell:*)', 'Bash(mktemp:*)', 'Bash(rm:*)']) {
       assert.ok(tools[1].includes(perm), `${file}: allowed-tools must include ${perm}`)
     }
   }

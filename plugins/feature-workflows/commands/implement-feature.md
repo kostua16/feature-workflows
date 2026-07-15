@@ -1,7 +1,7 @@
 ---
 description: DO flow — author tests -> execute stages -> test -> code-review -> decide -> commit. On upstream defect writes issues-and-improvements.md and stops (run /tune-feature). Requires prior /design-feature.
 argument-hint: <planDir> [--stage=stageNN] [--from-gate=execute|tests] [--target=TEST_TARGET] [--test-cmd=CMD] [--test-framework=NAME] [--profile=full|standard|light] [--fresh-budget] [--auto-commit] [--no-test-writer] [--no-issues] [--no-gsd-debug] [--no-publish] [--no-persist] [--no-goalkeeper] [--no-quick-decider] [--no-enhancer] [--no-parallel] [--decision-cap=N] [--retries=N] [--debug-retries=N] [--gsd-quick]
-allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*)
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*), Bash(mktemp:*), Bash(rm:*)
 ---
 
 Run the `feature-pipeline` workflow in **implement mode** — the DO flow that writes/validates tests,

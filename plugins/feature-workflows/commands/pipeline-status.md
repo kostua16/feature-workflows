@@ -1,7 +1,7 @@
 ---
 description: Read-only status report for a feature-pipeline run — mode, gates done/blocked, stage table, budgets used, telemetry, open questions, and the exact next command.
 argument-hint: <planDir>
-allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*)
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*), Bash(mktemp:*), Bash(rm:*)
 ---
 
 Run the `feature-pipeline` workflow in **status mode** — a strictly read-only inspection of a

@@ -1,7 +1,7 @@
 ---
 description: INSPECT flow — audit an existing planDir design docset through parallel review lenses (consistency/completeness/feasibility/testability/scope) -> adversarially verify -> design-review.md report + tune-consumable issues-and-improvements.md. Then run /tune-feature to fix.
 argument-hint: <planDir> [--lenses=key1,key2] [--min-severity=blocker|high|medium|low] [--no-verify] [--no-enhancer] [--no-quick-decider] [--decision-cap=N] [--retries=N]
-allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*)
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*), Bash(mktemp:*), Bash(rm:*)
 ---
 
 Run the `feature-pipeline` workflow in **review mode** — the INSPECT flow that audits an EXISTING

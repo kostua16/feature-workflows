@@ -1,7 +1,7 @@
 ---
 description: Convenience alias — runs /design-feature then instructs /implement-feature (split engine). Design THINK flow only by default; add --auto-implement to chain into the DO flow (implies --auto-commit off unless --auto-commit).
 argument-hint: <task description> [--auto-implement] [--yes] [--auto-commit] [--target=TEST_TARGET] [--plan=PLAN_PATH] [--definition=DEF_PATH] [--gsd-quick] [--no-chunker] [--no-gsd-debug] [--no-test-writer] [--no-knowledge] [--no-arch] [--no-design] [--no-e2e] [--no-tdd-enforce] [--no-reconcile] [--no-publish] [--no-persist] [--no-interview] [--no-parallel] [--no-translator] [--no-categorizer] [--no-requirements] [--no-explorer] [--no-enhancer] [--no-goalkeeper] [--no-quick-decider] [--decision-cap=N] [--timestamp=TS] [--retries=N] [--debug-retries=N] [--max-reconcile-iterations=N] [--resume <planDir>]
-allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*)
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*), Bash(mktemp:*), Bash(rm:*)
 ---
 
 Run the `feature-pipeline` workflow in **design mode** — the THINK-only flow. This is the convenience
