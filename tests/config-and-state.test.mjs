@@ -3,6 +3,7 @@
 //   EN-2 validatePipelineState, IM-1 stateChecksum, and writeChunkedFile chunking.
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { engine } from './harness.mjs'
 
 const {
@@ -14,6 +15,7 @@ const {
   validatePipelineState,
   stateChecksum,
   writeChunkedFile,
+  flushPipelineState,
   consolidate,
   retryState,
   decisionState,
@@ -181,6 +183,32 @@ test('validatePipelineState: absent checksum still passes (backward-compat)', ()
   const s = goodState()
   assert.equal(s.checksum, undefined)
   assert.equal(validatePipelineState(s).ok, true)
+})
+
+test('validatePipelineState: engineVersion is optional — absent (pre-1.5.0) and present both pass', () => {
+  const withoutVersion = goodState()
+  assert.equal(withoutVersion.engineVersion, undefined)
+  assert.equal(validatePipelineState(withoutVersion).ok, true)
+  const withVersion = goodState()
+  withVersion.engineVersion = '1.4.2'
+  assert.equal(validatePipelineState(withVersion).ok, true)
+})
+
+// ---- flushPipelineState: engineVersion stamp --------------------------------
+
+test('flushPipelineState: payload stamps engineVersion matching the engine header', async () => {
+  const calls = []
+  globalThis.agent = async (prompt, opts) => { calls.push({ prompt, label: opts.label }); return { ok: true } }
+  const result = { task: 't', slug: 's', planPath: 'docs/x/plan.md', logLines: [] }
+  await flushPipelineState('docs/x/', result, { mode: 'design' })
+  assert.ok(calls.length >= 1, 'state flush must go through the file-writer agent')
+  const m = calls[0].prompt.match(/"engineVersion":\s*"([^"]+)"/)
+  assert.ok(m, 'pipeline-state payload must include engineVersion')
+  const header = readFileSync(
+    new URL('../plugins/feature-workflows/workflows/feature-pipeline.js', import.meta.url),
+    'utf8'
+  ).match(/^\/\/ engine-version:\s*(\S+)/m)
+  assert.equal(m[1], header[1], 'stamped engineVersion must equal the engine-version header')
 })
 
 // ---- writeChunkedFile chunking ---------------------------------------------

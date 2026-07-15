@@ -1,3 +1,4 @@
+import { meta } from './meta/feature-pipeline.meta.mjs'
 import { DEFINE_VERDICT, TRANSLATOR_VERDICT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, RECONCILE_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT } from './schemas.mjs'
 import { RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECONCILE_SUBCAP_DEFAULT, DECISION_CAP_DEFAULT, resolveProfile, resolveConfigFlag, profileDefault, resolveUseTestWriter, retryState, budgetExhausted, spendRetry, hydrateBudget, decisionState, decisionBudgetExhausted, gm, resolveMode, gateModeActive } from './config.mjs'
 import { taskSlug, categorizeSlug, jiraIdFromTask, detectNonEnglish } from './text-utils.mjs'
@@ -450,6 +451,13 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (result.extractReady === undefined) result.extractReady = false
     if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
+    // The user-level install is a symlink that tracks the plugin, so a resume after a
+    // plugin update runs a newer engine than the one that wrote this state. Surface the
+    // skew without blocking; pre-1.5.0 state files lack engineVersion and stay silent.
+    if (resumed.engineVersion && resumed.engineVersion !== meta.version) {
+      result._resumeEngineSkew = { saved: resumed.engineVersion, current: meta.version }
+      plog(`--resume: engine version skew — state written by ${resumed.engineVersion}, running ${meta.version}; artifacts/gate contracts may differ`)
+    }
     const resumeRepairs = await repairResumeArtifactFlags(result)
     for (const repair of resumeRepairs) {
       plog(`resume-repair: cleared ${repair} because artifact verification failed`)

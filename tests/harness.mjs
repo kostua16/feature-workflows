@@ -55,6 +55,7 @@ const CANDIDATES = [
   'bumpGateTelemetry',
   'renderTelemetrySummary',
   'summarizeGates',
+  'flushPipelineState',
   'deriveNextCommand',
   'renderStatusReport',
   'selectBlockingFindings',

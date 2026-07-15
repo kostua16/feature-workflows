@@ -4,7 +4,7 @@
 // Gate-enforcing pipeline for new features / bug-fixes.
 //
 // Run via:
-//   Workflow({ scriptPath: ".claude/workflows/feature-pipeline.js",
+//   Workflow({ scriptPath: "~/.claude/workflows/feature-pipeline.js",  // user-level symlink to the plugin engine
 //              args: { task: "...", autoCommit: false, gsdQuick: false } })
 
 export const meta = {
@@ -1525,6 +1525,10 @@ async function flushPipelineState(planDir, result, config) {
     planPath: result.planPath,
     planDir,
     lastGate: (result._state && result._state.lastGate) || null,
+    // Engine version that wrote this state. Installs track the plugin (user-level
+    // symlink), so a later --resume may run a newer engine; the resume path warns
+    // on skew instead of hydrating silently. Absent on pre-1.5.0 state files.
+    engineVersion: meta.version,
     // IM-1: integrity checksum over the serialized result, verified by
     // validatePipelineState() on resume to detect a truncated chunked write.
     checksum: stateChecksum(JSON.stringify(result)),
@@ -4290,6 +4294,13 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (result.extractReady === undefined) result.extractReady = false
     if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
+    // The user-level install is a symlink that tracks the plugin, so a resume after a
+    // plugin update runs a newer engine than the one that wrote this state. Surface the
+    // skew without blocking; pre-1.5.0 state files lack engineVersion and stay silent.
+    if (resumed.engineVersion && resumed.engineVersion !== meta.version) {
+      result._resumeEngineSkew = { saved: resumed.engineVersion, current: meta.version }
+      plog(`--resume: engine version skew — state written by ${resumed.engineVersion}, running ${meta.version}; artifacts/gate contracts may differ`)
+    }
     const resumeRepairs = await repairResumeArtifactFlags(result)
     for (const repair of resumeRepairs) {
       plog(`resume-repair: cleared ${repair} because artifact verification failed`)

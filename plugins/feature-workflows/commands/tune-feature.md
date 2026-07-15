@@ -1,7 +1,7 @@
 ---
 description: FIX flow — read issues-and-improvements.md -> derive minimal gate-revisit plan -> refine those design gates in place -> preserve done stages -> re-enable designReady. Then re-run /implement-feature.
 argument-hint: <planDir> [--no-confirm] [--no-reconcile] [--no-enhancer] [--no-quick-decider] [--decision-cap=N] [--retries=N] [--max-reconcile-iterations=N]
-allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*)
+allowed-tools: Workflow, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*)
 ---
 
 Run the `feature-pipeline` workflow in **tune mode** — the FIX flow that consumes
@@ -12,18 +12,37 @@ a minimal design-gate revisit plan, refines
 only those gates in place, preserves completed plan stages, then re-enables `designReady` so you
 can re-run `/implement-feature`.
 
-## Preflight — engine must be installed
+## Preflight — engine link must be healthy
 
-- Engine installed: !`test -f .claude/workflows/feature-pipeline.js && echo INSTALLED || echo MISSING`
-- Installed engine version: !`grep -m1 "engine-version:" .claude/workflows/feature-pipeline.js 2>/dev/null || echo none`
+- Engine link: !`test -e ~/.claude/workflows/feature-pipeline.js && echo PRESENT || echo ABSENT`
+- Link target: !`readlink ~/.claude/workflows/feature-pipeline.js 2>/dev/null || echo not-a-symlink`
+- Installed engine version: !`grep -m1 "engine-version:" ~/.claude/workflows/feature-pipeline.js 2>/dev/null || echo none`
 - Plugin engine version: !`grep -m1 "engine-version:" "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" 2>/dev/null || echo unknown`
+- Legacy project copy: !`test -e .claude/workflows/feature-pipeline.js && echo LEGACY-COPY-PRESENT || echo none`
+- Legacy copy version: !`grep -m1 "engine-version:" .claude/workflows/feature-pipeline.js 2>/dev/null || echo none`
 
-If the engine is MISSING: tell the user to run `/feature-workflows:setup` first and STOP — do not
-call the Workflow tool. If the two versions differ: STOP before calling the Workflow tool — an
-outdated installed engine's agent/gate contract may not match the plugin's registered agents and
-would fail mid-pipeline instead of at preflight. Ask the user (AskUserQuestion) to either re-run
-`/feature-workflows:setup` first (recommended) or explicitly proceed with the outdated engine;
-only call the Workflow tool after setup has been re-run or the user explicitly chose to proceed.
+(`test -e` follows symlinks, so a dangling link reports ABSENT.) Then:
+
+1. **Auto-repair (silent — do not ask):** if the engine link is ABSENT, or the link target differs
+   from `${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js`, or it is `not-a-symlink` (copy
+   fallback) and the installed/plugin versions differ, run:
+   ```
+   mkdir -p ~/.claude/workflows/docs \
+     && { ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" ~/.claude/workflows/feature-pipeline.js \
+          && ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.md" ~/.claude/workflows/feature-pipeline.md \
+          && ln -sfn "${CLAUDE_PLUGIN_ROOT}/workflows/docs/feature-pipeline-documentation.md" ~/.claude/workflows/docs/feature-pipeline-documentation.md ; } \
+     || { cp "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js" ~/.claude/workflows/feature-pipeline.js \
+          && cp "${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.md" ~/.claude/workflows/feature-pipeline.md \
+          && cp "${CLAUDE_PLUGIN_ROOT}/workflows/docs/feature-pipeline-documentation.md" ~/.claude/workflows/docs/feature-pipeline-documentation.md ; }
+   ```
+   Symlink is preferred; the plain copy is the fallback where symlinks are unavailable (e.g.
+   Windows without developer mode) — in copy mode this same rule re-copies on version drift. Only
+   if BOTH the `ln` and `cp` forms fail: STOP and direct the user to `/feature-workflows:setup`.
+2. **Legacy shadow:** if LEGACY-COPY-PRESENT, a pre-1.5.0 project-level copy shadows the
+   user-level engine. If the legacy copy version matches the plugin engine version, proceed but
+   note the leftover copy and recommend `/feature-workflows:setup` to clean it up. If it differs,
+   STOP and tell the user to run `/feature-workflows:setup` — the stale project copy would run
+   instead of the current engine.
 
 This command REQUIRES a `<planDir>` positional arg and an `issues-and-improvements.md` at that dir.
 The issues file comes from a prior `/implement-feature` run that hit
@@ -104,8 +123,9 @@ Examples:
 ## Editing the workflow script
 
 The canonical engine source lives in the plugin at `plugins/feature-workflows/workflows/feature-pipeline.js`
-(resolved at runtime as `${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js`). The project copy at
-`.claude/workflows/feature-pipeline.js` is installed by `/feature-workflows:setup` and overwritten on
-re-run — edit the plugin source, not the copy. After editing, validate as **ES module** — see the
-**Validation** section in the `feature-pipeline.md` reference next to the engine. Plain `node --check`
-parses as CommonJS and silently passes invalid ESM; use the `--input-type=module` recipe there.
+(resolved at runtime as `${CLAUDE_PLUGIN_ROOT}/workflows/feature-pipeline.js`).
+`~/.claude/workflows/feature-pipeline.js` is a symlink to that plugin engine — auto-created by the
+pipeline commands and by `/feature-workflows:setup` — so edit the plugin source; the symlink
+follows automatically. After editing, validate as **ES module** — see the **Validation** section
+in the `feature-pipeline.md` reference next to the engine. Plain `node --check` parses as CommonJS
+and silently passes invalid ESM; use the `--input-type=module` recipe there.

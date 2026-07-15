@@ -9,13 +9,15 @@ driven by thin slash commands.
 ```
 /plugin marketplace add kostua16/feature-workflows    # or a local clone path for dev: /plugin marketplace add ./
 /plugin install feature-workflows@feature-workflows
-/feature-workflows:setup                              # copies the engine into your project's .claude/workflows/
 /feature-workflows:design-feature <task description>
 ```
 
-`setup` is required once per project: Claude Code resolves dynamic workflows only from the
-project's `.claude/workflows/` directory (plugins cannot ship workflows directly), so the plugin
-installs the engine there. Re-run it after plugin updates. See [docs/QUICKSTART.md](docs/QUICKSTART.md).
+No per-project setup: the pipeline commands auto-create symlinks in user-level
+`~/.claude/workflows/` pointing at the plugin engine (plugins cannot ship workflows directly,
+but the Workflow tool resolves the user-level directory), so nothing is copied into your repo
+and plugin updates propagate instantly. `/feature-workflows:setup` remains as a doctor/repair
+command (diagnose links, clean up legacy pre-1.5.0 project copies).
+See [docs/QUICKSTART.md](docs/QUICKSTART.md).
 
 ## What's here
 
@@ -25,7 +27,7 @@ installs the engine there. Re-run it after plugin updates. See [docs/QUICKSTART.
 | `plugins/feature-workflows/` | The plugin. See its [README](plugins/feature-workflows/README.md). |
 | `plugins/feature-workflows/workflows/feature-pipeline.js` | The engine — a ~6k-line **ES-module** dynamic workflow. ONE engine, SIX modes. |
 | `plugins/feature-workflows/workflows/feature-pipeline.md` | Full reference: gates, inputs, outputs, model tiers, validation. |
-| `plugins/feature-workflows/commands/` | 8 slash commands: `setup` + the 6 pipeline drivers + `pipeline-status`. |
+| `plugins/feature-workflows/commands/` | 8 slash commands: the 6 pipeline drivers + `pipeline-status` + the `setup` doctor. |
 | `plugins/feature-workflows/agents/` | 31 sub-agents (task-definition, arch-design, plan-architect, critical-reviewer, executor, …). |
 | `plugins/feature-workflows/skills/compress-md/` | In-session markdown caveman-compression skill (Node `.mjs` scripts). |
 | `docs/QUICKSTART.md` | End-user install & usage guide. |
@@ -72,8 +74,10 @@ names, so an extracted docset is a ready baseline for `/tune-feature` (fix audit
   `feature-pipeline.md` → *Validation* — plain `node --check` parses as CommonJS and **silently
   passes invalid ESM**.
 - **Committing is opt-in** (`autoCommit` defaults to `false`).
-- **The plugin copy is the source of truth.** The project copy at `.claude/workflows/` is derived
-  (installed by `/feature-workflows:setup`, version-checked by every pipeline command's preflight).
+- **The plugin engine is the source of truth.** The user-level install at `~/.claude/workflows/`
+  is a symlink to it (auto-created and health-checked by every pipeline command's preflight;
+  falls back to an auto-synced copy where symlinks are unavailable). Nothing is installed into
+  consuming projects — a leftover pre-1.5.0 project copy is flagged as a legacy shadow.
 - **No build manifest** (no `package.json` / `pyproject.toml`). Node 25 / Python 3.14 are available;
   `test-runner` is the stack-agnostic test gate for target projects the pipeline operates on.
 
@@ -90,5 +94,6 @@ sed 's/^return final$/\/\/ __sandbox_return__ final/' feature-pipeline.js \
 
 Also run the **phase-label validation** in `feature-pipeline.md` → *Phase-label validation* so
 every `phase('X')` maps to a declared `meta.phases` entry. Bump the version in lockstep
-(`plugin.json`, the `// engine-version:` header, `meta.version`), then re-run
-`/feature-workflows:setup` in consuming projects.
+(`plugin.json`, the `// engine-version:` header, `meta.version`). Consuming setups need no
+re-install — the user-level symlink tracks the plugin (copy-fallback installs re-sync at the
+next command preflight).

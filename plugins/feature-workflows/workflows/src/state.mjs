@@ -1,3 +1,4 @@
+import { meta } from './meta/feature-pipeline.meta.mjs'
 import { TODO_ACK, FILE_ACK, PIPELINE_STATE_READ, ARTIFACT_CHECK } from './schemas.mjs'
 import { nsAgent, retryState, decisionState, gm } from './config.mjs'
 import { safeAgent, renderTelemetrySummary } from './agent-core.mjs'
@@ -256,6 +257,10 @@ async function flushPipelineState(planDir, result, config) {
     planPath: result.planPath,
     planDir,
     lastGate: (result._state && result._state.lastGate) || null,
+    // Engine version that wrote this state. Installs track the plugin (user-level
+    // symlink), so a later --resume may run a newer engine; the resume path warns
+    // on skew instead of hydrating silently. Absent on pre-1.5.0 state files.
+    engineVersion: meta.version,
     // IM-1: integrity checksum over the serialized result, verified by
     // validatePipelineState() on resume to detect a truncated chunked write.
     checksum: stateChecksum(JSON.stringify(result)),
