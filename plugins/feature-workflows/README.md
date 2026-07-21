@@ -45,7 +45,8 @@ lives in `workflows/src/` as real ESM modules (`schemas.mjs`, `config.mjs`, `age
 `state.mjs`, the mode-support modules, `main.mjs`, and the `meta/` literal); the Workflow sandbox
 cannot resolve imports, so `scripts/build-workflows.mjs` (repo root, zero-dep) concatenates them
 into the flat dist script: banner + `export const meta` (version injected from `plugin.json`) +
-module bodies + the sandbox tail. Edit src, then:
+`const ENGINE_VERSION` (same version — sandbox-safe runtime binding) + module bodies + the
+sandbox tail. Edit src, then:
 
 ```
 npm run build            # regenerate workflows/feature-pipeline.js
@@ -53,14 +54,19 @@ npm run validate:build   # fail if the committed dist is stale (also a test + CI
 ```
 
 The builder self-checks every output: duplicate top-level names, unstripped import/export,
-sandbox-forbidden tokens (`require`, `Date.now`, `Math.random`, argless `new Date`), phase-label
-↔ `meta.phases` agreement, and the neutralized ESM syntax check.
+sandbox-forbidden tokens (`require`, `Date.now`, `Math.random`, argless `new Date`, runtime
+`meta.*` property access — the sandbox does not bind `meta`; use `ENGINE_VERSION`),
+phase-label ↔ `meta.phases` agreement, and the neutralized ESM syntax check.
+
+**Sandbox note (issue #17):** `export const meta` is Workflow metadata only. Runtime code must
+use the build-injected `ENGINE_VERSION` constant — never read fields off `meta`.
 
 ## Versioning rule
 
 `.claude-plugin/plugin.json` → `version` is the **single bump site**. The build injects it into
-the dist's `// engine-version:` header and `meta.version`, so all three markers agree by
-construction. Version bumps happen through the release flow — `npm run release -- X.Y.Z` bumps,
+the dist's `// engine-version:` header, `meta.version`, and `ENGINE_VERSION`, so the three
+lockstep markers agree by construction (`ENGINE_VERSION` is a derived mirror, not a fourth
+hand-edited site). Version bumps happen through the release flow — `npm run release -- X.Y.Z` bumps,
 builds, validates, commits, tags, and pins the marketplace catalog to the tag (end users
 install pinned releases, not `main`). See `docs/release-process.md`.
 

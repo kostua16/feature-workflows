@@ -2,11 +2,12 @@
 //
 // The Workflow sandbox cannot resolve imports, so each dist file is a flat
 // concatenation: banner -> `export const meta` literal (version injected from
-// plugin.json) -> module bodies in manifest order -> the sandbox tail
-// (`const final = await main()` / `return final`). Source modules use real ESM
-// import/export so Node (and the test harness) can import them directly; the
-// import lines and the trailing `export { ... }` list are STRIPPED at build time,
-// everything else is emitted verbatim.
+// plugin.json) -> `const ENGINE_VERSION` (same version; sandbox-safe runtime
+// binding — issue #17: sandbox does not bind `meta`) -> module bodies in
+// manifest order -> the sandbox tail (`const final = await main()` / `return final`).
+// Source modules use real ESM import/export so Node (and the test harness) can
+// import them directly; the import lines and the trailing `export { ... }` list
+// are STRIPPED at build time, everything else is emitted verbatim.
 //
 // Usage:
 //   node scripts/build-workflows.mjs           # write dist file(s)
@@ -22,6 +23,8 @@ if (!version) throw new Error('plugin.json has no version')
 // One entry today (stage 1: single engine). Stage 2 adds per-mode entries here;
 // `modules` is the emit order (original engine order — function decls hoist, but
 // top-level const initializers may only reference EARLIER modules).
+// NOTE: src/engine-version.mjs is Node-only (import target for state/main). It must
+// NEVER be listed in modules[] — dist gets the injected ENGINE_VERSION const instead.
 const ENTRIES = [
   {
     out: 'feature-pipeline.js',
@@ -68,8 +71,13 @@ for (const entry of ENTRIES) {
   metaSrc = metaSrc.replace(/version: '[^']*',[^\n]*/, `version: '${version}',`)
   if (!metaSrc.includes(`version: '${version}',`)) throw new Error(`${entry.meta}: no version field to inject`)
 
+  const engineVersionDecl = `const ENGINE_VERSION = '${version}';`
+
   // ---- module bodies: strip import lines + the export list, keep the rest verbatim
   const seen = new Map()
+  // Injected binding — register before scanning modules so a module redeclaring
+  // ENGINE_VERSION fails with a clear duplicate-name error (issue #17).
+  seen.set('ENGINE_VERSION', '<injected>')
   const bodies = entry.modules.map((file) => {
     const raw = readFileSync(new URL(`src/${file}`, wfRoot), 'utf8')
     if (raw.includes('\r')) throw new Error(`${file}: source module contains CRLF — normalize to LF`)
@@ -94,7 +102,23 @@ for (const entry of ENTRIES) {
     return kept.join('\n')
   })
 
-  const dist = [entry.banner.join('\n'), '', metaSrc, '', bodies.join('\n\n'), '', 'const final = await main()', 'return final', ''].join('\n')
+  const dist = [
+    entry.banner.join('\n'),
+    '',
+    metaSrc,
+    '',
+    engineVersionDecl,
+    '',
+    bodies.join('\n\n'),
+    '',
+    'const final = await main()',
+    'return final',
+    '',
+  ].join('\n')
+
+  if (!dist.includes(engineVersionDecl)) {
+    throw new Error(`${entry.out}: ENGINE_VERSION injection missing`)
+  }
 
   // ---- post-emit self-checks -----------------------------------------------
   // CRLF in the emitted dist blocks Workflow execution (issue #16); the source-module
@@ -108,6 +132,9 @@ for (const entry of ENTRIES) {
     [/\bDate\.now\(/, 'Date.now()'],
     [/\bMath\.random\(/, 'Math.random()'],
     [/\bnew Date\(\)/, 'argless new Date()'],
+    // Whole-dist scan: `export const meta =` does not match. Sandbox does not bind
+    // `meta` at runtime — use ENGINE_VERSION instead (issue #17).
+    [/\bmeta\./, 'runtime meta. access (sandbox does not bind meta; issue #17)'],
   ]) {
     if (re.test(dist)) throw new Error(`${entry.out}: forbidden token (${why})`)
   }
