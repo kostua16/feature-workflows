@@ -429,6 +429,10 @@ A blocked implement (`issues-handoff`) is resumable: after tune updates docs + r
   regex on task text; the slug is derived from task text. Grep guard enforces 0 of each.
 - **No `import` / `require`.** The file is a self-contained ES module. All helpers are
   defined inline. This is why the engine is one file, not three.
+- **`export const meta` is metadata only (issue #17).** The Workflow sandbox does not leave a
+  runtime binding named `meta`. Stamp/skew code must use the build-injected
+  `ENGINE_VERSION` constant. The builder fails the build if the dist contains `meta.*`
+  property access.
 
 ### 9.2 Determinism limits
 

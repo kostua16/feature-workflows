@@ -53,6 +53,8 @@ export const meta = {
   ],
 }
 
+const ENGINE_VERSION = '1.4.4';
+
 // ---- Schemas (JSON Schema) -------------------------------------------------
 
 const DEFINE_VERDICT = {
@@ -1528,7 +1530,9 @@ async function flushPipelineState(planDir, result, config) {
     // Engine version that wrote this state. Installs track the plugin (user-level
     // symlink), so a later --resume may run a newer engine; the resume path warns
     // on skew instead of hydrating silently. Absent on pre-1.5.0 state files.
-    engineVersion: meta.version,
+    // Use ENGINE_VERSION (build-injected), not the meta export binding — the Workflow
+    // sandbox does not bind `export const meta` at runtime (issue #17).
+    engineVersion: ENGINE_VERSION,
     // IM-1: integrity checksum over the serialized result, verified by
     // validatePipelineState() on resume to detect a truncated chunked write.
     checksum: stateChecksum(JSON.stringify(result)),
@@ -1536,6 +1540,17 @@ async function flushPipelineState(planDir, result, config) {
     config,
   }
   return writeChunkedFile(statePath, JSON.stringify(payload, null, 2), 'file-writer:pipeline-state', result)
+}
+
+// Pure: compare a resumed state's engineVersion to the running engine. Returns
+// {saved, current} when both are present and differ; otherwise null. Pre-1.5.0
+// state files omit engineVersion and stay silent. Used by --resume (issue #17:
+// must not read the meta export binding — sandbox leaves meta unbound).
+function detectResumeEngineSkew(savedVersion, currentVersion) {
+  if (savedVersion && savedVersion !== currentVersion) {
+    return { saved: savedVersion, current: currentVersion }
+  }
+  return null
 }
 
 // Load <planDir>/pipeline-state.json for --resume. Returns { state: <obj|null> }
@@ -4297,9 +4312,11 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     // The user-level install is a symlink that tracks the plugin, so a resume after a
     // plugin update runs a newer engine than the one that wrote this state. Surface the
     // skew without blocking; pre-1.5.0 state files lack engineVersion and stay silent.
-    if (resumed.engineVersion && resumed.engineVersion !== meta.version) {
-      result._resumeEngineSkew = { saved: resumed.engineVersion, current: meta.version }
-      plog(`--resume: engine version skew — state written by ${resumed.engineVersion}, running ${meta.version}; artifacts/gate contracts may differ`)
+    // Use ENGINE_VERSION (not the meta export binding) — sandbox does not bind meta (issue #17).
+    const skew = detectResumeEngineSkew(resumed.engineVersion, ENGINE_VERSION)
+    if (skew) {
+      result._resumeEngineSkew = skew
+      plog(`--resume: engine version skew — state written by ${skew.saved}, running ${skew.current}; artifacts/gate contracts may differ`)
     }
     const resumeRepairs = await repairResumeArtifactFlags(result)
     for (const repair of resumeRepairs) {

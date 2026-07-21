@@ -1,4 +1,4 @@
-import { meta } from './meta/feature-pipeline.meta.mjs'
+import { ENGINE_VERSION } from './engine-version.mjs'
 import { TODO_ACK, FILE_ACK, PIPELINE_STATE_READ, ARTIFACT_CHECK } from './schemas.mjs'
 import { nsAgent, retryState, decisionState, gm } from './config.mjs'
 import { safeAgent, renderTelemetrySummary } from './agent-core.mjs'
@@ -260,7 +260,9 @@ async function flushPipelineState(planDir, result, config) {
     // Engine version that wrote this state. Installs track the plugin (user-level
     // symlink), so a later --resume may run a newer engine; the resume path warns
     // on skew instead of hydrating silently. Absent on pre-1.5.0 state files.
-    engineVersion: meta.version,
+    // Use ENGINE_VERSION (build-injected), not the meta export binding — the Workflow
+    // sandbox does not bind `export const meta` at runtime (issue #17).
+    engineVersion: ENGINE_VERSION,
     // IM-1: integrity checksum over the serialized result, verified by
     // validatePipelineState() on resume to detect a truncated chunked write.
     checksum: stateChecksum(JSON.stringify(result)),
@@ -268,6 +270,17 @@ async function flushPipelineState(planDir, result, config) {
     config,
   }
   return writeChunkedFile(statePath, JSON.stringify(payload, null, 2), 'file-writer:pipeline-state', result)
+}
+
+// Pure: compare a resumed state's engineVersion to the running engine. Returns
+// {saved, current} when both are present and differ; otherwise null. Pre-1.5.0
+// state files omit engineVersion and stay silent. Used by --resume (issue #17:
+// must not read the meta export binding — sandbox leaves meta unbound).
+function detectResumeEngineSkew(savedVersion, currentVersion) {
+  if (savedVersion && savedVersion !== currentVersion) {
+    return { saved: savedVersion, current: currentVersion }
+  }
+  return null
 }
 
 // Load <planDir>/pipeline-state.json for --resume. Returns { state: <obj|null> }
@@ -348,4 +361,4 @@ async function repairResumeArtifactFlags(result) {
   return repairs
 }
 
-export { consolidate, writeChunkedFile, flushPipelineLog, stateChecksum, validatePipelineState, summarizeGates, deriveNextCommand, renderStatusReport, flushPipelineState, loadPipelineState, verifyArtifactPresence, repairResumeArtifactFlags }
+export { consolidate, writeChunkedFile, flushPipelineLog, stateChecksum, validatePipelineState, summarizeGates, deriveNextCommand, renderStatusReport, flushPipelineState, loadPipelineState, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew }
