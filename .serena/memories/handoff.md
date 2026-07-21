@@ -23,6 +23,16 @@ _Last updated: 2026-07-22 (v1.5.0 milestone initialized and roadmap approved)._
   - `e4d4d05` — `docs: research project-scale extract design`
   - `0155b30` — `docs: define milestone v1.5.0 requirements`
   - `bc3fcea` — `docs: create milestone v1.5.0 roadmap (7 phases)`
+- GitHub issue hierarchy now mirrors the approved roadmap:
+  - Parent milestone issue **#19** — `v1.5.0 Project-Scale Extract Design`
+  - Phase 1 **#20** — State, Coverage, Migration, and Revision Contracts
+  - Phase 2 **#21** — Bounded Discovery, Validated Graph, and Schedulability; includes the
+    required HITL checkpoint for cycle-policy confirmation
+  - Phase 3 **#22** — Multi-Entry Build, Install, and Version Lockstep
+  - Phase 4 **#23** — Checkpointed Feature Leaf
+  - Phase 5 **#24** — Bounded Scheduler and Transactional Automatic Continuation
+  - Phase 6 **#25** — Synthesis, Publish, Persist, and Status Truth
+  - Phase 7 **#26** — Compatibility and Project-Scale Proof
 
 ## Durable architecture decisions
 - The user-facing contract is **one `/feature-workflows:extract-design` command**. Internally, the
@@ -44,10 +54,12 @@ _Last updated: 2026-07-22 (v1.5.0 milestone initialized and roadmap approved)._
   gate; extract-specific graph and queue semantics must not leak into unrelated modes.
 
 ## Next recommended action
-Run `$gsd-plan-phase 1` for **State, Coverage, Migration, and Revision Contracts**. Phase 1 must
-characterize the v1.4.5 migration boundary and revision/digest inputs before schema implementation,
-then establish pure deterministic lifecycle/readiness reducers, root-last migration, sharded state,
-selective invalidation, and RED-first fixtures.
+Begin implementation planning from Phase 1 issue **#20** by running `$gsd-plan-phase 1` for
+**State, Coverage, Migration, and Revision Contracts**. Phase 1 must characterize the v1.4.5
+migration boundary and revision/digest inputs before schema implementation, then establish pure
+deterministic lifecycle/readiness reducers, root-last migration, sharded state, selective
+invalidation, and RED-first fixtures. When work reaches Phase 2 issue **#21**, stop at its HITL
+checkpoint and obtain explicit user confirmation of the cycle policy before proceeding.
 
 Related: `mem:core`, `mem:session_start`, `mem:task_completion`, `mem:conventions`,
 `mem:memory_maintenance`.
