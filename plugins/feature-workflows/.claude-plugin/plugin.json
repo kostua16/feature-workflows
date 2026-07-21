@@ -1,6 +1,6 @@
 {
   "name": "feature-workflows",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "description": "Gate-enforced feature pipeline: THINK (design) -> DO (implement) -> FIX (tune) -> EXTRACT (reverse-engineer design docs from existing code) -> REVIEW (audit an existing design docset and collect issues) + read-only status. Ships the feature-pipeline dynamic-workflow engine (auto-linked into ~/.claude/workflows/ by the pipeline commands; /feature-workflows:setup is the doctor/repair command), 31 specialized sub-agents, and the compress-md skill.",
   "author": {
     "name": "Konstantin Leontyev",
