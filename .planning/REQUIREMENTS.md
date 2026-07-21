@@ -168,8 +168,23 @@ Each v1 requirement is assigned to exactly one owning roadmap phase.
 | COMPAT-01 | Phase 7 | Pending |
 | QUAL-01 | Phase 7 | Pending |
 | DOGFOOD-01 | Phase 7 | Pending |
+| DCKPT-01 | Phase 8 | Pending |
+| DSTATE-01 | Phase 8 | Pending |
+| DRESUME-01 | Phase 8 | Pending |
+| DREADY-01 | Phase 9 | Pending |
+| DHIST-01 | Phase 9 | Pending |
+| DTERM-01 | Phase 9 | Pending |
+| DQUEST-01 | Phase 9 | Pending |
+| DCHUNK-01 | Phase 9 | Pending |
+| DYAGNI-01 | Phase 9 | Pending |
+| DBUDGET-01 | Phase 10 | Pending |
+| DLOOP-01 | Phase 10 | Pending |
+| DPROMPT-01 | Phase 10 | Pending |
+| DTRANS-01 | Phase 11 | Pending |
+| DVERIFY-01 | Phase 11 | Pending |
+| DTEST-01 | Phase 11 | Pending |
 
-**Coverage:** 21/21 original v1 requirements mapped. The 15 design-mode extension requirements (DCKPT-01 through DTEST-01) await phase assignment by the roadmap extension. All 30 approved improvement themes are represented.
+**Coverage:** 36/36 v1 requirements mapped; 0 orphaned; 0 duplicated. All 30 approved improvement themes are represented.
 
 ---
 *Requirements defined: 2026-07-22*  

@@ -4,7 +4,7 @@
 
 ## Overview
 
-Milestone v1.5.0 turns the shipped v1.4.5 extract flow into trustworthy whole-project extraction. It establishes the state and revision contracts first, discovers a bounded schedulable graph, ships both required workflow entries in lockstep, makes each feature a checkpointed leaf, advances work through transactionally acknowledged bounded segments, derives synthesis and readiness from exact coverage, and proves compatibility and scale through installed-plugin E2Es and an observed whole-repository run.
+Milestone v1.5.0 turns the shipped v1.4.5 extract flow into trustworthy whole-project extraction. It establishes the state and revision contracts first, discovers a bounded schedulable graph, ships both required workflow entries in lockstep, makes each feature a checkpointed leaf, advances work through transactionally acknowledged bounded segments, derives synthesis and readiness from exact coverage, and proves compatibility and scale through installed-plugin E2Es and an observed whole-repository run. Phases 8-11 extend the same milestone to `/feature-workflows:design-feature` (and implement/tune where the identical defect is proven), adopting the extract-mode checkpoint, digest/revision, budget, retry-attempt-history, and truthful-readiness primitives from Phases 1-7 to fix the file:line-verified design-mode defects recorded in `.planning/research/DESIGN-MODE-FINDINGS.md`.
 
 The user experience remains one `/feature-workflows:extract-design` command. Internal segmentation exists to respect the one-level composition model and shared call, concurrency, abort, and token limits; every segment is durable and manually resumable even when automatic relaunch is unavailable.
 
@@ -53,6 +53,10 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 - [ ] **Phase 5: Bounded Scheduler and Transactional Automatic Continuation** - Dependency-safe work advances through budgeted, isolated, monotonically acknowledged segments from one command.
 - [ ] **Phase 6: Synthesis, Publish, Persist, and Status Truth** - Bounded verified summaries produce retry-safe project views and one revision-current readiness account.
 - [ ] **Phase 7: Compatibility and Project-Scale Proof** - Continuous mode compatibility, complete E2E characterization, and whole-repository dogfooding prove the promise.
+- [ ] **Phase 8: Design-Mode Durable Checkpoints and Revision-Aware Resume** - Design (and implement/tune where proven) gains gate-level durable persistence, auto-recovering atomic state writes, and digest-driven resume that skips unchanged work.
+- [ ] **Phase 9: Design-Mode Truthful Readiness and Outcome Reporting** - `designReady` and terminal commit/publish/persist outcomes are true only when genuinely earned, and every degraded path is durably recorded and surfaced.
+- [ ] **Phase 10: Design-Mode Bounded Budgets and Prompt Context** - Per-gate/per-run budgets, per-loop retry sub-budgets, and bounded prompt payloads replace observational telemetry and unbounded interpolation.
+- [ ] **Phase 11: Design-Mode Reliability, Verification, and Characterization Proof** - Transient-error backoff, deterministic artifact verification, and end-to-end behavioral tests prove the extended design flow.
 
 ## Phase Details
 
@@ -205,6 +209,86 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
   4. The observed run recovers from an injected gate interruption and duplicate continuation delivery without manual state repair and reaches truthful verified readiness.
 **Plans**: TBD
 
+### Phase 8: Design-Mode Durable Checkpoints and Revision-Aware Resume
+**Goal**: Users whose `/design-feature` run (and implement/tune where the identical coarse-checkpoint loss is proven) is interrupted resume from the last completed material gate, never lose a run to a truncated state file, and pay only for changed work on resume.  
+**Depends on**: Phase 1 (CONTRACT-01 pure reducers, REV-01 durable digest/revision comparison), Phase 4 (CHECKPOINT-01 gate-level before/after acknowledgement pattern), Phase 6 (OBSERVE-01 attempted-vs-durably-verified persistence pattern)  
+**Requirements**: DCKPT-01, DSTATE-01, DRESUME-01  
+**RED Gate**:
+  1. Fault-injection fixtures interrupt the process between design gates (Define, Codebase Facts, E2E Use Cases, Requirements, Architecture, Detailed Design, Plan, Reconcile, Plan Review) and fail because resume restarts from Define despite completed gate artifacts already on disk, since `stateCheckpoint` only advances an in-memory cursor and `flushPipelineState` runs only at hard-block/terminal exits (F1).
+  2. Truncated/partial chunked-state fixtures fail because resume hard-blocks as `resume-invalid-state` with only manual-inspection advice instead of auto-recovering from a last-good snapshot (F2).
+  3. Unchanged-artifact resume and approval-decision fixtures fail because `repairResumeArtifactFlags` re-reads every recorded artifact and edit/reject approval paths re-run unaffected review loops and downstream gates regardless of digest (F3).
+**GREEN Evidence**:
+  1. Design (and implement/tune where proven) gate transitions durably persist state after every material gate using the Phase 4 shared reducer/acknowledgement pattern, and interrupting at any of those points resumes at the first incomplete gate without repeating verified work.
+  2. State writes follow write-verify-acknowledge with a retained last-good snapshot; injected truncation/partial-write faults auto-recover on resume instead of hard-blocking.
+  3. Resume and approval round-trips compare durable digests from the Phase 1 revision contract; unchanged artifacts skip re-verification calls, reviews re-run only when their digested inputs changed, and approval decisions apply without re-running unaffected gates.
+  4. Phases 1-7 evidence and all continuous regression gates remain green.
+**Success Criteria** (what must be TRUE):
+  1. Interrupting a design run between any two material gates resumes at the first incomplete gate with all prior verified artifacts intact and no gate repeated.
+  2. A truncated or partially written state file auto-recovers from the last durably acknowledged snapshot on resume instead of hard-blocking as `resume-invalid-state`.
+  3. Resuming a run or applying an approval decision re-verifies or re-runs only artifacts/reviews whose durable digest changed; unaffected gates and reviews are skipped.
+  4. Implement and tune modes exhibit the same gate-level checkpoint durability wherever the coarse-checkpoint defect is proven present.
+**Plans**: TBD
+
+### Phase 9: Design-Mode Truthful Readiness and Outcome Reporting
+**Goal**: Users see `designReady=true` (and equivalent terminal commit/publish/persist outcomes across modes) only when every underlying gate genuinely passed with no hidden degradation, and every fail-forward, retry, escalation, fallback, open question, chunker degradation, and routed YAGNI blocker is durably recorded and truthfully surfaced.  
+**Depends on**: Phase 5 (RETRY-01 attempt-history persistence pattern), Phase 6 (STATUS-01 truthful readiness derivation, OBSERVE-01 attempted-vs-durable outcome pattern), Phase 8 (durable gate-level state to persist and surface fail-forward/attempt/degradation records)  
+**Requirements**: DREADY-01, DHIST-01, DTERM-01, DQUEST-01, DCHUNK-01, DYAGNI-01  
+**RED Gate**:
+  1. Fail-forward review, force-accepted plan with carried blockers, and unresolved reconcile-conflict fixtures fail because the design terminal sets `designReady=true` without checking `_reviewed*Forced` flags, `forceAccepted`/`carriedBlockers`, or `reconcile.consistent` (F4, F5, F6).
+  2. Commit-failure, publish-failure, and persist-failure fixtures fail because the run still reports terminal success with self-reported unverified booleans (F10).
+  3. Unresolved-open-question, silent chunker single-stage degradation, and `--no-reconcile` BLOCKER-severity YAGNI fixtures fail because completion proceeds without enforcement, degradation is only a log line, and the escalated blocker never reaches `reconcileContext` outside the reconcile branch (F7, F8, F9).
+  4. Attempt-history fixtures fail because retries, escalations, and fallbacks are only tracked as a count and last reason in `agentFailures`, not journaled as durable inspectable state (F16).
+**GREEN Evidence**:
+  1. `designReady=true` (and analogous per-mode readiness) is set only when no review was fail-forwarded, no plan carries force-accepted blockers, reconcile conflicts are resolved, and required artifacts are durably verified; any degraded case reports its exact cause through handoff and status using the Phase 6 truthful-readiness derivation.
+  2. Commit, publish, and persist outcomes distinguish attempted from durably verified results across all modes; a failed commit never yields reported terminal success.
+  3. Unresolved open questions block design completion unless explicitly deferred with recorded evidence; chunker single-stage degradation is an explicit acknowledged outcome; BLOCKER-severity YAGNI findings reach the plan reviewer even with reconcile disabled.
+  4. Every fail-forward, retry, escalation, and fallback is persisted as durable attempt-history state (extending the Phase 5 attempt-history pattern) and exposed through handoff and read-only status.
+  5. Phases 1-8 evidence and all continuous regression gates remain green.
+**Success Criteria** (what must be TRUE):
+  1. `designReady=true` never occurs alongside a fail-forwarded review, a force-accepted plan with carried blockers, or an unresolved reconcile conflict; the exact degraded cause is reported instead.
+  2. A failed commit, publish, or persist step is never reported as terminal success; attempted and durably verified outcomes are distinguishable in the handoff.
+  3. Unresolved open questions block completion unless explicitly deferred with recorded evidence, plan-chunker degradation requires explicit acknowledgement, and BLOCKER-severity YAGNI findings reach the plan reviewer regardless of the reconcile flag.
+  4. A user can inspect a durable, attempt-numbered history of every fail-forward, retry, escalation, and fallback with reasons through handoff and status surfaces.
+**Plans**: TBD
+
+### Phase 10: Design-Mode Bounded Budgets and Prompt Context
+**Goal**: Users' design runs enforce real per-gate and per-run call/token budgets with reserved capacity for state persistence and handoff, prevent early review/refine loops from starving later gates, and keep every design-gate prompt bounded regardless of accumulated conflicts, blockers, or fixes.  
+**Depends on**: Phase 5 (BUDGET-01 enforced budget/reserve pattern), Phase 8 (durable checkpoint reserve accounting for state-flush capacity)  
+**Requirements**: DBUDGET-01, DLOOP-01, DPROMPT-01  
+**RED Gate**:
+  1. Call/token accounting fixtures fail because `gateTelemetry` only counts and never enforces a per-gate or per-run cap, and no capacity is reserved for state flush/handoff (F11).
+  2. Multi-loop budget-starvation fixtures fail because all four design review/refine loops spend from one shared global retry budget and `ESCALATION_RETRIES=5` is hardcoded rather than configurable (F12).
+  3. Large-conflict/blocker/fix-payload fixtures fail because reconcile conflicts, review blockers, and design fixes are interpolated into prompts via raw `JSON.stringify` without the existing `compactList` hygiene applied (F13).
+**GREEN Evidence**:
+  1. Per-gate and per-run call/token budgets are enforced (not merely observed) using the Phase 5 BUDGET-01 pattern, with non-spendable reserve carved out for state persistence and handoff.
+  2. Each design review/refine loop draws from its own bounded sub-budget so early-loop spend cannot starve later gates or escalation; escalation retry limits are configurable rather than hardcoded.
+  3. Conflict, blocker, and fix payloads interpolated into design-gate prompts are capped and compacted using the existing `compactList` prompt-hygiene helper before interpolation.
+  4. Phases 1-9 evidence and all continuous regression gates remain green.
+**Success Criteria** (what must be TRUE):
+  1. A design run that would exceed a characterized per-gate or per-run call/token budget stops with a truthful handoff before exhausting shared capacity, and reserved capacity for state flush/handoff is never spent by gate work.
+  2. An early design review/refine loop that spends heavily cannot reduce the budget available to a later loop or to plan-review escalation; escalation retry limits are configurable.
+  3. A design-gate prompt built from a large accumulated set of conflicts, blockers, or fixes stays within the same bounded size discipline already applied to implement/executor prompts.
+**Plans**: TBD
+
+### Phase 11: Design-Mode Reliability, Verification, and Characterization Proof
+**Goal**: Users' blocking design gates survive transient provider/network errors, artifact-presence and append-growth checks are deterministic rather than self-reported, and the extended design flow — gate sequence, review loop, agent retry ladder, crash-resume, partial state writes — is proven end to end by behavioral characterization tests.  
+**Depends on**: Phase 1 (REV-01 digest/revision contract for deterministic verification), Phase 6 (OBSERVE-01/STATUS-01 verified-persistence and readiness pattern), Phase 7 (QUAL-01 characterization evidence model), Phase 8 (durable checkpoint/resume behavior under test), Phase 9 (truthful outcome behavior under test), Phase 10 (bounded budget/retry-ladder behavior under test)  
+**Requirements**: DTRANS-01, DVERIFY-01, DTEST-01  
+**RED Gate**:
+  1. Transient-error injection fixtures (non-schema throw: network/provider error) fail because `flexibleAgent` treats any non-schema failure as immediately fatal with no backoff retry, hard-blocking every blocking design gate on the first transient error (F14).
+  2. Hallucinated-verification fixtures fail because `verifyArtifactPresence` and `verifyAppendGrowth` trust an LLM file-reader/writer's self-reported existence/size rather than the shared digest/revision contract, so a fabricated existence claim passes a missing artifact and an under-report false-blocks a present one (F15).
+  3. No behavioral test currently exercises the design gate sequence end to end, the review loop, the agent retry ladder, crash-resume without a flushed state, or partial state writes — each fixture fails for lack of coverage until added (F17).
+**GREEN Evidence**:
+  1. The shared agent core classifies failures as transient, schema, or fatal and applies bounded backoff retries to transient errors before converting them to a hard block, across all modes.
+  2. Artifact-presence and append-growth verification is derived deterministically from the Phase 1 digest/revision contract rather than trusted agent self-reports; a hallucinated existence claim can no longer pass a missing artifact, and an under-reported size can no longer false-block a present one.
+  3. Behavioral characterization tests cover the design gate sequence, review loop, agent retry ladder (including the new transient classification), crash-resume from an unflushed state (using the Phase 8 checkpoint contract), and partial/truncated state writes, following the milestone's RED/GREEN evidence model.
+  4. Phases 1-10 evidence and all continuous regression gates remain green.
+**Success Criteria** (what must be TRUE):
+  1. A transient provider/network error on a blocking design gate is retried with bounded backoff and only hard-blocks after those retries are exhausted, not on the first non-schema failure.
+  2. Artifact-presence and append-growth checks pass or fail based on the shared digest/revision contract; a hallucinated agent self-report can neither pass a missing artifact nor false-block a present one.
+  3. The design gate sequence, review loop, agent retry ladder, crash-resume without a flushed state, and partial state writes each have passing behavioral characterization tests with recorded RED-then-GREEN evidence.
+**Plans**: TBD
+
 ## Exact E2E Matrix
 
 | ID | Owning phase | Surface and fixture | Required observable outcome |
@@ -229,10 +313,25 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 | E2E-STATUS-01 | 6 | Partial/deferred/blocked/failed/skipped, stale revision, invalid graph, missing synthesis, and complete project | Handoff and read-only status agree exactly; only the complete current-revision case is ready. |
 | E2E-COMPAT-01 | 7 | Design resume, implement, tune, review, and status against v1.4.5 migration and v1.5 completed shards | Established gates/artifacts/handoffs work without state loss or extract-specific behavior leaking into other modes. |
 | E2E-DOGFOOD-01 | 7 | Whole repository's full natural inventory, multiple segments, injected interruption and duplicate continuation | One command reaches verified whole-project readiness below runtime limits with complete durable evidence. |
+| E2E-DCKPT-01 | 8 | Interrupt design (and implement/tune where the coarse-checkpoint loss is proven) mid-chain between each material gate | Resume starts at the first incomplete gate with every prior verified artifact intact; no gate is repeated. |
+| E2E-DSTATE-01 | 8 | Inject truncated/partial chunked state write at each write boundary | Resume auto-recovers from the last durably acknowledged snapshot instead of hard-blocking as `resume-invalid-state`. |
+| E2E-DRESUME-01 | 8 | Resume and apply accept/edit-stages/reject approval decisions against unchanged and digest-changed artifacts | Unchanged artifacts skip re-verification calls; only digest-changed reviews/gates re-run; approval decisions apply without re-running unaffected gates. |
+| E2E-DREADY-01 | 9 | Fail-forwarded review, force-accepted plan with carried blockers, unresolved reconcile conflict | `designReady=true` never occurs in any case; the exact degraded cause is reported instead. |
+| E2E-DHIST-01 | 9 | Multiple fail-forwards, retries, model escalations, and fallbacks across one run | Handoff and read-only status surface a durable, attempt-numbered history with reasons for every event. |
+| E2E-DTERM-01 | 9 | Inject commit failure, publish failure, and persist failure independently | Terminal success is never reported over the failed step; attempted vs durably verified outcomes are distinguishable across modes. |
+| E2E-DQUEST-01 | 9 | Unresolved open question at design completion | Completion blocks unless the question is explicitly deferred with recorded evidence. |
+| E2E-DCHUNK-01 | 9 | Force plan-chunker fallback to a single stage | The degradation is surfaced as an explicit outcome requiring acknowledgement, not a silent log line. |
+| E2E-DYAGNI-01 | 9 | BLOCKER-severity YAGNI finding with `--no-reconcile` | The finding still reaches the plan reviewer instead of being dropped. |
+| E2E-DBUDGET-01 | 10 | Design run approaching characterized per-gate/per-run call/token limits | Run stops with a truthful handoff before exhausting capacity; reserve for state flush/handoff is never spent by gate work. |
+| E2E-DLOOP-01 | 10 | Heavy spend in an early design review/refine loop | The later loop and plan-review escalation retain their own bounded sub-budget; escalation retry limit is configurable. |
+| E2E-DPROMPT-01 | 10 | Large accumulated reconcile conflicts, review blockers, and design fixes | Interpolated prompt payloads are capped/compacted via the existing prompt-hygiene helper; prompt size stays bounded. |
+| E2E-DTRANS-01 | 11 | Inject a transient provider/network error on a blocking design gate | Bounded backoff retry occurs before any hard block; hard block occurs only after retries are exhausted. |
+| E2E-DVERIFY-01 | 11 | Hallucinated artifact-presence self-report and under-reported append-growth self-report | The digest/revision contract rejects the hallucinated existence claim and accepts a genuinely present artifact regardless of self-report. |
+| E2E-DTEST-01 | 11 | Full design gate sequence, review loop, agent retry ladder, crash-resume without flushed state, partial state writes | Each scenario has a passing behavioral characterization test with recorded RED-then-GREEN evidence. |
 
 ## Progress
 
-**Execution Order:** Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7.
+**Execution Order:** Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -243,3 +342,7 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 | 5. Bounded Scheduler and Transactional Automatic Continuation | 0/TBD | Not started | - |
 | 6. Synthesis, Publish, Persist, and Status Truth | 0/TBD | Not started | - |
 | 7. Compatibility and Project-Scale Proof | 0/TBD | Not started | - |
+| 8. Design-Mode Durable Checkpoints and Revision-Aware Resume | 0/TBD | Not started | - |
+| 9. Design-Mode Truthful Readiness and Outcome Reporting | 0/TBD | Not started | - |
+| 10. Design-Mode Bounded Budgets and Prompt Context | 0/TBD | Not started | - |
+| 11. Design-Mode Reliability, Verification, and Characterization Proof | 0/TBD | Not started | - |
