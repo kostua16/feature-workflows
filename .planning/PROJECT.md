@@ -19,6 +19,7 @@ One user command must drive a trustworthy feature workflow from intent to durabl
 - Incremental project-level synthesis with truthful partial/complete coverage reporting.
 - Shared scalability, publishing, persistence, and observability improvements for other workflow modes where the same limits apply.
 - Large-project characterization tests and real plugin dogfooding that prove the end-to-end command contract.
+- Compatibility proof that completed feature shards remain usable by design, implement, tune, review, and read-only status modes throughout the milestone.
 
 ## Requirements
 
@@ -36,7 +37,9 @@ One user command must drive a trustworthy feature workflow from intent to durabl
 
 ### Active
 
-<!-- The 15 approved improvement themes for v1.5.0. -->
+<!-- The 15 user-approved improvement themes for v1.5.0. Atomic enabling
+contracts for state, revision invalidation, distribution, continuation,
+compatibility, and dogfooding are specified separately in REQUIREMENTS.md. -->
 
 #### Project discovery and decomposition
 
@@ -97,14 +100,15 @@ The improvements should become shared orchestration primitives where design, rev
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Present whole-project extraction as one user command backed by automatic bounded, resumable segments | Preserves a simple command surface while respecting finite runtime capacity and allowing any number of features to be processed safely | — Pending |
-| Use one leaf extraction workflow per feature beneath a top-level orchestrator | Fits the one-level nesting limit, isolates failures, and creates a natural durable progress unit | — Pending |
-| Number this first GSD roadmap from Phase 1 | The repository has shipped history but no prior GSD planning ledger or roadmap phase sequence | — Pending |
+| Present whole-project extraction as one user command backed by automatic bounded, resumable segments | Preserves a simple command surface while respecting finite runtime capacity and allowing any number of features to be processed safely | ✓ Accepted by user |
+| Use one leaf extraction workflow per feature beneath a top-level orchestrator | Fits the one-level nesting limit, isolates failures, and creates a natural durable progress unit | ✓ Accepted by user |
+| Number this first GSD roadmap from Phase 1 | The repository has shipped history but no prior GSD planning ledger or roadmap phase sequence | ✓ Accepted by user |
 | Treat v1.4.5 as the pre-GSD brownfield baseline | The plugin manifest and generated engine identify v1.4.5 as the current shipped behavior from which validated requirements are inferred | ✓ Good |
-| Name the milestone `v1.5.0 Project-Scale Extract Design` | Whole-project orchestration and completion semantics are a substantial capability increment over the v1.4.5 baseline | — Pending |
-| Use repository-grounded research | The main unknowns are current engine contracts, runtime constraints, failure modes, and characterization gaps already evidenced in source and project docs | — Pending |
-| Report readiness only from verified scope coverage and required artifacts | Prevents capped, deferred, skipped, or blocked work from being mislabeled complete | — Pending |
-| Generalize only proven common scaling primitives to other modes | Gains consistency without broadening the milestone into an unnecessary rewrite | — Pending |
+| Name the milestone `v1.5.0 Project-Scale Extract Design` | Whole-project orchestration and completion semantics are a substantial capability increment over the v1.4.5 baseline | ✓ Accepted by user |
+| Use repository-grounded research | The main unknowns are current engine contracts, runtime constraints, failure modes, and characterization gaps already evidenced in source and project docs | ✓ Accepted by user |
+| Report readiness only from verified scope coverage and required artifacts | Prevents capped, deferred, skipped, or blocked work from being mislabeled complete | ✓ Accepted by user |
+| Generalize only proven common scaling primitives to other modes | Gains consistency without broadening the milestone into an unnecessary rewrite | ✓ Accepted by user |
+| Preserve implement-mode compatibility alongside design, tune, review, and status | Whole-project extract state is not complete if the established downstream implementation path cannot consume it without regression | ✓ Accepted milestone constraint |
 
 ## Evolution
 
