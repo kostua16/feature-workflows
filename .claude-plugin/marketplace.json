@@ -14,8 +14,8 @@
         "source": "git-subdir",
         "url": "https://github.com/kostua16/feature-workflows",
         "path": "plugins/feature-workflows",
-        "ref": "v1.4.4",
-        "sha": "d9cb8ac5eb5eac57df4c0aa17c3cf4f3b4eb810c"
+        "ref": "v1.4.5",
+        "sha": "fc4b03531f063c1a345a871bb5bcb0e7f25694b9"
       },
       "description": "Gate-enforced feature pipeline: 8 commands, 31 sub-agents, the feature-pipeline dynamic-workflow engine, compress-md skill.",
       "category": "workflows",
