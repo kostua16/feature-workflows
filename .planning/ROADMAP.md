@@ -1,5 +1,7 @@
 # Roadmap: feature-workflows
 
+## Roadmap v1.5.0: Project-Scale Extract Design
+
 ## Overview
 
 Milestone v1.5.0 turns the shipped v1.4.5 extract flow into trustworthy whole-project extraction. It establishes the state and revision contracts first, discovers a bounded schedulable graph, ships both required workflow entries in lockstep, makes each feature a checkpointed leaf, advances work through transactionally acknowledged bounded segments, derives synthesis and readiness from exact coverage, and proves compatibility and scale through installed-plugin E2Es and an observed whole-repository run.
@@ -189,17 +191,17 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 **RED Gate**:
   1. Run the complete milestone E2E matrix below against both generated source and copy/symlink installed-plugin surfaces; every scenario must have recorded pre-fix RED evidence from its owning phase or a newly exposed failing characterization before correction.
   2. Run design, implement, tune, review, status, v1.4.5 migration, and resume fixtures continuously; any state/artifact/handoff regression blocks dogfooding.
-  3. Start a whole-repository dogfood run with enough features to require multiple segments and capture the first unmet scale, continuation, compatibility, or truthfulness assertion as RED evidence.
+  3. Start a whole-repository dogfood run over its full natural inventory with characterized settings that require multiple segments, and capture the first unmet scale, continuation, compatibility, or truthfulness assertion as RED evidence.
 **GREEN Evidence**:
   1. The exact E2E matrix passes on clean generated output and both installed-plugin modes with no stale distribution or version drift.
   2. Design, implement, tune, review, and status workflows consume compatible migrated/completed shards while preserving their established gates and artifact behavior.
-  3. One observed `/feature-workflows:extract-design` command completes the whole repository across multiple automatically acknowledged segments, recording revision, budgets, attempts, coverage, failures, synthesis, installed version, compatibility checks, and final readiness proof.
+  3. One observed `/feature-workflows:extract-design` command completes the repository's full natural inventory across multiple automatically acknowledged segments, recording revision, budgets, attempts, coverage, failures, synthesis, installed version, compatibility checks, and final readiness proof.
   4. The dogfood run stays below characterized runtime limits and demonstrates recovery from at least one injected interruption and one duplicate continuation delivery without manual state repair.
   5. All continuous regression gates and every prior phase evidence suite are green.
 **Success Criteria** (what must be TRUE):
   1. Every exact E2E matrix scenario passes against clean generated output plus copy and symlink installed-plugin surfaces.
   2. Design, implement, tune, review, and read-only status preserve established gates, artifacts, hydration, and handoffs for v1.4.5 migration and v1.5 shards.
-  3. One observed whole-repository command processes at least 100 canonical in-scope features across multiple automatically acknowledged segments with no duplicate/missing coverage and measured reserve headroom.
+  3. One observed whole-repository command processes its full natural inventory across multiple automatically acknowledged segments with no duplicate/missing coverage and measured reserve headroom.
   4. The observed run recovers from an injected gate interruption and duplicate continuation delivery without manual state repair and reaches truthful verified readiness.
 **Plans**: TBD
 
@@ -226,7 +228,7 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 | E2E-PERSIST-01 | 6 | Fail attempted write, durable verification, index update, and continuation acknowledgement | Retry is safe; attempted and durable status differ; root/status never claims unverified persistence. |
 | E2E-STATUS-01 | 6 | Partial/deferred/blocked/failed/skipped, stale revision, invalid graph, missing synthesis, and complete project | Handoff and read-only status agree exactly; only the complete current-revision case is ready. |
 | E2E-COMPAT-01 | 7 | Design resume, implement, tune, review, and status against v1.4.5 migration and v1.5 completed shards | Established gates/artifacts/handoffs work without state loss or extract-specific behavior leaking into other modes. |
-| E2E-DOGFOOD-01 | 7 | Whole repository, multiple features, multiple segments, injected interruption and duplicate continuation | One command reaches verified whole-project readiness below runtime limits with complete durable evidence. |
+| E2E-DOGFOOD-01 | 7 | Whole repository's full natural inventory, multiple segments, injected interruption and duplicate continuation | One command reaches verified whole-project readiness below runtime limits with complete durable evidence. |
 
 ## Progress
 

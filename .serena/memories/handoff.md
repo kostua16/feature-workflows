@@ -1,80 +1,53 @@
 # Handoff — current state & next actions
 
-_Last updated: 2026-07-11 (workflow-decomposition investigation; engine still v1.4.0, unchanged)._
+_Last updated: 2026-07-22 (v1.5.0 milestone initialized and roadmap approved)._
 
 ## Current state
-- Investigated splitting the monolithic engine into smaller composed workflows —
-  see `docs/workflow-decomposition-investigation.md`. Verdict: feasible; hard constraints are
-  ONE-level `workflow()` nesting and no code sharing between scripts (needs a src→dist build
-  step to avoid duplicating the ~2.8k-line helper stack). Staging: (1) modularize
-  source + build to the same single dist engine, (2) split per MODE (six sibling workflows,
-  `pipeline-state.json` contract unchanged), (3) selective `workflow()` children —
-  extract-slice first, then a shared design-docs child for design/tune/extract reuse.
-- **STAGE 1 IMPLEMENTED (engine v1.4.1, PR #10):** `workflows/src/` = 16 contiguous-range ESM
-  modules + `meta/feature-pipeline.meta.mjs`; `scripts/build-workflows.mjs` (zero-dep concat
-  builder, manifest order, self-checks: dup names, unstripped import/export, forbidden tokens,
-  phase-labels ⊆ meta.phases, neutralized ESM check); `npm run build` / `validate:build`;
-  `tests/build-drift.test.mjs`; CI adds dist-freshness + src smoke-import steps. Versioning is
-  single-site (plugin.json → build injects header + meta.version). Verified pure refactor: the
-  v1.4.1 dist body is byte-identical to v1.4.0 (banner only differs); 183 tests pass; harness
-  deliberately still reads the DIST (tests the shipped artifact). `main()` stays whole in
-  `main.mjs` — carving mode branches is stage 2.
-- **RELEASE CHANNEL (option 2+4, second PR stacked on #10):** end users install PINNED
-  releases, not main. `npm run release -- X.Y.Z` (scripts/release.mjs): bump plugin.json →
-  build → full validation → commit + annotated tag vX.Y.Z → pin marketplace.json to the tag
-  (scripts/pin-marketplace.mjs, `git-subdir` source {url, path, ref, sha} — NOT `github`,
-  the plugin lives in a subdir; sha is the effective pin). Push with --follow-tags; the tag
-  triggers .github/workflows/release.yml (re-validates the tagged tree, publishes GitHub
-  Release + dist/doc/checksums assets; never writes to branches). Rollback = `npm run
-  marketplace:pin -- --release <prev-tag>` + commit. Dogfooding after first release:
-  `marketplace:pin -- --dev` locally, don't commit. Catalog stays relative-path until the
-  FIRST release flips it. See docs/release-process.md.
-- **One-click release (PR #13):** `.github/workflows/release-dispatch.yml` — Actions "Run
-  workflow" button with a version input; CI runs the whole sequence (reuses release.mjs) and
-  publishes. GITHUB_TOKEN pushes trigger no other workflows → no double publish, no loops,
-  but also no main-push CI on bot commits. Re-run same version = idempotent recovery.
-  release.yml publish step is UI-flow-aware (existing Release -> upload assets, keep notes).
-  v1.4.1 aftercare pending: re-push tag (or manual asset upload) + `marketplace:pin --release
-  v1.4.1` commit.
-- Implemented **review mode** (`mode: 'review'`, engine/plugin v1.4.0) — the sixth pipeline
-  mode and the INSPECT flow: `/review-design <planDir>` audits an existing design docset
-  (forward-designed, extracted, or tuned) and collects ALL design issues without mutating
-  anything; `/tune-feature <planDir>` then consumes them.
-- Review branch (after tune, before Translate; requires `--resume` with pipeline-state.json):
-  artifact inventory → per-lens parallel reviewers (consistency/completeness/feasibility/
-  testability/scope) → merge/dedup (across lenses AND against already-recorded issues) →
-  adversarial verification (refuted findings dropped; unavailable verdicts keep the finding)
-  → `design-review.md` (deterministic report) → gate-mapped findings ≥ `minSeverity` appended
-  to `issues-and-improvements.md` in the exact tune-consumable section format.
-- New engine surface: REVIEW_FINDINGS/MERGE/VERIFY_VERDICT schemas; `REVIEW_LENSES`,
-  `SEVERITY_RANK`, `meetsMinSeverity`, `resolveMinSeverity`, `resolveReviewLenses`,
-  `collectReviewDocs`, `reviewIssueSection`, `buildReviewReport`, `runReviewLenses`,
-  `mergeReviewFindings`, `verifyReviewFindings`, `recordReviewIssues`; config
-  `useReviewVerify`/`minSeverity`/`reviewLenses`; result `reviewPath`/`designReview`;
-  model tiers `reviewLens`/`reviewVerify`=opus, `reviewMerge`=sonnet; phase `Design Review`;
-  blocked values `review-requires-plandir` / `review-no-artifacts` / `design-review` /
-  `review-record-failed`.
-- PR #9 review fix: `recordReviewIssues` returns the PERSISTED count (0 on failed/absent
-  ack; `issuesPath` set only on success), recording runs before the report so the report's
-  recorded count is truth, and actionable-but-unpersisted findings block at
-  `review-record-failed` (re-run review, dedup-safe) instead of routing tune to a
-  `tune-no-issues` dead end.
-- Invariants kept: review never sets `designReady` or resets stages (structural tests);
-  the `review-requires-plandir` block returns BEFORE planDir derivation (a fresh review run
-  would otherwise throw on undefined planPath pre-safety-net).
-- New command `commands/review-design.md`; docs updated (engine reference, READMEs,
-  QUICKSTART, marketplace.json, cross-refs in tune/setup/pipeline-status/feature-pipeline).
+- Milestone **v1.5.0 Project-Scale Extract Design** is initialized and approved. Planning status is
+  **ready to plan** at Phase 1; implementation has not started.
+- The 15 approved improvement themes are expressed as **21 atomic requirements**, mapped exactly
+  once across **7 phases** (21/21 coverage; no orphaned or duplicated requirements):
+  1. State, Coverage, Migration, and Revision Contracts
+  2. Bounded Discovery, Validated Graph, and Schedulability
+  3. Multi-Entry Build, Install, and Version Lockstep
+  4. Checkpointed Feature Leaf
+  5. Bounded Scheduler and Transactional Automatic Continuation
+  6. Synthesis, Publish, Persist, and Status Truth
+  7. Compatibility and Project-Scale Proof
+- Planning artifacts are `.planning/PROJECT.md`, `.planning/REQUIREMENTS.md`,
+  `.planning/ROADMAP.md`, `.planning/STATE.md`, `.planning/MILESTONES.md`, and
+  `.planning/research/`; the published architecture is
+  `docs/project-scale-extract-design-architecture.md`.
+- Milestone commits:
+  - `5682a1d` — `docs: start milestone v1.5.0 Project-Scale Extract Design`
+  - `e4d4d05` — `docs: research project-scale extract design`
+  - `0155b30` — `docs: define milestone v1.5.0 requirements`
+  - `bc3fcea` — `docs: create milestone v1.5.0 roadmap (7 phases)`
 
-## Validation
-- `npm test`: 180 tests pass (24 new in `tests/review-mode.test.mjs`; harness CANDIDATES extended).
-- `npm run validate:agents`: 31 agents, refs resolve. `npm run validate:versions`: lockstep 1.4.0.
-- ESM syntax check and phase-label validation (`undeclared_count=0`) pass.
+## Durable architecture decisions
+- The user-facing contract is **one `/feature-workflows:extract-design` command**. Internally, the
+  command automatically drives as many bounded, durably acknowledged top-level segments as needed;
+  every stop retains an exact idempotent manual resume command.
+- A top-level `feature-pipeline` control plane owns discovery, scheduling, reconciliation,
+  synthesis, continuation, and the sole readiness decision. One generated `fp-extract-slice`
+  leaf owns the checkpointed extraction gates for exactly one feature and performs no further
+  workflow composition.
+- Parent and leaf share the runtime's **1,000-agent-call ceiling**, token budget, concurrency cap,
+  and abort signal. Segment admission must preserve non-spendable capacity for checkpointing,
+  reconciliation, synthesis, persistence, and truthful handoff; runtime constants must come from
+  characterization rather than guesses.
+- State evolves additively from v1.4.5 into a compact project manifest plus independently resumable
+  feature shards. `extractReady=true` is derived only from exhausted discovery, a valid graph,
+  complete current-revision feature/artifact coverage, current verified synthesis, and no incomplete
+  lifecycle state.
+- Design, implement, tune, review, and read-only status compatibility is a continuous milestone
+  gate; extract-specific graph and queue semantics must not leak into unrelated modes.
 
-## Next recommended actions
-- Dogfood `/review-design` on an extract-produced docset, then `/tune-feature` to verify the
-  tunePlanner consumes review-written sections end-to-end.
-- Consider a `--max-findings` cap to bound R3 verification cost on huge docsets.
-- Pre-existing residue: Gate 0.2 facts prompt hardcodes Serena project "log_analysis";
-  `workflows/docs/feature-pipeline-documentation.md` still describes the 3-mode engine.
+## Next recommended action
+Run `$gsd-plan-phase 1` for **State, Coverage, Migration, and Revision Contracts**. Phase 1 must
+characterize the v1.4.5 migration boundary and revision/digest inputs before schema implementation,
+then establish pure deterministic lifecycle/readiness reducers, root-last migration, sharded state,
+selective invalidation, and RED-first fixtures.
 
-Related: `mem:core`, `mem:session_start`, `mem:task_completion`, `mem:conventions`.
+Related: `mem:core`, `mem:session_start`, `mem:task_completion`, `mem:conventions`,
+`mem:memory_maintenance`.

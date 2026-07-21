@@ -11,12 +11,13 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 | Phase | Scope | Exit condition most relevant to pitfalls |
 |---|---|---|
-| **1. Coverage and State Contracts** | Status vocabulary, coverage invariant, manifest/feature schemas, v1.4.5 migration | Old state hydrates deterministically; incomplete work cannot satisfy readiness |
-| **2. Deterministic Discovery and Graph** | Bounded inventory, stable feature identity, paginated decomposition, graph validation | Every inventory item is owned, excluded with a reason, or reported unassigned; graph is schedulable |
-| **3. Sharded Leaf Extraction** | `fp-extract-slice`, gate checkpoints, isolated feature state, parent/child protocol | Interruption at every material gate resumes without repeating verified work or losing artifacts |
-| **4. Bounded Scheduler and Continuation** | Dependency-aware ready queue, retries, fairness, per-segment budgets, automatic continuation | One command crosses segment boundaries safely; every segment proves progress or stops truthfully |
-| **5. Synthesis, Publish, and Status Truth** | Incremental overview/coverage index, verification, publishing, handoff/status | Published and reported state is tied to the latest verified coverage snapshot |
-| **6. Compatibility and Large-Project Proof** | Cross-mode contract tests, migration fixtures, ceiling/failure E2Es, dogfooding | Design/tune/review/implement/status still consume feature docsets; whole-project scenarios pass |
+| **1. State, Coverage, Migration, and Revision Contracts** | Status vocabulary, coverage invariant, manifest/feature schemas, v1.4.5 migration, revision invalidation | Old state hydrates deterministically; incomplete work cannot satisfy readiness; stale evidence invalidates selectively |
+| **2. Bounded Discovery, Validated Graph, and Schedulability** | Bounded inventory, stable feature identity, paginated decomposition, graph validation | Every inventory item is owned, excluded with a reason, or reported unassigned; graph is schedulable |
+| **3. Multi-Entry Build, Install, and Version Lockstep** | Top-level and leaf generation, copy/symlink installs, version/release drift | Both workflow entries install, resolve, version, and release together without drift |
+| **4. Checkpointed Feature Leaf** | `fp-extract-slice`, gate checkpoints, isolated feature state, parent/child protocol | Interruption at every material gate resumes without repeating verified work or losing artifacts |
+| **5. Bounded Scheduler and Transactional Automatic Continuation** | Dependency-aware ready queue, retries, fairness, per-segment budgets, automatic continuation | One command crosses segment boundaries safely; every segment proves progress or stops truthfully |
+| **6. Synthesis, Publish, Persist, and Status Truth** | Incremental overview/coverage index, verification, publishing, handoff/status | Published and reported state is tied to the latest verified coverage snapshot |
+| **7. Compatibility and Project-Scale Proof** | Cross-mode contract tests, migration fixtures, ceiling/failure E2Es, dogfooding | Design/tune/review/implement/status still consume feature docsets; whole-project scenarios pass |
 
 ## Critical Pitfalls
 
@@ -30,7 +31,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** False whole-project completion, permanently invisible deferred work, misleading coverage percentages, and a resume that has nothing runnable even though the project is incomplete.
 
-**Prevention (Phase 1):** Define non-overlapping durable states: `discovered`, `runnable`, `in-progress`, `deferred`, `blocked-retryable`, `failed-terminal`, `excluded`, and `completed`. Store `reason`, `attempts`, and transition sequence. A cap moves work to `deferred`, never `skipped`; a selector changes the declared scope or creates an explicit exclusion with provenance. Compute readiness from a single invariant: inventory is complete, graph is valid, every in-scope feature is `completed`, every mandated artifact is verified, and project synthesis covers the same manifest revision. `blocked`, `failed`, `deferred`, and `unassigned` all prevent readiness.
+**Prevention (Phase 1):** Define the non-overlapping durable feature lifecycle statuses exactly as `runnable`, `deferred`, `in-progress`, `blocked`, `failed`, `skipped`, `excluded`, and `completed`. Represent pre-queue discovery in a separate phase field, and represent retryable versus terminal classification, provenance, and diagnostics in separate reason/evidence fields alongside attempts and transition sequence; none of those metadata values is a lifecycle status. A cap moves work to `deferred`, never `skipped`; a selector changes the declared scope or creates an explicit exclusion with provenance. Compute readiness from a single invariant: inventory is complete, graph is valid, every in-scope feature is `completed`, every mandated artifact is verified, and project synthesis covers the same manifest revision. `blocked`, `failed`, and `deferred` prevent readiness; unassigned inventory is coverage evidence outside the feature lifecycle and also prevents readiness.
 
 **Detection:** Contract tests where one of N features is capped, blocked, failed, or newly discovered must assert `extractReady=false`, exact remaining counts, and a runnable continuation. Add a state-transition table test that rejects illegal terminal transitions.
 
@@ -44,7 +45,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Runaway cost, ceiling crashes before state/handoff is written, duplicate agent work, and a command that appears hung rather than resumable.
 
-**Prevention (Phase 4):** Make a segment a first-class persisted unit with `segmentId`, manifest revision, start cursor, end cursor, call/token/retry usage, and a progress delta. Stop scheduling before capacity is exhausted, reserve budget for parent-state flush plus handoff, and return `continuation-required`. The command driver may launch the next top-level segment automatically, but only after verifying a durable state revision increased or a feature/gate transition occurred. Repeat of the same progress fingerprint is a hard `no-progress` stop with an actionable report, not another loop.
+**Prevention (Phase 5):** Make a segment a first-class persisted unit with `segmentId`, manifest revision, start cursor, end cursor, call/token/retry usage, and a progress delta. Stop scheduling before capacity is exhausted, reserve budget for parent-state flush plus handoff, and return `continuation-required`. The command driver may launch the next top-level segment automatically, but only after verifying a durable state revision increased or a feature/gate transition occurred. Repeat of the same progress fingerprint is a hard `no-progress` stop with an actionable report, not another loop.
 
 **Detection:** E2Es for a permanently invalid child result, zero remaining budget, unchanged state revision, command-driver restart, and interruption between segment return and relaunch. Assert finite invocations and a durable continuation point in every case.
 
@@ -58,7 +59,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Duplicate token spend, partial overwrite, inconsistent parent and feature state, and failure to meet the milestone’s first-incomplete-gate resume contract.
 
-**Prevention (Phase 3):** Give the leaf workflow ownership of one sharded feature-state file and require a checkpoint acknowledgement after every material transition: gate started, artifact written, artifact verified, gate completed, gate blocked. Checkpoint payloads carry a monotonic revision and artifact digest. The parent manifest stores only compact feature status, state path, revision, summary digest, and dependency metadata. Do not advance the parent to the next feature until the child’s terminal-or-continuation checkpoint is acknowledged.
+**Prevention (Phase 4):** Give the leaf workflow ownership of one sharded feature-state file and require a checkpoint acknowledgement after every material transition: gate started, artifact written, artifact verified, gate completed, gate blocked. Checkpoint payloads carry a monotonic revision and artifact digest. The parent manifest stores only compact feature status, state path, revision, summary digest, and dependency metadata. Do not advance the parent to the next feature until the child’s terminal-or-continuation checkpoint is acknowledged.
 
 **Detection:** Fault-injection tests abort immediately before and after every gate write and checkpoint. Resume must invoke exactly the first unverified gate, preserve already verified files, and reconcile parent/child revisions deterministically.
 
@@ -86,7 +87,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** False readiness after later continuation, stale synthesis after a newly completed feature, and downstream tune/review operating on a partial baseline.
 
-**Prevention (Phases 1 and 5):** Replace “flag set” as authority with a derived readiness proof containing `manifestRevision`, `inventoryDigest`, `graphDigest`, completed/excluded/remaining counts, required-artifact verification results, synthesis input digest, and verification revision. Persist `extractReady` only as a cached projection of that proof and invalidate it whenever any input revision changes. Missing required synthesis blocks complete readiness while still allowing a truthful partial report.
+**Prevention (Phases 1 and 6):** Replace “flag set” as authority with a derived readiness proof containing `manifestRevision`, `inventoryDigest`, `graphDigest`, completed/excluded/remaining counts, required-artifact verification results, synthesis input digest, and verification revision. Persist `extractReady` only as a cached projection of that proof and invalidate it whenever any input revision changes. Missing required synthesis blocks complete readiness while still allowing a truthful partial report.
 
 **Detection:** Mutate one feature status, artifact digest, graph edge, or inventory revision after a ready snapshot; status must immediately become partial and synthesis must be scheduled again.
 
@@ -114,7 +115,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Poor throughput, permanently stranded retryable work, misleading “no pending slices,” and failure domains that are isolated only by abandonment.
 
-**Prevention (Phase 4):** Schedule from a deterministic ready set, not array position. Use bounded per-feature/per-gate attempts, persist each failure class and attempt result, and defer retryable work to a later scheduling round or segment. Apply round-robin fairness among ready components, honor dependencies, and cap consecutive work on one feature. Terminal failures remain visible and prevent readiness; independent work continues.
+**Prevention (Phase 5):** Schedule from a deterministic ready set, not array position. Use bounded per-feature/per-gate attempts, persist each failure class and attempt result, and defer retryable work to a later scheduling round or segment. Apply round-robin fairness among ready components, honor dependencies, and cap consecutive work on one feature. Terminal failures remain visible and prevent readiness; independent work continues.
 
 **Detection:** A fixture with one repeatedly failing first feature plus several independent healthy features must complete the healthy features, exhaust exactly the configured attempts for the failure, and report the remainder without spinning.
 
@@ -128,7 +129,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Schema failures, truncated inventories, lost tail features, increased hallucination, and a monolithic parent state that is expensive to read/write on every checkpoint.
 
-**Prevention (Phases 2, 3, and 5):** Persist a paginated inventory and feature index as artifacts. Pass agents artifact paths plus a bounded page/feature summary, never the whole project manifest. Hierarchically refine only oversized discovery nodes. Child args contain feature ID, shard path, compact source summary, and bounded dependency summaries. Incremental synthesis consumes verified per-feature summaries in pages and maintains an input digest.
+**Prevention (Phases 2, 4, and 6):** Persist a paginated inventory and feature index as artifacts. Pass agents artifact paths plus a bounded page/feature summary, never the whole project manifest. Hierarchically refine only oversized discovery nodes. Child args contain feature ID, shard path, compact source summary, and bounded dependency summaries. Incremental synthesis consumes verified per-feature summaries in pages and maintains an input digest.
 
 **Detection:** Measure maximum serialized prompt/args/state size in tests. Use a synthetic inventory beyond one prompt page and assert no page loss, deterministic page cursors, bounded child payload size, and identical aggregate coverage across resumes.
 
@@ -142,7 +143,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Raw ceiling failures, lost terminal state, unpredictable feature truncation, and no truthful estimate of remaining work.
 
-**Prevention (Phase 4):** Track separate budgets for agent calls, tokens, retries, and decisions at segment, feature, and gate levels. Estimate worst-case remaining calls for the next gate; start it only if capacity exceeds that estimate plus a fixed checkpoint/handoff reserve. Thread spent/remaining counters through child JSON returns because module counters do not cross workflow scripts. Segment proactively; never rely on catching the hard ceiling as normal control flow.
+**Prevention (Phase 5):** Track separate budgets for agent calls, tokens, retries, and decisions at segment, feature, and gate levels. Estimate worst-case remaining calls for the next gate; start it only if capacity exceeds that estimate plus a fixed checkpoint/handoff reserve. Thread spent/remaining counters through child JSON returns because module counters do not cross workflow scripts. Segment proactively; never rely on catching the hard ceiling as normal control flow.
 
 **Detection:** Boundary tests at reserve-1, reserve, and reserve+1; adversarial schema retries; review-loop subcaps; and child throws. Every below-reserve case must yield `continuation-required` with no new gate start.
 
@@ -156,7 +157,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Truthful coverage becomes impossible, extracted design contradicts the current code, and final synthesis mixes revisions.
 
-**Prevention (Phases 1, 2, and 3):** Record an agent-derived source snapshot identity at inventory time: repository HEAD when available, dirty-worktree fingerprint, inventory digest, and per-feature file/content metadata digest. At each segment resume, compare current evidence with the persisted snapshot. Classify additions, deletions, moves, and modifications; invalidate the affected feature from the earliest dependent gate and invalidate downstream feature summaries/synthesis. Require an explicit policy for “continue frozen snapshot” versus “refresh to current source”; never silently mix them.
+**Prevention (Phases 1, 2, and 4):** Record an agent-derived source snapshot identity at inventory time: repository HEAD when available, dirty-worktree fingerprint, inventory digest, and per-feature file/content metadata digest. At each segment resume, compare current evidence with the persisted snapshot. Classify additions, deletions, moves, and modifications; invalidate the affected feature from the earliest dependent gate and invalidate downstream feature summaries/synthesis. Require an explicit policy for “continue frozen snapshot” versus “refresh to current source”; never silently mix them.
 
 **Detection:** Resume fixtures after file modify/add/delete/rename and dependency change. Assert only affected features and downstream synthesis are invalidated, while unchanged verified shards remain reusable.
 
@@ -170,7 +171,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Public docs and operator status disagree with durable state, retries never happen, users follow the wrong continuation command, and `published` is interpreted as success when it means “attempted.”
 
-**Prevention (Phase 5):** Separate `publishAttempt` from `publishSucceeded`, and tie successful publication to a verified coverage/synthesis revision. Publish bounded project and feature units idempotently; retry failures. Generate status directly from the coverage ledger: processed, remaining, deferred, blocked, failed, excluded, budget usage, active segment, and exact `/extract-design --resume` continuation. Rebuild synthesis when its input digest changes. Run final publication only after verification, while allowing explicitly labeled partial snapshots when requested.
+**Prevention (Phase 6):** Separate `publishAttempt` from `publishSucceeded`, and tie successful publication to a verified coverage/synthesis revision. Publish bounded project and feature units idempotently; retry failures. Generate status directly from the coverage ledger: processed, remaining, deferred, blocked, failed, excluded, budget usage, active segment, and exact `/extract-design --resume` continuation. Rebuild synthesis when its input digest changes. Run final publication only after verification, while allowing explicitly labeled partial snapshots when requested.
 
 **Detection:** Publish failure then resume; complete another feature after an overview exists; corrupt one published artifact; query status for partial/blocked/complete extract states. Assert status, handoff, and docs carry the same revision and counts.
 
@@ -184,7 +185,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **Consequences:** Runtime exceptions, lost telemetry/budget truth, incompatible installed dist files, and a continuation path that cannot launch the intended leaf.
 
-**Prevention (Phase 3):** Keep `fp-extract` as the top-level workflow launched by the command and `fp-extract-slice` as a strict leaf. Define and schema-validate a versioned JSON request/response protocol. Parent owns inventory, graph, scheduling, aggregate coverage, synthesis, and continuation; child owns one feature’s gate machine and shard. Merge child counters/digests explicitly. Wrap unknown workflow, syntax, invalid response, and child throw into a persisted feature outcome before continuing independent work. Extend build/setup/version validation to every shipped workflow file.
+**Prevention (Phases 3 and 4):** Keep `feature-pipeline` as the top-level workflow launched by the command and `fp-extract-slice` as a strict leaf. Define and schema-validate a versioned JSON request/response protocol. Parent owns inventory, graph, scheduling, aggregate coverage, synthesis, and continuation; child owns one feature’s gate machine and shard. Merge child counters/digests explicitly. Wrap unknown workflow, syntax, invalid response, and child throw into a persisted feature outcome before continuing independent work. Extend build/setup/version validation to every shipped workflow file.
 
 **Detection:** Contract tests for protocol version mismatch, missing child, child syntax error, invalid/null return, counter merge, and an assertion that leaf dist contains no `workflow()` call.
 
@@ -214,7 +215,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **What goes wrong:** Re-running whole-project synthesis on every segment becomes unbounded, while never re-running it leaves stale cross-feature relationships. Summaries omit failures or excluded scope and still look authoritative.
 
-**Prevention (Phase 5):** Store one verified, bounded synthesis summary per feature and update project views by changed summary digest. Coverage index is deterministic data, not prose. Architecture overview, dependency map, and cross-cutting concerns each record their input manifest revision and completeness state. Verify index rows against the manifest before readiness.
+**Prevention (Phase 6):** Store one verified, bounded synthesis summary per feature and update project views by changed summary digest. Coverage index is deterministic data, not prose. Architecture overview, dependency map, and cross-cutting concerns each record their input manifest revision and completeness state. Verify index rows against the manifest before readiness.
 
 **Repository evidence:** Current overview is one agent call over all queue entries and is non-blocking/path-guarded (`extract-slice.mjs:223-254`; `main.mjs:1173-1178`).
 
@@ -224,7 +225,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **What goes wrong:** `/tune-feature`, `/design-feature --resume`, `/review-design`, implement gates, or status misread new feature shard fields; a migration clears `designReady`; extract-only status semantics leak into forward modes.
 
-**Prevention (Phases 1 and 6):** Preserve established artifact names and legacy top-level fields, but add explicit state kind/mode contracts for `extract-project` and `extract-feature`. Define which consumers accept each kind. Keep shared checkpoint/budget primitives mode-neutral. Test every legal handoff and reject illegal ones with a precise command.
+**Prevention (Phases 1 and 7):** Preserve established artifact names and legacy top-level fields, but add explicit state kind/mode contracts for `extract-project` and `extract-feature`. Define which consumers accept each kind. Keep shared checkpoint/budget primitives mode-neutral. Test every legal handoff and reject illegal ones with a precise command.
 
 **Repository evidence:** Multi-slice local state is currently emitted as `mode:'design'`, `designReady` on completed outcome, and a synthetic `planPath` although no plan is written (`main.mjs:1110-1168`). `repairResumeArtifactFlags()` contains a special-case fix because unconditional Plan repair previously disabled persistence/readiness (`state.mjs:317-362`; `tests/extract-mode.test.mjs:167-195`).
 
@@ -234,7 +235,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **What goes wrong:** Tests pass because source contains a flush call or current helper returns an expected ordering, while interruption, child composition, state migration, continuation, and installed-plugin behavior remain untested.
 
-**Prevention (Phase 6):** Retain pure helper tests, but add executable characterization at three levels: state-machine unit tests, parent/leaf protocol integration tests against generated dist, and end-to-end command scenarios in an installed plugin fixture. Include pagination, interruption at every gate, resume, dependency ordering, partial failure, ceiling reserve, stale source, synthesis refresh, and whole-repository dogfood evidence.
+**Prevention (Phase 7):** Retain pure helper tests, but add executable characterization at three levels: state-machine unit tests, parent/leaf protocol integration tests against generated dist, and end-to-end command scenarios in an installed plugin fixture. Include pagination, interruption at every gate, resume, dependency ordering, partial failure, ceiling reserve, stale source, synthesis refresh, and whole-repository dogfood evidence.
 
 **Repository evidence:** `tests/extract-mode.test.mjs` is mainly helper and source-string assertions; it explicitly enshrines cycle fallback, cap-as-skipped, after-slice flushing, and only “multi-slice never claims parent designReady,” not truthful `extractReady` (`tests/extract-mode.test.mjs:1-241`).
 
@@ -246,7 +247,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **What goes wrong:** Audit findings duplicate across resumed segments, or a retried artifact writer overwrites newer content.
 
-**Prevention (Phases 3 and 5):** Give generated sections stable IDs/digests, use compare-and-replace for derived artifacts, and deduplicate append-only findings by feature/gate/finding digest. Record output revision in the shard before acknowledging a gate.
+**Prevention (Phases 4 and 6):** Give generated sections stable IDs/digests, use compare-and-replace for derived artifacts, and deduplicate append-only findings by feature/gate/finding digest. Record output revision in the shard before acknowledging a gate.
 
 **Detection:** Retry the same completed/blocked gate twice and compare byte output plus issue counts.
 
@@ -254,7 +255,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **What goes wrong:** Sharded feature files exist, but the parent still embeds every file, artifact, log, attempt, and prompt result, so every checkpoint rewrites an ever-growing JSON document through an agent.
 
-**Prevention (Phase 3):** Enforce a compact manifest schema and size budget. Parent entries reference shards and contain only scheduler/coverage fields and compact verified summaries. Logs and attempt histories live in bounded append-only per-feature/segment artifacts.
+**Prevention (Phase 1):** Enforce a compact manifest schema and size budget. Parent entries reference shards and contain only scheduler/coverage fields and compact verified summaries. Logs and attempt histories live in bounded append-only per-feature/segment artifacts.
 
 **Detection:** State-size growth tests should be approximately O(feature count) with a small fixed entry size, not O(files × gates × attempts).
 
@@ -262,7 +263,7 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 **What goes wrong:** “30 done” sounds complete without saying 30/47, which inventory revision was measured, or whether 5 excluded features are inside the denominator.
 
-**Prevention (Phase 5):** Every log, status, handoff, and published index reports the same coverage revision and explicit denominator: discovered, in-scope, completed, deferred, blocked, failed, excluded, unassigned. Include last durable segment/gate and budget reserve.
+**Prevention (Phase 6):** Every log, status, handoff, and published index reports the same coverage revision and explicit denominator: discovered, in-scope, completed, deferred, blocked, failed, excluded, unassigned. Include last durable segment/gate and budget reserve.
 
 **Detection:** Snapshot status output for partial, source-drifted, migrated, and complete states and compare it against manifest-derived counts.
 
@@ -270,12 +271,13 @@ The phase names below are used throughout the prevention guidance so each risk h
 
 | Phase Topic | Likely Pitfall | Required mitigation before phase exit |
 |---|---|---|
-| Coverage and State Contracts | False readiness; ambiguous statuses; unsafe legacy hydration | Formal transition table, derived readiness proof, schema version/migrations, v1.4.5 fixtures |
-| Deterministic Discovery and Graph | Prompt overflow; identity collision; missing ownership; hidden cycles | Paginated inventory, canonical IDs, full reconciliation, SCC/dangling-edge validation |
-| Sharded Leaf Extraction | Mid-gate loss; parent/child divergence; nesting violation | Gate-level acknowledged checkpoints, compact manifest, versioned leaf protocol, leaf cannot compose |
-| Bounded Scheduler and Continuation | No-progress loops; starvation; hard ceiling before checkpoint | Deterministic ready set, fair bounded retries, progress fingerprint, explicit reserve, automatic top-level segmentation |
-| Synthesis, Publish, and Status Truth | Stale overview; failed publish treated as done; wrong continuation command | Revision-bound incremental synthesis, verify-before-publish, attempted/succeeded split, extract-aware status |
-| Compatibility and Large-Project Proof | Extract fixes break other modes; structural tests miss runtime behavior | Cross-mode handoff matrix, generated-dist integration, fault injection, large fixture, installed-plugin dogfood |
+| State, Coverage, Migration, and Revision Contracts | False readiness; ambiguous statuses; unsafe legacy hydration | Formal transition table, derived readiness proof, schema version/migrations, v1.4.5 fixtures |
+| Bounded Discovery, Validated Graph, and Schedulability | Prompt overflow; identity collision; missing ownership; hidden cycles | Paginated inventory, canonical IDs, full reconciliation, SCC/dangling-edge validation |
+| Multi-Entry Build, Install, and Version Lockstep | Missing leaf dist; copy/symlink resolution or version drift | Two-entry clean build, both install modes, version/release lockstep validation |
+| Checkpointed Feature Leaf | Mid-gate loss; parent/child divergence; nesting violation | Gate-level acknowledged checkpoints, compact manifest, versioned leaf protocol, leaf cannot compose |
+| Bounded Scheduler and Transactional Automatic Continuation | No-progress loops; starvation; hard ceiling before checkpoint | Deterministic ready set, fair bounded retries, progress fingerprint, explicit reserve, automatic top-level segmentation |
+| Synthesis, Publish, Persist, and Status Truth | Stale overview; failed publish treated as done; wrong continuation command | Revision-bound incremental synthesis, verify-before-publish, attempted/succeeded split, extract-aware status |
+| Compatibility and Project-Scale Proof | Extract fixes break other modes; structural tests miss runtime behavior | Cross-mode handoff matrix, generated-dist integration, fault injection, large fixture, installed-plugin dogfood |
 
 ## What the Roadmap Must Not Defer
 
