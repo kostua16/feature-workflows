@@ -23,3 +23,4 @@ parse_counts.json
 *.Zone.Identifier
 .omc/
 *.zip
+.kilo/plans/
