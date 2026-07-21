@@ -10,7 +10,7 @@ One user command must drive a trustworthy feature workflow from intent to durabl
 
 ## Current Milestone: v1.5.0 Project-Scale Extract Design
 
-**Goal:** Make `/feature-workflows:extract-design` automatically process an entire large project through bounded, durable per-feature segments from one user command, while reporting coverage and completion truthfully.
+**Goal:** Make `/feature-workflows:extract-design` automatically process an entire large project through bounded, durable per-feature segments from one user command, while reporting coverage and completion truthfully — and extend the same durability, truthfulness, and bounded-execution contracts to `/feature-workflows:design-feature` and the shared engine where the same defects are proven.
 
 **Target features:**
 
@@ -20,6 +20,7 @@ One user command must drive a trustworthy feature workflow from intent to durabl
 - Shared scalability, publishing, persistence, and observability improvements for other workflow modes where the same limits apply.
 - Large-project characterization tests and real plugin dogfooding that prove the end-to-end command contract.
 - Compatibility proof that completed feature shards remain usable by design, implement, tune, review, and read-only status modes throughout the milestone.
+- Design-mode extension: durable gate-level design checkpoints, truthful `designReady` and terminal outcomes, enforced budgets and bounded prompts, transient-failure retries, deterministic artifact verification, and design-flow characterization tests (phases appended after Phase 7; evidence in `.planning/research/DESIGN-MODE-FINDINGS.md`).
 
 ## Requirements
 
@@ -68,13 +69,40 @@ compatibility, and dogfooding are specified separately in REQUIREMENTS.md. -->
 - [ ] **14. Extract-aware publishing, persistence, and status:** Publish and persist project and feature artifacts in bounded units; expose continuation, coverage, budgets, failures, and readiness through the command handoff and status mode, reusing the same primitives in other modes where applicable.
 - [ ] **15. Large-project E2E characterization and dogfooding:** Add fixtures and end-to-end scenarios for pagination, segmentation, interruption, resume, dependency ordering, partial failure, ceiling avoidance, final synthesis, and an observed whole-repository plugin run.
 
+#### Design-mode durability and state (extension)
+
+- [ ] **16. Gate-level durable design checkpoints:** Persist pipeline state after every material design gate (and in implement/tune where the same coarse-checkpoint loss is proven) instead of only at hard-block and terminal exits.
+- [ ] **17. Atomic, recoverable state persistence:** Replace truncation-prone chunked state writes with a write-verify-acknowledge pattern and a last-good snapshot so resume auto-recovers instead of hard-blocking on `resume-invalid-state`.
+- [ ] **18. Revision-aware resume and approval round-trips:** Skip re-verification and review re-runs for unchanged artifacts via durable digests, and make approval decisions apply without re-running unaffected gates.
+
+#### Design-mode truthfulness (extension)
+
+- [ ] **19. Truthful design readiness:** Set `designReady=true` only when no review was fail-forwarded, no plan was force-accepted with carried blockers, reconcile conflicts are resolved, and required artifacts are verified; otherwise report the exact degraded state.
+- [ ] **20. Durable fail-forward and attempt history:** Record every fail-forward, retry, escalation, and fallback with reasons as durable state surfaced through handoff and status.
+- [ ] **21. Truthful commit, publish, and persist outcomes:** Distinguish attempted from durably verified commit/publish/persist results and never report terminal success over a failed commit.
+- [ ] **22. Open-questions resolution policy:** Require unresolved open questions to be resolved, explicitly deferred with recorded evidence, or to block design completion.
+- [ ] **23. Surfaced plan-chunker degradation:** Make single-stage chunker fallback an explicit acknowledged degraded outcome instead of a silent log line.
+- [ ] **24. YAGNI blocker routing independent of reconcile:** Deliver BLOCKER-severity YAGNI findings to the plan reviewer even when reconcile is disabled.
+
+#### Design-mode bounded execution (extension)
+
+- [ ] **25. Enforced per-gate call and token budgets:** Convert observational gate telemetry into enforced per-gate/per-run budgets with non-spendable reserve for state flush and handoff.
+- [ ] **26. Per-loop retry sub-budgets:** Give each design review/refine loop its own bounded budget so early loops cannot starve later gates, and make escalation retries configurable.
+- [ ] **27. Bounded prompt context in design loops:** Cap and compact conflict, blocker, and fix payloads interpolated into design-gate prompts, reusing the existing compaction hygiene.
+
+#### Design-mode reliability and proof (extension)
+
+- [ ] **28. Transient-error retry with backoff:** Classify agent-call failures (transient, schema, fatal) and apply bounded backoff retries to transient errors in the shared agent core.
+- [ ] **29. Deterministic artifact verification:** Verify artifact presence and append growth through the shared digest/revision contract rather than trusting agent self-reports.
+- [ ] **30. Design-flow and shared-infra characterization tests:** Add behavioral tests for the design gate sequence, review loop, agent retry ladder, crash-resume, and partial state writes per the milestone evidence model.
+
 ### Out of Scope
 
 - A literally unbounded single Workflow invocation — runtime limits make this unsafe; the user-visible contract is one command backed by automatic durable segments and continuation loops.
 - Removing or weakening existing gates, artifact verification, reviews, or tests to reduce runtime — scale must preserve workflow quality.
 - Breaking or replacing the existing `pipeline-state.json` contract — older v1.4.5 state must continue to hydrate safely through additive/defaulted schema evolution.
 - Redesigning the meaning or format of established design artifacts unless required for bounded indexing or compatibility — this milestone changes orchestration and scale behavior, not the product's design language.
-- Broad rewrites of non-extract modes — shared improvements may be adopted where the same issue is proven, but extract-design and whole-project completion remain the milestone focus.
+- Broad rewrites of non-extract modes — shared improvements and the approved design-mode extension themes (16-30) are adopted only where a defect is proven with evidence; unproven speculative changes to other modes stay excluded.
 - External ecosystem research — milestone research is repository-grounded and should validate decisions against current source, tests, docs, and runtime constraints.
 
 ## Context
@@ -109,6 +137,9 @@ The improvements should become shared orchestration primitives where design, rev
 | Report readiness only from verified scope coverage and required artifacts | Prevents capped, deferred, skipped, or blocked work from being mislabeled complete | ✓ Accepted by user |
 | Generalize only proven common scaling primitives to other modes | Gains consistency without broadening the milestone into an unnecessary rewrite | ✓ Accepted by user |
 | Preserve implement-mode compatibility alongside design, tune, review, and status | Whole-project extract state is not complete if the established downstream implementation path cannot consume it without regression | ✓ Accepted milestone constraint |
+| Extend v1.5.0 with design-mode phases instead of opening a v1.6.0 milestone | GSD tracks one active milestone; the design-mode findings adopt the same primitives phases 1-7 build, so appending phases keeps one ledger and one milestone truth | ✓ Accepted by user |
+| Track the extension in GitHub issue #19 with new sub-issues per appended phase | The milestone parent issue must stay the single tracking surface; sub-issues are added once phases are created and committed | ✓ Accepted by user |
+| Ground the extension in `.planning/research/DESIGN-MODE-FINDINGS.md` | All 15 extension themes trace to file:line-verified defects (F1-F17); the prior docs/TODOs.md backlog is fully implemented, so no theme duplicates shipped work | ✓ Good |
 
 ## Evolution
 
@@ -130,4 +161,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-22 after starting milestone v1.5.0 Project-Scale Extract Design*
+*Last updated: 2026-07-22 after extending milestone v1.5.0 with design-mode durability, truthfulness, and bounded-execution themes (16-30)*
