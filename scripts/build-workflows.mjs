@@ -72,6 +72,7 @@ for (const entry of ENTRIES) {
   const seen = new Map()
   const bodies = entry.modules.map((file) => {
     const raw = readFileSync(new URL(`src/${file}`, wfRoot), 'utf8')
+    if (raw.includes('\r')) throw new Error(`${file}: source module contains CRLF — normalize to LF`)
     const kept = []
     for (const line of raw.split('\n')) {
       if (/^import[ {]/.test(line)) continue
@@ -96,6 +97,9 @@ for (const entry of ENTRIES) {
   const dist = [entry.banner.join('\n'), '', metaSrc, '', bodies.join('\n\n'), '', 'const final = await main()', 'return final', ''].join('\n')
 
   // ---- post-emit self-checks -----------------------------------------------
+  // CRLF in the emitted dist blocks Workflow execution (issue #16); the source-module
+  // check above is the primary gate, this is a belt-and-suspenders net over the assembly.
+  if (dist.includes('\r')) throw new Error(`${entry.out}: emitted dist contains CR — source has CRLF`)
   // forbidden tokens (sandbox-unsafe / must have been stripped)
   for (const [re, why] of [
     [/^import[ {]/m, 'unstripped import'],

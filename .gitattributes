@@ -1,2 +1,3 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Auto detect text files; force LF on checkout (overrides core.autocrlf on Windows).
+# CRLF in the shipped engine blocks Workflow execution — see issue #16.
+* text=auto eol=lf
