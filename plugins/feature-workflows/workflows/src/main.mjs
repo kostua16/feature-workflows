@@ -4,6 +4,7 @@ import { RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECO
 import { taskSlug, categorizeSlug, jiraIdFromTask, detectNonEnglish } from './text-utils.mjs'
 import { consolidate, writeChunkedFile, validatePipelineState, renderStatusReport, flushPipelineState, flushPipelineStateWithSnapshot, loadPipelineState, loadPipelineStateWithRecovery, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew } from './state.mjs'
 import { computeContentDigest } from './revision.mjs'
+import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
 import { seedExtractQueue, nextPendingSlice, resolveScope } from './extract-scope.mjs'
@@ -125,6 +126,18 @@ async function main() {
         logLines: [`main: resume blocked — no pipeline-state.json at ${resumeDir}`],
       }
       return block
+    }
+    // INT-MIGRATION-RESUME: explicit --migrate converts a v1.4.5 legacy state file
+    // (one carrying result.slices) to v1.5.0 format before validation. Opt-in flag
+    // avoids misfire-prone auto-detection on every resume. When the flag is absent,
+    // a legacy state file that passes structural validation resumes as-is (backward
+    // compatible); one that fails validation still blocks with resume-invalid-state.
+    if (args && args.migrate) {
+      const beforeVersion = resumed.schemaVersion || 'pre-1.5.0'
+      resumed = migrateResumeState(resumed)
+      if (resumed.schemaVersion === '1.5.0' && beforeVersion !== '1.5.0') {
+        log(`main: --migrate converted legacy state (${beforeVersion}) to v1.5.0`)
+      }
     }
     // EN-2: validate the hydrated state BEFORE trusting it into 25+ result flags. A
     // corrupt/truncated pipeline-state.json (a failed chunked write, IM-1) that still

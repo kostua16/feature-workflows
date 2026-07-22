@@ -2011,8 +2011,12 @@ function migrateLegacyState(legacyState) {
   }
 }
 
-// Validate migration boundaries for fault injection. Pure: checks the state at a
-// given migration phase boundary without performing any writes.
+// Validate migration boundaries for fault injection. Uses an internal-accumulator
+// pattern: the 'child-write' phase marks the matched child with _durable=true
+// in-place (a mutation of the passed-in state object) so subsequent 'before-root'
+// and 'after-children' checks can gate root acknowledgement on all children being
+// durable. Deterministic and side-effect-free from an I/O perspective, but NOT a
+// pure read-only check — it mutates the accumulator state between phase calls.
 //
 // state: the in-progress migration output
 // phase: 'child-write' | 'before-root' | 'after-children'
@@ -2062,6 +2066,41 @@ function validateMigrationBoundary(state, phase, childId) {
   }
 
   return { ok: false, reason: `unknown migration phase '${phase}'` }
+}
+
+// Migrate a v1.4.5 pipeline-state.json in-place for v1.5.0 resume. Detects legacy
+// extract state by the presence of result.slices (a v1.4.5 extract-queue field absent
+// from v1.5.0 state) and a non-1.5.0 schemaVersion. Runs the root-last migration and
+// injects the v1.5.0 project manifest into the state so the resume path sees the
+// current structure. Strips the stale checksum (result changed during migration).
+//
+// This is an explicit, opt-in transform invoked via --migrate on resume — NOT
+// auto-detected on every resume to avoid misfire-prone heuristics on ambiguous state.
+// Idempotent: a v1.5.0 state passes through unchanged.
+//
+// state: the deserialized pipeline-state.json (must have result.slices for migration)
+// Returns: the migrated state object (or the original if no migration was needed)
+function migrateResumeState(state) {
+  if (!state || typeof state !== 'object') return state
+  if (state.schemaVersion === '1.5.0') return state
+
+  const result = state.result || {}
+  const hasLegacySlices = Array.isArray(result.slices) && result.slices.length > 0
+
+  if (!hasLegacySlices) return state
+
+  const manifest = migrateLegacyState(state)
+
+  const { checksum, ...stateWithoutChecksum } = state
+  return {
+    ...stateWithoutChecksum,
+    result: {
+      ...result,
+      projectManifest: manifest,
+    },
+    schemaVersion: '1.5.0',
+    engineVersion: state.engineVersion || '1.4.5',
+  }
 }
 
 // Selective revision invalidation: deterministic digest computation, revision

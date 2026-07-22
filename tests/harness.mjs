@@ -81,6 +81,7 @@ const CANDIDATES = [
   'deriveFeatureId',
   'migrateLegacyState',
   'validateMigrationBoundary',
+  'migrateResumeState',
   'REVISION_INPUTS',
   'GATE_DEPENDENCY_MAP',
   'computeDigest',

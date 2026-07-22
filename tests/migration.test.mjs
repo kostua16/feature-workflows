@@ -9,6 +9,7 @@ const {
   deriveFeatureId,
   migrateLegacyState,
   validateMigrationBoundary,
+  migrateResumeState,
 } = engine
 
 // ---- deriveFeatureId ----
@@ -204,4 +205,128 @@ test('validateMigrationBoundary: mixed-version ready state never observable', ()
   const { deriveReadiness } = engine
   const r = deriveReadiness(state)
   assert.equal(r.ready, false, 'partially migrated state must not be ready')
+})
+
+// ---- migrateResumeState (INT-MIGRATION-RESUME: explicit --migrate flag) ----
+
+test('migrateResumeState: v1.4.5 state with result.slices migrates to v1.5.0', () => {
+  const legacyState = {
+    task: 'extract whole-project design',
+    slug: 'extract-whole-project',
+    planPath: 'docs/project/extract/plan.md',
+    planDir: 'docs/project/extract/',
+    engineVersion: '1.4.5',
+    config: { mode: 'extract' },
+    result: {
+      mode: 'extract',
+      slices: [
+        { name: 'Feature A', planDir: 'docs/project/extract/feat-a/', status: 'pending', files: ['src/a.mjs'] },
+        { name: 'Feature B', planDir: 'docs/project/extract/feat-b/', status: 'completed', files: ['src/b.mjs'] },
+      ],
+    },
+  }
+  const migrated = migrateResumeState(legacyState)
+  assert.equal(migrated.schemaVersion, '1.5.0')
+  assert.ok(migrated.result.projectManifest, 'migrated state must carry the project manifest')
+  assert.equal(migrated.result.projectManifest.schemaVersion, '1.5.0')
+  assert.equal(migrated.result.projectManifest.features.length, 2)
+  // Core pipeline-state fields preserved
+  assert.equal(migrated.task, legacyState.task)
+  assert.equal(migrated.slug, legacyState.slug)
+  assert.equal(migrated.planPath, legacyState.planPath)
+  assert.equal(migrated.planDir, legacyState.planDir)
+  assert.deepEqual(migrated.config, legacyState.config)
+})
+
+test('migrateResumeState: migrated state passes validatePipelineState', () => {
+  const { validatePipelineState } = engine
+  const legacyState = {
+    task: 'add retry layer',
+    slug: 'add-retry-layer',
+    planPath: 'docs/parser/feature/add-retry-layer/plan.md',
+    planDir: 'docs/parser/feature/add-retry-layer/',
+    engineVersion: '1.4.5',
+    config: { mode: 'design' },
+    result: {
+      mode: 'design',
+      slices: [
+        { name: 'Auth', planDir: 'docs/extract/auth/', status: 'pending', files: ['auth.mjs'] },
+      ],
+    },
+  }
+  const migrated = migrateResumeState(legacyState)
+  const validation = validatePipelineState(migrated)
+  assert.ok(validation.ok, `migrated state should validate: ${validation.errors?.join(', ')}`)
+})
+
+test('migrateResumeState: v1.5.0 state passes through unchanged', () => {
+  const v15State = {
+    schemaVersion: '1.5.0',
+    task: 'already migrated',
+    slug: 'already-migrated',
+    planPath: 'docs/x/plan.md',
+    planDir: 'docs/x/',
+    result: { mode: 'design' },
+  }
+  const result = migrateResumeState(v15State)
+  assert.equal(result, v15State, 'already-v1.5.0 state must return as the same object')
+})
+
+test('migrateResumeState: state without slices passes through unchanged', () => {
+  const noSlicesState = {
+    task: 'no slices here',
+    slug: 'no-slices',
+    planPath: 'docs/y/plan.md',
+    planDir: 'docs/y/',
+    engineVersion: '1.4.5',
+    result: { mode: 'design', definitionPath: 'docs/y/idea.md' },
+  }
+  const result = migrateResumeState(noSlicesState)
+  assert.equal(result, noSlicesState, 'state without slices must return as-is')
+  assert.equal(result.schemaVersion, undefined, 'must not inject schemaVersion')
+})
+
+test('migrateResumeState: strips stale checksum after mutation', () => {
+  const legacyState = {
+    task: 'has checksum',
+    slug: 'has-checksum',
+    planPath: 'docs/z/plan.md',
+    planDir: 'docs/z/',
+    engineVersion: '1.4.5',
+    checksum: 'stale-checksum-value',
+    result: {
+      mode: 'extract',
+      slices: [
+        { name: 'X', planDir: 'docs/z/x/', status: 'pending', files: ['x.mjs'] },
+      ],
+    },
+  }
+  const migrated = migrateResumeState(legacyState)
+  assert.equal(migrated.checksum, undefined, 'stale checksum must be stripped after migration')
+})
+
+test('migrateResumeState: null/undefined/non-object passes through', () => {
+  assert.equal(migrateResumeState(null), null)
+  assert.equal(migrateResumeState(undefined), undefined)
+  assert.equal(migrateResumeState('string'), 'string')
+})
+
+test('migrateResumeState: idempotent — double migration produces same result', () => {
+  const legacyState = {
+    task: 'idempotent test',
+    slug: 'idempotent',
+    planPath: 'docs/i/plan.md',
+    planDir: 'docs/i/',
+    engineVersion: '1.4.5',
+    result: {
+      mode: 'extract',
+      slices: [
+        { name: 'A', planDir: 'docs/i/a/', status: 'pending', files: ['a.mjs'] },
+        { name: 'B', planDir: 'docs/i/b/', status: 'completed', files: ['b.mjs'] },
+      ],
+    },
+  }
+  const once = migrateResumeState(legacyState)
+  const twice = migrateResumeState(once)
+  assert.equal(twice, once, 'second migration of already-v1.5.0 state must be a no-op (same object)')
 })
