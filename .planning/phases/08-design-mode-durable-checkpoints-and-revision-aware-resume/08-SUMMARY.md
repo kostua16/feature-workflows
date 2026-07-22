@@ -1,3 +1,10 @@
+---
+requirements-completed:
+  - DCKPT-01
+  - DSTATE-01
+  - DRESUME-01
+---
+
 # Phase 8: Design-Mode Durable Checkpoints and Revision-Aware Resume — Summary
 
 **Phase:** 8

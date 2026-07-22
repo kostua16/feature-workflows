@@ -1,3 +1,10 @@
+---
+requirements-completed:
+  - CONTRACT-01
+  - STATE-01
+  - REV-01
+---
+
 # Phase 1: State, Coverage, Migration, and Revision Contracts — Summary
 
 **Phase:** 1

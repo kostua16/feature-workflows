@@ -1,3 +1,10 @@
+---
+requirements-completed:
+  - COMPAT-01
+  - QUAL-01
+  - DOGFOOD-01
+---
+
 # Phase 7: Compatibility and Project-Scale Proof — Summary
 
 **Phase:** 7

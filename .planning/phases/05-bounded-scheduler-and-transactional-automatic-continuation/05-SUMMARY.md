@@ -1,3 +1,11 @@
+---
+requirements-completed:
+  - BUDGET-01
+  - RETRY-01
+  - ISOLATE-01
+  - CONT-01
+---
+
 # Phase 5: Bounded Scheduler and Transactional Automatic Continuation — Summary
 
 **Phase:** 5

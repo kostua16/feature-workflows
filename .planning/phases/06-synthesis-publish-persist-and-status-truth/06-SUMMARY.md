@@ -1,3 +1,10 @@
+---
+requirements-completed:
+  - SYNTH-01
+  - OBSERVE-01
+  - STATUS-01
+---
+
 # Phase 6: Synthesis, Publish, Persist, and Status Truth — Summary
 
 **Phase:** 6

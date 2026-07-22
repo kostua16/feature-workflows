@@ -1,3 +1,10 @@
+---
+requirements-completed:
+  - DTRANS-01
+  - DVERIFY-01
+  - DTEST-01
+---
+
 # Phase 11 Summary: Design-Mode Reliability, Verification, and Characterization Proof
 
 **Phase:** 11/11 (FINAL)

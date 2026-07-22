@@ -1,3 +1,9 @@
+---
+requirements-completed:
+  - ORCH-01
+  - CHECKPOINT-01
+---
+
 # Phase 4: Checkpointed Feature Leaf — Summary
 
 **Phase:** 4

@@ -1,3 +1,8 @@
+---
+requirements-completed:
+  - DIST-01
+---
+
 # Phase 3: Multi-Entry Build, Install, and Version Lockstep — Summary
 
 **Phase:** 3

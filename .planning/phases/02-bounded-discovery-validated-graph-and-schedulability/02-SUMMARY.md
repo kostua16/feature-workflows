@@ -1,3 +1,12 @@
+---
+requirements-completed:
+  - INV-01
+  - DISC-01
+  - GRAPH-01
+  - QUEUE-01
+  - DEPCTX-01
+---
+
 # Phase 2: Bounded Discovery, Validated Graph, and Schedulability — Summary
 
 **Phase:** 2

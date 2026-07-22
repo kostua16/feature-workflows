@@ -1,3 +1,13 @@
+---
+requirements-completed:
+  - DREADY-01
+  - DHIST-01
+  - DTERM-01
+  - DQUEST-01
+  - DCHUNK-01
+  - DYAGNI-01
+---
+
 # Phase 9: Design-Mode Truthful Readiness and Outcome Reporting — Summary
 
 **Phase:** 9

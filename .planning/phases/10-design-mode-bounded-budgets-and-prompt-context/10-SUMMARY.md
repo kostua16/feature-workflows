@@ -1,3 +1,10 @@
+---
+requirements-completed:
+  - DBUDGET-01
+  - DLOOP-01
+  - DPROMPT-01
+---
+
 # Phase 10: Design-Mode Bounded Budgets and Prompt Context — Summary
 
 **Phase:** 10
