@@ -3898,7 +3898,7 @@ function deriveCoverageIndex(summaries) {
     failed: 0,
     skipped: 0,
     excluded: 0,
-    inProgress: 0,
+    'in-progress': 0,
     runnable: 0,
   }
   for (var i = 0; i < summaries.length; i++) {
@@ -3910,7 +3910,7 @@ function deriveCoverageIndex(summaries) {
     denominator: denominator,
     completed: counts.completed,
     deferred: counts.deferred,
-    remaining: counts.runnable + counts.deferred + counts.inProgress,
+    remaining: counts.runnable + counts.deferred + counts['in-progress'],
     blocked: counts.blocked,
     failed: counts.failed,
     skipped: counts.skipped,
@@ -3995,6 +3995,11 @@ function synthesizeProjectViews(featureSummaries, oldState, revisions) {
     if (prev.featureDigests[s.id] !== d) {
       changed = true
     }
+  }
+
+  // Detect feature-set membership changes (removals not caught by digest check)
+  if (Object.keys(prev.featureDigests || {}).length !== Object.keys(newDigests).length) {
+    changed = true
   }
 
   // If nothing changed and revisions match, retain existing views (idempotent)
@@ -4101,7 +4106,7 @@ const PERSIST_UNIT_TYPES = Object.freeze({
   FEATURE_SHARD: 'feature-shard',
   PROJECT_INDEX: 'project-index',
   SYNTHESIS_VIEW: 'synthesis-view',
-  CONTINUUATION_ACK: 'continuation-ack',
+  CONTINUATION_ACK: 'continuation-ack',
 })
 
 // Initialize empty persistence tracker.
@@ -4129,7 +4134,7 @@ function recordAttemptedWrite(tracker, key, unitType) {
 
   var entry = {
     key: key,
-    unitType: unitType || PERSIST_UNIT_TYPES.FEATURE_SHARD,
+    unitType: unitType || (existing ? existing.unitType : PERSIST_UNIT_TYPES.FEATURE_SHARD),
     state: PERSISTENCE_STATES.ATTEMPTED,
     attempts: existing ? existing.attempts + 1 : 1,
   }

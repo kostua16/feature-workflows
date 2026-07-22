@@ -15,7 +15,7 @@ const PERSIST_UNIT_TYPES = Object.freeze({
   FEATURE_SHARD: 'feature-shard',
   PROJECT_INDEX: 'project-index',
   SYNTHESIS_VIEW: 'synthesis-view',
-  CONTINUUATION_ACK: 'continuation-ack',
+  CONTINUATION_ACK: 'continuation-ack',
 })
 
 // Initialize empty persistence tracker.
@@ -43,7 +43,7 @@ function recordAttemptedWrite(tracker, key, unitType) {
 
   var entry = {
     key: key,
-    unitType: unitType || PERSIST_UNIT_TYPES.FEATURE_SHARD,
+    unitType: unitType || (existing ? existing.unitType : PERSIST_UNIT_TYPES.FEATURE_SHARD),
     state: PERSISTENCE_STATES.ATTEMPTED,
     attempts: existing ? existing.attempts + 1 : 1,
   }

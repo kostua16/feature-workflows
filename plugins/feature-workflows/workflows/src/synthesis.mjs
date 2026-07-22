@@ -60,7 +60,7 @@ function deriveCoverageIndex(summaries) {
     failed: 0,
     skipped: 0,
     excluded: 0,
-    inProgress: 0,
+    'in-progress': 0,
     runnable: 0,
   }
   for (var i = 0; i < summaries.length; i++) {
@@ -72,7 +72,7 @@ function deriveCoverageIndex(summaries) {
     denominator: denominator,
     completed: counts.completed,
     deferred: counts.deferred,
-    remaining: counts.runnable + counts.deferred + counts.inProgress,
+    remaining: counts.runnable + counts.deferred + counts['in-progress'],
     blocked: counts.blocked,
     failed: counts.failed,
     skipped: counts.skipped,
@@ -157,6 +157,11 @@ function synthesizeProjectViews(featureSummaries, oldState, revisions) {
     if (prev.featureDigests[s.id] !== d) {
       changed = true
     }
+  }
+
+  // Detect feature-set membership changes (removals not caught by digest check)
+  if (Object.keys(prev.featureDigests || {}).length !== Object.keys(newDigests).length) {
+    changed = true
   }
 
   // If nothing changed and revisions match, retain existing views (idempotent)
