@@ -2,20 +2,6 @@
 name: quick-decider
 description: |-
   Use this agent when you need fast, expert recommendation to select best option from small list at branching point. Optimized for 1-4 turns.
-
-  <example>
-  assistant: "I have two implementation approaches but need to pick one quickly. I'll use quick-decider agent with both options and context."
-  <commentary>
-  When you have defined set of options and need fast recommendation, delegate to quick-decider agent.
-  </commentary>
-  </example>
-
-  <example>
-  assistant: "Let me use quick-decider agent to evaluate these three HTTP libraries and recommend best fit."
-  <commentary>
-  When selecting among multiple candidates and speed matters more than exhaustive analysis, delegate to quick-decider agent.
-  </commentary>
-  </example>
 tools: [ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern]
 model: opus
 color: red

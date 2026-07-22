@@ -2,14 +2,6 @@
 name: feature-categorizer
 description: |-
   Use this agent when you need to categorize feature idea or request into project taxonomy. Returns category in form "{module/global-category}/{component/sub-category}".
-
-  <example>
-  user: "We need support for parsing XML log files alongside the JSON parser."
-  assistant: "I'll use feature-categorizer agent to determine where this feature fits in project taxonomy."
-  <commentary>
-  Use feature-categorizer agent before implementation planning to classify feature ideas.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: opus
 color: red

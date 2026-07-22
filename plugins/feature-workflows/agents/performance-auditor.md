@@ -2,14 +2,6 @@
 name: "performance-auditor"
 description: |-
   Use this agent to audit app perf, tune SQL queries, investigate perf degradation, identify bottlenecks, profile code, or recommend optimizations. Specializes in finding perf issues before they become critical and diagnosing slowdown root causes.
-
-  <example>
-  user: "Our reporting queries are taking 30+ seconds, can you optimize them?"
-  assistant: "I'll use the Agent tool to launch the performance-auditor agent to investigate and optimize the slow queries"
-  <commentary>
-  SQL tuning, perf degradation investigation, proactive code review — all use the performance-auditor agent.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Bash, Edit, NotebookEdit, Write
 model: opus
 color: green

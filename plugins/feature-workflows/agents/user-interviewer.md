@@ -2,14 +2,6 @@
 name: user-interviewer
 description: |-
   Use this agent when the user needs to interview stakeholders or gather requirements through structured questioning.
-
-  <example>
-  user: "I need to understand what features the marketing team wants in the analytics dashboard"
-  assistant: "I'll use the user-interviewer agent to help gather those requirements."
-  <commentary>
-  The user needs to gather requirements through structured interviewing, so use the user-interviewer agent.
-  </commentary>
-  </example>
 model: sonnet
 color: green
 memory: project

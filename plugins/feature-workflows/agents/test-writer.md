@@ -2,15 +2,6 @@
 name: test-writer
 description: |-
   Use this agent when you need to write TDD (RED and GREEN) tests derived from e2e use cases, NFRs, system requirements, or plan-defined test goals. Produces failing RED-phase tests first, then passing GREEN-phase validation tests.
-
-  <example>
-  Context: The plan-architect has defined test goals for a new caching feature, and the user wants tests written before implementation.
-  user: "The plan includes test goals for the cache invalidation feature. Let's start with the tests."
-  assistant: "I'll use the Agent tool to launch the test-writer agent to write the RED-phase tests for cache invalidation based on the plan's test goals."
-  <commentary>
-  Since test goals from a plan are ready and the user wants TDD tests, use the test-writer agent to create the RED-phase tests first.
-  </commentary>
-  </example>
 tools: [ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Edit, NotebookEdit, Write, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern]
 model: opus
 color: red

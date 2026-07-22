@@ -2,14 +2,6 @@
 name: plan-executor
 description: |-
   Use this agent when the user wants to execute a previously created plan or task definition.
-
-  <example>
-  user: "Execute the implementation plan for the caching layer"
-  assistant: "I'll use the plan-executor agent to carry out the plan."
-  <commentary>
-  The user wants to execute a plan, so use the plan-executor agent.
-  </commentary>
-  </example>
 model: haiku
 color: orange
 memory: project

@@ -2,14 +2,6 @@
 name: code-explorer
 description: |-
   Use this agent when the user needs to explore, search, read, or analyze project files and code.
-
-  <example>
-  user: "How does the authentication flow work in this codebase?"
-  assistant: "I'll use the code-explorer agent to investigate the authentication flow."
-  <commentary>
-  The user wants to understand a code pattern across the codebase, so use the code-explorer agent to search, read, and summarize the authentication implementation.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: haiku
 color: green
