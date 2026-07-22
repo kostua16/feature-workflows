@@ -634,7 +634,11 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       artifactPath: artifactPathKey ? (result[artifactPathKey] || null) : null,
     }
     if (artifactPathKey && result[artifactPathKey]) {
-      const dataKey = '_' + artifactPathKey.replace('Path', '')
+      // The result data field for definitionPath is _define (gate name),
+      // not _definition (path prefix). All other keys follow the _ + replace
+      // convention and match their result field directly.
+      const dataKey = artifactPathKey === 'definitionPath' ? '_define'
+        : '_' + artifactPathKey.replace('Path', '')
       result._artifactDigests[artifactPathKey] = computeContentDigest(result[dataKey] || result[artifactPathKey])
     }
     plog(`checkpointDesign: durable flush at gate '${gateName}'`)
