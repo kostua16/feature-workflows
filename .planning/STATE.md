@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.5.0
 milestone_name: Project-Scale Extract Design
-status: executing
-stopped_at: Phase 10 complete — ready for Phase 11 planning
-last_updated: "2026-07-22T14:59:43.033Z"
-last_activity: "2026-07-22 — Phase 10 complete: bounded design budgets (DBUDGET-01), per-loop sub-budgets (DLOOP-01), compactList prompts (DPROMPT-01) (32 new tests, 732 total)"
+status: completed
+stopped_at: Phase 11 complete — milestone v1.5.0 finished (11/11 phases, 787 tests)
+last_updated: "2026-07-22T15:07:40.065Z"
+last_activity: "2026-07-22 — Phase 11 complete: transient-error backoff, deterministic artifact verification, behavioral characterization tests (55 new tests, 787 total)"
 progress:
   total_phases: 11
-  completed_phases: 10
-  total_plans: 10
-  completed_plans: 10
-  percent: 91
+  completed_phases: 11
+  total_plans: 11
+  completed_plans: 11
+  percent: 100
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-07-22)
 
 ## Current Position
 
-Phase: 11 of 11 (Design-Mode Reliability, Verification, and Characterization Proof)
-Plan: 0 of TBD in current phase
-Status: Ready to execute
-Last activity: 2026-07-22 — Phase 10 complete: bounded design budgets (DBUDGET-01), per-loop sub-budgets (DLOOP-01), compactList prompts (DPROMPT-01) (32 new tests, 732 total)
+Phase: 11 — COMPLETE
+Plan: 1 of 1 in current phase
+Status: Phase 11 complete — milestone v1.5.0 finished
+Last activity: 2026-07-22 — Phase 11 complete: transient-error backoff (DTRANS-01), deterministic artifact verification (DVERIFY-01), behavioral characterization tests (DTEST-01) (55 new tests, 787 total)
 
 Progress: [█████████░] 91%
 
@@ -55,7 +55,7 @@ Progress: [█████████░] 91%
 | 9 | 1 | 1 | — |
 | 10 | 1 | 1 | — |
 
-**Recent Trend:** Phases 1-10 complete with 732 tests passing.
+**Recent Trend:** Phases 1-11 complete with 787 tests passing. Milestone v1.5.0 finished.
 
 ## Accumulated Context
 
@@ -92,6 +92,7 @@ None yet.
 - Phase 8 COMPLETE: design-mode durable checkpoints (DCKPT-01 — 19 material gates), auto-recovering atomic state writes (DSTATE-01 — last-good snapshot), digest-driven resume (DRESUME-01 — skip unchanged artifacts) (22 new tests, 646 total).
 - Phase 9 COMPLETE: truthful design readiness (DREADY-01 — deriveDesignReadiness pure gate), durable degradation journal (DHIST-01 — fail-forward/retry/escalation/fallback events), terminal outcome blocking (DTERM-01 — commit failure blocks, publish/persist verified), open-questions enforcement (DQUEST-01), chunker degradation surfacing (DCHUNK-01), YAGNI blocker routing (DYAGNI-01) (54 new tests, 700 total).
 - Phase 10 COMPLETE: enforced design budgets (DBUDGET-01 — design-budget.mjs wrapping Phase 5 budget-admission with per-gate/per-run caps + HANDOFF reserve), per-loop sub-budgets (DLOOP-01 — design-loops.mjs with independent refine/reconcile/debug/escalation budgets; configurable escalation retries), bounded prompt payloads (DPROMPT-01 — compactList applied at all design-gate JSON.stringify sites) (32 new tests, 732 total).
+- Phase 11 COMPLETE: transient-error backoff (DTRANS-01 — classifyAgentError + retryTransientError with bounded exponential backoff in flexibleAgent), deterministic artifact verification (DVERIFY-01 — verifyArtifactDigest pure function using durable checkpoint+digest; verifyArtifactPresence skips LLM when digest-verified; verifyAppendGrowth uses content digest), behavioral characterization proof (DTEST-01 — 55 new tests covering error classification, digest verification, append-growth, gate sequence, retry ladder, crash-resume, partial writes, regression assertions for phases 8-10) (55 new tests, 787 total).
 
 ## Deferred Items
 
