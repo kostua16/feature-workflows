@@ -2153,6 +2153,1057 @@ function retainValidEvidence(featureShard) {
   return { ...featureShard, gates: validGates }
 }
 
+// Deterministic repository inventory: path classification, inventory construction,
+// digest computation, and oversized-area refinement.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Every discovered path is accounted for as included or explicitly excluded,
+// with the applicable policy (generated, vendor, ignore) recorded as evidence.
+
+
+// Path classification policies. Each policy has a test predicate and a verdict.
+const PATH_POLICIES = Object.freeze({
+  INCLUDED: 'included',
+  EXCLUDED: 'excluded',
+  GENERATED: 'generated',
+  VENDOR: 'vendor',
+  IGNORED: 'ignored',
+})
+
+// Common generated/vendor/ignore directory patterns. A path matches if any
+// segment equals one of these names. Deterministic: same path → same verdict.
+const GENERATED_SEGMENTS = new Set([
+  'node_modules', 'dist', 'build', '.next', 'out', 'target',
+  '__pycache__', '.pytest_cache', 'coverage', '.nyc_output',
+  'vendor', '.vendor', 'third_party', 'third-party',
+])
+const IGNORE_SEGMENTS = new Set([
+  '.git', '.svn', '.hg', '.DS_Store', 'Thumbs.db',
+])
+
+// Common generated file extensions that indicate non-source paths.
+const GENERATED_EXTENSIONS = new Set([
+  '.min.js', '.min.css', '.map', '.lock', '.pyc', '.pyo',
+  '.class', '.o', '.so', '.dylib', '.dll', '.exe',
+])
+
+// Classify a single path against the policy set.
+// Returns { path, verdict, policy, evidence } — deterministic.
+//
+// policies: optional override { generatedSegments?, ignoreSegments?, generatedExtensions?, includePatterns?, excludePatterns? }
+function classifyPath(path, policies) {
+  const opts = policies || {}
+  const genSegs = opts.generatedSegments || GENERATED_SEGMENTS
+  const ignSegs = opts.ignoreSegments || IGNORE_SEGMENTS
+  const genExts = opts.generatedExtensions || GENERATED_EXTENSIONS
+  const includePats = opts.includePatterns || []
+  const excludePats = opts.excludePatterns || []
+
+  if (!path || typeof path !== 'string') {
+    return { path: String(path || ''), verdict: PATH_POLICIES.EXCLUDED, policy: 'invalid', evidence: 'path is not a string' }
+  }
+
+  const segments = path.split('/')
+  const basename = segments[segments.length - 1] || ''
+  const ext = basename.substring(basename.lastIndexOf('.'))
+
+  // Check ignore patterns first (highest precedence)
+  for (const seg of segments) {
+    if (ignSegs.has(seg)) {
+      return { path, verdict: PATH_POLICIES.IGNORED, policy: 'ignore', evidence: `segment '${seg}' matches ignore list` }
+    }
+  }
+  for (const pat of excludePats) {
+    if (path.includes(pat)) {
+      return { path, verdict: PATH_POLICIES.EXCLUDED, policy: 'exclude-pattern', evidence: `matches exclude pattern '${pat}'` }
+    }
+  }
+
+  // Check generated/vendor
+  for (const seg of segments) {
+    if (genSegs.has(seg)) {
+      const isVendor = seg === 'vendor' || seg === '.vendor' || seg === 'third_party' || seg === 'third-party'
+      return {
+        path,
+        verdict: PATH_POLICIES.GENERATED,
+        policy: isVendor ? 'vendor' : 'generated',
+        evidence: `segment '${seg}' classified as ${isVendor ? 'vendor' : 'generated'}`,
+      }
+    }
+  }
+
+  // Check generated extensions
+  for (const gExt of genExts) {
+    if (basename.endsWith(gExt)) {
+      return { path, verdict: PATH_POLICIES.GENERATED, policy: 'generated', evidence: `extension '${gExt}' is generated` }
+    }
+  }
+
+  // Check explicit include patterns
+  for (const pat of includePats) {
+    if (path.includes(pat)) {
+      return { path, verdict: PATH_POLICIES.INCLUDED, policy: 'include-pattern', evidence: `matches include pattern '${pat}'` }
+    }
+  }
+
+  // Default: included
+  return { path, verdict: PATH_POLICIES.INCLUDED, policy: 'default', evidence: 'no exclusion policy matched' }
+}
+
+// Build a deterministic inventory from a list of paths.
+// Sorts paths canonically (by UTF-16 code unit order) so the same input
+// always produces the same output regardless of traversal order.
+//
+// paths: string[]
+// policies: optional override (see classifyPath)
+// Returns: { entries: [...], digest, counts }
+function buildInventory(paths, policies) {
+  if (!Array.isArray(paths)) {
+    throw new Error('buildInventory: paths must be an array')
+  }
+
+  // Canonical sort ensures deterministic ordering regardless of traversal order
+  const sorted = [...paths].sort()
+
+  const entries = sorted.map((p) => classifyPath(p, policies))
+
+  const counts = {
+    included: 0,
+    excluded: 0,
+    generated: 0,
+    vendor: 0,
+    ignored: 0,
+  }
+
+  for (const e of entries) {
+    if (e.verdict === PATH_POLICIES.INCLUDED) counts.included++
+    else if (e.verdict === PATH_POLICIES.EXCLUDED) counts.excluded++
+    else if (e.verdict === PATH_POLICIES.GENERATED) {
+      if (e.policy === 'vendor') counts.vendor++
+      else counts.generated++
+    } else if (e.verdict === PATH_POLICIES.IGNORED) counts.ignored++
+  }
+
+  return {
+    entries,
+    digest: inventoryDigest({ entries }),
+    counts,
+  }
+}
+
+// Compute a deterministic digest over an inventory's entries.
+// Only the path and verdict of each entry contribute to the digest,
+// so reclassification of evidence text does not change the fingerprint.
+function inventoryDigest(inventory) {
+  const entries = (inventory && inventory.entries) || []
+  const fingerprint = entries.map((e) => `${e.path}|${e.verdict}`).join('\n')
+  return computeDigest(fingerprint)
+}
+
+// Recursively refine an oversized area into bounded pages.
+// If the area has more paths than maxPathsPerPage, split it in half
+// recursively until each page is within the bound.
+//
+// area: { name, paths: string[] }
+// maxPathsPerPage: number (must be > 0)
+// Returns: pages — array of { name, paths, depth }
+function refineOversizedArea(area, maxPathsPerPage) {
+  if (!area || !Array.isArray(area.paths)) {
+    throw new Error('refineOversizedArea: area must have a paths array')
+  }
+  if (!Number.isFinite(maxPathsPerPage) || maxPathsPerPage <= 0) {
+    throw new Error('refineOversizedArea: maxPathsPerPage must be a positive number')
+  }
+
+  const pages = []
+
+  function splitRecursive(name, paths, depth) {
+    if (paths.length <= maxPathsPerPage) {
+      pages.push({ name, paths: [...paths].sort(), depth })
+      return
+    }
+
+    // Sort paths for deterministic splitting
+    const sorted = [...paths].sort()
+    const mid = Math.ceil(sorted.length / 2)
+
+    // Derive sub-area names from the path prefix at the split point
+    const firstHalf = sorted.slice(0, mid)
+    const secondHalf = sorted.slice(mid)
+
+    // Use common directory prefix for naming sub-areas
+    const firstName = `${name}-a`
+    const secondName = `${name}-b`
+
+    splitRecursive(firstName, firstHalf, depth + 1)
+    splitRecursive(secondName, secondHalf, depth + 1)
+  }
+
+  splitRecursive(area.name || 'area', area.paths, 0)
+  return pages
+}
+
+// Durable paginated discovery: cursors, page advancement, interruption recovery.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Oversized areas refine recursively into bounded durable pages; interrupted
+// discovery resumes without gaps or duplicates through stable cursor positions.
+
+
+// Create a pagination cursor over an inventory.
+// The cursor tracks position so interrupted discovery can resume exactly.
+//
+// inventory: { entries: [...], digest, counts } from buildInventory
+// pageSize: number of entries per page (must be > 0)
+// Returns: { includedEntries, pageSize, offset, exhausted, digest, pagesEmitted }
+function createCursor(inventory, pageSize) {
+  if (!inventory || !Array.isArray(inventory.entries)) {
+    throw new Error('createCursor: inventory must have an entries array')
+  }
+  if (!Number.isFinite(pageSize) || pageSize <= 0) {
+    throw new Error('createCursor: pageSize must be a positive number')
+  }
+
+  // Only included entries are paginated; excluded/generated/ignored are
+  // accounted for but not paged
+  const included = inventory.entries.filter((e) => e.verdict === 'included')
+
+  return {
+    includedEntries: included,
+    pageSize,
+    offset: 0,
+    exhausted: included.length === 0,
+    digest: inventory.digest,
+    pagesEmitted: 0,
+    totalIncluded: included.length,
+  }
+}
+
+// Advance the cursor by one page. Returns the page entries and an updated cursor.
+// The page includes entries [offset, offset+pageSize). The updated cursor's
+// offset advances past the page.
+//
+// cursor: from createCursor
+// Returns: { page: [...], cursor: updatedCursor } or { page: [], cursor: same } if exhausted
+function nextPage(cursor) {
+  if (!cursor || cursor.exhausted || cursor.offset >= cursor.includedEntries.length) {
+    return { page: [], cursor: { ...cursor, exhausted: true } }
+  }
+
+  const start = cursor.offset
+  const end = Math.min(start + cursor.pageSize, cursor.includedEntries.length)
+  const page = cursor.includedEntries.slice(start, end)
+
+  const newOffset = end
+  const exhausted = newOffset >= cursor.includedEntries.length
+
+  return {
+    page,
+    cursor: {
+      ...cursor,
+      offset: newOffset,
+      exhausted,
+      pagesEmitted: cursor.pagesEmitted + 1,
+    },
+  }
+}
+
+// Resume discovery from an interrupted cursor position.
+// Returns the same result as nextPage but validates that the cursor's
+// digest matches the expected inventory — if the inventory changed,
+// the cursor is marked stale.
+//
+// cursor: interrupted cursor
+// expectedDigest: digest of the current inventory
+// Returns: { page, cursor, stale } — stale=true if inventory changed
+function resumeDiscovery(cursor, expectedDigest) {
+  if (!cursor) {
+    throw new Error('resumeDiscovery: cursor is required')
+  }
+
+  const stale = expectedDigest && cursor.digest !== expectedDigest
+  if (stale) {
+    // Cursor is stale — discovery must restart
+    return { page: [], cursor: { ...cursor, exhausted: false, offset: 0, pagesEmitted: 0, digest: expectedDigest }, stale: true }
+  }
+
+  const result = nextPage(cursor)
+  return { ...result, stale: false }
+}
+
+// Check if a cursor has covered all included entries.
+function exhausted(cursor) {
+  if (!cursor) return true
+  return cursor.exhausted || cursor.offset >= (cursor.totalIncluded || 0)
+}
+
+// Collect all pages from an inventory at once (for testing/small inventories).
+// Returns an array of page arrays.
+function allPages(inventory, pageSize) {
+  const cursor = createCursor(inventory, pageSize)
+  const pages = []
+  let c = cursor
+  while (!exhausted(c)) {
+    const result = nextPage(c)
+    if (result.page.length === 0) break
+    pages.push(result.page)
+    c = result.cursor
+  }
+  return pages
+}
+
+// Compute a deterministic page digest from a single page's entries.
+function pageDigest(pageEntries) {
+  const fingerprint = (pageEntries || [])
+    .map((e) => `${e.path}|${e.verdict}`)
+    .join('\n')
+  return computeDigest(fingerprint)
+}
+
+// Discovery result: pages + canonical feature identity extraction.
+// Takes the full set of included pages and extracts canonical feature identities
+// using path-based grouping. Each unique directory prefix becomes a candidate feature.
+//
+// pages: array of page arrays (from allPages or accumulated nextPage calls)
+// Returns: { features: [{ id, paths, digest }], totalFeatures, coverageDigest }
+function extractFeaturesFromPages(pages) {
+  if (!Array.isArray(pages)) {
+    throw new Error('extractFeaturesFromPages: pages must be an array')
+  }
+
+  // Flatten all pages into a single entry list
+  const allEntries = pages.flat()
+
+  // Group by directory prefix for feature extraction
+  const dirMap = new Map()
+  for (const entry of allEntries) {
+    const segs = entry.path.split('/')
+    // Use parent directory as feature identity (or root for top-level files)
+    const dir = segs.length > 1 ? segs.slice(0, -1).join('/') : '(root)'
+    if (!dirMap.has(dir)) {
+      dirMap.set(dir, [])
+    }
+    dirMap.get(dir).push(entry.path)
+  }
+
+  const features = []
+  for (const [dir, paths] of dirMap) {
+    // Canonicalize the directory into a feature ID
+    const id = dir.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root'
+    features.push({
+      id,
+      paths: paths.sort(),
+      digest: computeDigest(paths.sort().join('\n')),
+    })
+  }
+
+  // Sort features by ID for deterministic ordering
+  features.sort((a, b) => a.id.localeCompare(b.id))
+
+  return {
+    features,
+    totalFeatures: features.length,
+    coverageDigest: computeDigest(features.map((f) => f.id).sort().join('\n')),
+  }
+}
+
+// Validated feature graph: canonical identities, ownership verification,
+// dependency edge validation, and cycle detection.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Graph validation rejects unexplained ownership gaps/overlap, collisions,
+// dangling edges, and unsupported cycles before extraction.
+
+
+// Cycle policy classifications
+const CYCLE_POLICIES = Object.freeze({
+  SUPPORTED: 'supported',   // cycle allowed via explicit policy (e.g. priority override)
+  UNSUPPORTED: 'unsupported', // cycle must not be scheduled — deadlock
+  NONE: 'none',             // no cycle detected
+})
+
+// Graph validation result verdicts
+const GRAPH_VERDICTS = Object.freeze({
+  VALID: 'valid',
+  INVALID: 'invalid',
+})
+
+// Canonicalize feature identities to be collision-free.
+// If two features have the same derived ID, disambiguate using their paths.
+//
+// features: [{ id, paths: [...], ... }]
+// Returns: { canonical: [{ id, originalId, paths, ... }], collisions: [...] }
+function canonicalizeIdentity(features) {
+  if (!Array.isArray(features)) {
+    throw new Error('canonicalizeIdentity: features must be an array')
+  }
+
+  const idMap = new Map()
+  for (const f of features) {
+    const id = f.id || 'unknown'
+    if (!idMap.has(id)) {
+      idMap.set(id, [])
+    }
+    idMap.get(id).push(f)
+  }
+
+  const collisions = []
+  const canonical = []
+
+  for (const [id, group] of idMap) {
+    if (group.length === 1) {
+      canonical.push({ ...group[0], originalId: id })
+    } else {
+      // Collision: disambiguate by index suffix
+      collisions.push({ id, count: group.length, paths: group.flatMap((f) => f.paths || []) })
+      group.forEach((f, i) => {
+        canonical.push({ ...f, originalId: id, id: `${id}-${i + 1}` })
+      })
+    }
+  }
+
+  return { canonical, collisions }
+}
+
+// Detect cycles in a dependency edge list using depth-first search.
+// Returns the first cycle found (if any) as an array of feature IDs.
+//
+// edges: [{ from, to }] — from depends on to (to must complete first)
+// Returns: { hasCycle, cycle: [...], allCycles: [...] }
+function detectCycle(edges) {
+  if (!Array.isArray(edges)) {
+    return { hasCycle: false, cycle: [], allCycles: [] }
+  }
+
+  // Build adjacency list
+  const adj = new Map()
+  const nodes = new Set()
+  for (const e of edges) {
+    if (!adj.has(e.from)) adj.set(e.from, [])
+    adj.get(e.from).push(e.to)
+    nodes.add(e.from)
+    nodes.add(e.to)
+  }
+
+  const WHITE = 0, GRAY = 1, BLACK = 2
+  const color = new Map()
+  for (const n of nodes) color.set(n, WHITE)
+
+  const allCycles = []
+
+  function dfsVisit(node, path) {
+    color.set(node, GRAY)
+    path.push(node)
+
+    const neighbors = adj.get(node) || []
+    for (const next of neighbors) {
+      if (!color.has(next)) {
+        color.set(next, WHITE)
+      }
+      const c = color.get(next)
+      if (c === GRAY) {
+        // Found a cycle — extract it from the path
+        const cycleStart = path.indexOf(next)
+        const cycle = path.slice(cycleStart).concat([next])
+        allCycles.push(cycle)
+      } else if (c === WHITE) {
+        dfsVisit(next, path)
+      }
+    }
+
+    path.pop()
+    color.set(node, BLACK)
+  }
+
+  for (const n of nodes) {
+    if (color.get(n) === WHITE) {
+      dfsVisit(n, [])
+    }
+  }
+
+  // Deduplicate cycles (normalize rotation)
+  const seen = new Set()
+  const uniqueCycles = []
+  for (const cycle of allCycles) {
+    // Normalize: rotate so the smallest ID is first, then join as key
+    const minIdx = cycle.indexOf(cycle.reduce((a, b) => (a < b ? a : b)))
+    const normalized = [...cycle.slice(minIdx, -1), ...cycle.slice(0, minIdx)].join('->')
+    if (!seen.has(normalized)) {
+      seen.add(normalized)
+      uniqueCycles.push(cycle)
+    }
+  }
+
+  return {
+    hasCycle: uniqueCycles.length > 0,
+    cycle: uniqueCycles[0] || [],
+    allCycles: uniqueCycles,
+  }
+}
+
+// Classify a cycle as supported (policy override) or unsupported (deadlock).
+//
+// edges: [{ from, to }]
+// cyclePolicy: optional map of { edgeKey: 'supported' | 'unsupported' }
+// Returns: { classification: 'supported' | 'unsupported' | 'none', cycle: [...] }
+function classifyCycle(edges, cyclePolicy) {
+  const detection = detectCycle(edges)
+  if (!detection.hasCycle) {
+    return { classification: CYCLE_POLICIES.NONE, cycle: [] }
+  }
+
+  // Check if the cycle has explicit policy support
+  const policy = cyclePolicy || {}
+  const cycleEdges = detection.cycle
+  let allSupported = true
+
+  for (let i = 0; i < cycleEdges.length - 1; i++) {
+    const key = `${cycleEdges[i]}->${cycleEdges[i + 1]}`
+    if (policy[key] !== 'supported') {
+      allSupported = false
+      break
+    }
+  }
+
+  return {
+    classification: allSupported ? CYCLE_POLICIES.SUPPORTED : CYCLE_POLICIES.UNSUPPORTED,
+    cycle: detection.cycle,
+  }
+}
+
+// Validate the full feature graph.
+//
+// features: [{ id, paths: [...] }]
+// edges: [{ from, to }] — dependency edges
+// ownershipMap: optional { path: featureId } — explicit ownership assignment
+// cyclePolicy: optional map for supported cycles
+//
+// Returns: {
+//   verdict: 'valid' | 'invalid',
+//   errors: [{ type, detail }],
+//   warnings: [{ type, detail }],
+// }
+function validateGraph(features, edges, ownershipMap, cyclePolicy) {
+  const errors = []
+  const warnings = []
+
+  // 1. Check for identity collisions
+  const idSet = new Set()
+  const idCounts = new Map()
+  for (const f of features || []) {
+    const id = f.id || 'unknown'
+    idCounts.set(id, (idCounts.get(id) || 0) + 1)
+  }
+  for (const [id, count] of idCounts) {
+    if (count > 1) {
+      errors.push({ type: 'identity-collision', detail: `Feature ID '${id}' appears ${count} times` })
+    }
+  }
+
+  // 2. Check ownership gaps and overlaps
+  if (ownershipMap) {
+    const featureIds = new Set(features.map((f) => f.id))
+    const pathOwners = new Map()
+
+    for (const [path, ownerId] of Object.entries(ownershipMap)) {
+      if (!featureIds.has(ownerId)) {
+        errors.push({ type: 'ownership-gap', detail: `Path '${path}' owned by unknown feature '${ownerId}'` })
+      }
+      if (pathOwners.has(path)) {
+        errors.push({
+          type: 'ownership-overlap',
+          detail: `Path '${path}' owned by both '${pathOwners.get(path)}' and '${ownerId}'`,
+        })
+      } else {
+        pathOwners.set(path, ownerId)
+      }
+    }
+
+    // Check for uncovered paths (gaps in ownership)
+    const allFeaturePaths = new Set((features || []).flatMap((f) => f.paths || []))
+    for (const p of allFeaturePaths) {
+      if (!pathOwners.has(p)) {
+        warnings.push({ type: 'ownership-unassigned', detail: `Path '${p}' not in ownership map` })
+      }
+    }
+  }
+
+  // 3. Check for dangling edges (references to non-existent features)
+  const featureIdSet = new Set((features || []).map((f) => f.id))
+  for (const e of edges || []) {
+    if (!featureIdSet.has(e.from)) {
+      errors.push({ type: 'dangling-edge', detail: `Edge from unknown feature '${e.from}'` })
+    }
+    if (!featureIdSet.has(e.to)) {
+      errors.push({ type: 'dangling-edge', detail: `Edge to unknown feature '${e.to}'` })
+    }
+  }
+
+  // 4. Check for cycles
+  if (edges && edges.length > 0) {
+    const cycleResult = classifyCycle(edges, cyclePolicy)
+    if (cycleResult.classification === CYCLE_POLICIES.UNSUPPORTED) {
+      errors.push({
+        type: 'unsupported-cycle',
+        detail: `Unsupported dependency cycle: ${cycleResult.cycle.join(' -> ')}`,
+      })
+    } else if (cycleResult.classification === CYCLE_POLICIES.SUPPORTED) {
+      warnings.push({
+        type: 'supported-cycle',
+        detail: `Supported dependency cycle: ${cycleResult.cycle.join(' -> ')}`,
+      })
+    }
+  }
+
+  return {
+    verdict: errors.length === 0 ? GRAPH_VERDICTS.VALID : GRAPH_VERDICTS.INVALID,
+    errors,
+    warnings,
+  }
+}
+
+// Compute a deterministic digest of the feature graph.
+// Includes feature IDs (sorted), paths, and edges (sorted).
+function graphDigest(features, edges) {
+  const fPart = (features || [])
+    .map((f) => `${f.id}:${(f.paths || []).sort().join(',')}`)
+    .sort()
+    .join('\n')
+  const ePart = (edges || [])
+    .map((e) => `${e.from}->${e.to}`)
+    .sort()
+    .join('\n')
+  return computeDigest(`${fPart}\n---\n${ePart}`)
+}
+
+// Truthful queue semantics: exactly-one-state guarantee, cap enforcement,
+// selector application, deferred promotion, and coverage denominator.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Caps and selectors retain unprocessed in-scope features as resumable deferred
+// work rather than completion. Excluded paths remain outside the denominator
+// with recorded rationale.
+
+
+// Apply a segment cap to a list of features. Features beyond the cap are
+// marked deferred (NOT excluded or completed). Previously runnable features
+// within the cap remain runnable. Idempotent: reapplying the same cap produces
+// the same result.
+//
+// features: [{ id, lifecycle, ... }]
+// cap: max number of features in non-deferred processing state
+// Returns: new features array with cap applied (does NOT mutate input)
+function applyCap(features, cap) {
+  if (!Array.isArray(features)) {
+    throw new Error('applyCap: features must be an array')
+  }
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error('applyCap: cap must be a positive number')
+  }
+
+  let processingCount = 0
+  return features.map((f) => {
+    // Only consider in-scope features (not excluded)
+    if (f.lifecycle === LIFECYCLE_STATES.EXCLUDED) {
+      return { ...f }
+    }
+
+    // Count features already in a processing state (in-progress, runnable that
+    // have been admitted, completed, failed, blocked, skipped)
+    const isProcessing = f.lifecycle !== LIFECYCLE_STATES.DEFERRED &&
+      f.lifecycle !== LIFECYCLE_STATES.EXCLUDED
+
+    if (isProcessing || f.lifecycle === LIFECYCLE_STATES.RUNNABLE) {
+      if (processingCount < cap) {
+        processingCount++
+        return { ...f }
+      }
+      // Over cap — defer with rationale
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.DEFERRED,
+        deferReason: 'cap-exceeded',
+      }
+    }
+
+    // Already deferred or other state — leave as-is
+    return { ...f }
+  })
+}
+
+// Apply a selector to filter which features are admitted. Non-selected
+// in-scope features are marked deferred (NOT excluded). Idempotent.
+//
+// features: [{ id, lifecycle, ... }]
+// selector: { includeIds: [...] } or { excludeIds: [...] }
+// Returns: new features array with selector applied
+function applySelector(features, selector) {
+  if (!Array.isArray(features)) {
+    throw new Error('applySelector: features must be an array')
+  }
+  if (!selector) {
+    return features.map((f) => ({ ...f }))
+  }
+
+  const includeSet = new Set(selector.includeIds || [])
+  const excludeSet = new Set(selector.excludeIds || [])
+
+  return features.map((f) => {
+    if (f.lifecycle === LIFECYCLE_STATES.EXCLUDED) {
+      return { ...f }
+    }
+
+    // If includeIds is specified, non-matching features are deferred
+    if (includeSet.size > 0 && !includeSet.has(f.id)) {
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.DEFERRED,
+        deferReason: 'selector-excluded',
+      }
+    }
+
+    // If excludeIds is specified, matching features are deferred
+    if (excludeSet.size > 0 && excludeSet.has(f.id)) {
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.DEFERRED,
+        deferReason: 'selector-excluded',
+      }
+    }
+
+    return { ...f }
+  })
+}
+
+// Promote deferred features up to cap after some features have completed.
+// Each feature is promoted from deferred exactly once. Returns updated features.
+//
+// features: [{ id, lifecycle, ... }]
+// completedIds: Set or array of feature IDs that have completed
+// cap: max processing features
+// Returns: { features: updated, promoted: [...], remainingDeferred: number }
+function promoteDeferred(features, completedIds, cap) {
+  if (!Array.isArray(features)) {
+    throw new Error('promoteDeferred: features must be an array')
+  }
+
+  const completedSet = completedIds instanceof Set ? completedIds : new Set(completedIds || [])
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error('promoteDeferred: cap must be a positive number')
+  }
+
+  // Count only actively processing features (runnable, in-progress, blocked)
+  // against the cap — completed and failed features do NOT consume cap slots
+  let processingCount = 0
+  const promoted = []
+
+  const updated = features.map((f) => {
+    // Completed features stay completed — they free their cap slot
+    if (completedSet.has(f.id) || f.lifecycle === LIFECYCLE_STATES.COMPLETED) {
+      return { ...f, lifecycle: LIFECYCLE_STATES.COMPLETED }
+    }
+
+    // Excluded features stay excluded
+    if (f.lifecycle === LIFECYCLE_STATES.EXCLUDED) {
+      return { ...f }
+    }
+
+    // Failed features do not consume cap slots
+    if (f.lifecycle === LIFECYCLE_STATES.FAILED) {
+      return { ...f }
+    }
+
+    // Actively processing features (runnable, in-progress, blocked) consume cap
+    if (f.lifecycle !== LIFECYCLE_STATES.DEFERRED && f.lifecycle !== LIFECYCLE_STATES.SKIPPED) {
+      processingCount++
+      return { ...f }
+    }
+
+    // Deferred feature — promote if under cap
+    if (processingCount < cap) {
+      processingCount++
+      promoted.push(f.id)
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.RUNNABLE,
+        promotedAt: (f.promotedAt || 0) + 1,
+      }
+    }
+
+    // Still deferred — over cap
+    return { ...f }
+  })
+
+  const remainingDeferred = updated.filter(
+    (f) => f.lifecycle === LIFECYCLE_STATES.DEFERRED
+  ).length
+
+  return { features: updated, promoted, remainingDeferred }
+}
+
+// Compute the coverage denominator: total in-scope features excluding
+// those explicitly excluded. This is the truth source for readiness.
+//
+// features: [{ id, lifecycle, ... }]
+// Returns: { denominator, excluded, total, breakdown: { ... } }
+function queueDenominator(features) {
+  if (!Array.isArray(features)) {
+    throw new Error('queueDenominator: features must be an array')
+  }
+
+  const breakdown = {}
+  let excluded = 0
+  let total = features.length
+
+  for (const f of features) {
+    const lc = f.lifecycle || 'unknown'
+    breakdown[lc] = (breakdown[lc] || 0) + 1
+    if (lc === LIFECYCLE_STATES.EXCLUDED) {
+      excluded++
+    }
+  }
+
+  return {
+    denominator: total - excluded,
+    excluded,
+    total,
+    breakdown,
+  }
+}
+
+// Compute exact completed/deferred counts for a cap-constrained segment.
+// This is the core computation for the 23-feature/cap-8 progression:
+// segment 1: 8 processed / 15 deferred
+// segment 2: 16 processed / 7 deferred
+// segment 3: 23 processed / 0 deferred
+//
+// totalFeatures: number of in-scope features
+// cap: per-segment processing cap
+// segment: 1-based segment number
+// Returns: { processed, deferred, complete }
+function segmentProgression(totalFeatures, cap, segment) {
+  if (!Number.isFinite(totalFeatures) || totalFeatures < 0) {
+    throw new Error('segmentProgression: totalFeatures must be non-negative')
+  }
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error('segmentProgression: cap must be positive')
+  }
+  if (!Number.isFinite(segment) || segment < 1) {
+    throw new Error('segmentProgression: segment must be >= 1')
+  }
+
+  const processed = Math.min(totalFeatures, cap * segment)
+  const deferred = Math.max(0, totalFeatures - processed)
+  const complete = processed >= totalFeatures
+
+  return { processed, deferred, complete }
+}
+
+// Schedulability plan: prerequisite waves, cycle/no-progress classification,
+// and bounded dependency context. All functions are pure and deterministic.
+//
+// The schedulability plan produces deterministic prerequisite waves, explicit
+// cycle/no-progress outcomes, and bounded verified dependency summaries.
+
+
+// Schedulability verdicts
+const SCHEDULABILITY_VERDICTS = Object.freeze({
+  SCHEDULABLE: 'schedulable',
+  NO_PROGRESS: 'no-progress',
+  UNSUPPORTED_CYCLE: 'unsupported-cycle',
+})
+
+// Compute deterministic prerequisite waves from features and dependency edges.
+// Features with no unmet dependencies form wave 1; features whose dependencies
+// are all in earlier waves form subsequent waves. Within a wave, cap limits
+// how many features can be admitted.
+//
+// features: [{ id, ... }]
+// edges: [{ from, to }] — from depends on to (to must complete first)
+// cap: max features per wave (0 = unlimited)
+// Returns: { waves: [[featureId, ...], ...], unscheduled: [...], verdict: 'schedulable'|'no-progress'|'unsupported-cycle' }
+function computeWaves(features, edges, cap, cyclePolicy) {
+  if (!Array.isArray(features)) {
+    throw new Error('computeWaves: features must be an array')
+  }
+
+  const featureIds = new Set(features.map((f) => f.id))
+
+  // Build reverse adjacency: for each feature, what does it depend on?
+  const dependencies = new Map()
+  for (const id of featureIds) {
+    dependencies.set(id, new Set())
+  }
+  for (const e of (edges || [])) {
+    if (featureIds.has(e.from) && featureIds.has(e.to)) {
+      dependencies.get(e.from).add(e.to)
+    }
+  }
+
+  // Check for unsupported cycles (respecting policy)
+  const cycleCheck = detectCycle(edges || [])
+  if (cycleCheck.hasCycle) {
+    const cycleResult = classifyCycle(edges, cyclePolicy || {})
+    if (cycleResult.classification === CYCLE_POLICIES.UNSUPPORTED) {
+      return {
+        waves: [],
+        unscheduled: [...featureIds],
+        verdict: SCHEDULABILITY_VERDICTS.UNSUPPORTED_CYCLE,
+        cycle: cycleCheck.cycle,
+      }
+    }
+  }
+
+  // Topological wave assignment (Kahn's algorithm with wave tracking)
+  // Cap is per-wave: limits how many features each wave admits, not total budget
+  const waves = []
+  const scheduled = new Set()
+
+  while (scheduled.size < featureIds.size) {
+    // Find features whose dependencies are all scheduled
+    const ready = []
+    for (const id of featureIds) {
+      if (scheduled.has(id)) continue
+      const deps = dependencies.get(id)
+      let allMet = true
+      for (const d of deps) {
+        if (!scheduled.has(d)) {
+          allMet = false
+          break
+        }
+      }
+      if (allMet) {
+        ready.push(id)
+      }
+    }
+
+    if (ready.length === 0) {
+      // No progress — remaining features have unresolvable dependencies
+      break
+    }
+
+    ready.sort() // deterministic ordering
+    // Per-wave cap: limits features admitted per wave, not total budget.
+    // Overflow features stay eligible for the next wave.
+    const waveCap = (Number.isFinite(cap) && cap > 0) ? cap : ready.length
+    const wave = ready.slice(0, waveCap)
+
+    for (const id of wave) {
+      scheduled.add(id)
+    }
+    waves.push(wave)
+  }
+
+  const unscheduled = [...featureIds].filter((id) => !scheduled.has(id)).sort()
+
+  return {
+    waves,
+    unscheduled,
+    verdict: unscheduled.length > 0
+      ? SCHEDULABILITY_VERDICTS.NO_PROGRESS
+      : SCHEDULABILITY_VERDICTS.SCHEDULABLE,
+  }
+}
+
+// Compute bounded dependency context for a single feature.
+// Traverses the dependency graph up to maxDepth hops, collecting verified
+// summaries of each dependency. The context is bounded to prevent
+// unbounded prompt growth.
+//
+// featureId: the feature to compute context for
+// features: [{ id, paths, digest, ... }]
+// edges: [{ from, to }]
+// maxDepth: maximum traversal depth (default 3)
+// Returns: { featureId, context: [{ id, depth, paths, digest }], bounded: boolean }
+function boundedDependencyContext(featureId, features, edges, maxDepth) {
+  if (!featureId) {
+    throw new Error('boundedDependencyContext: featureId is required')
+  }
+
+  const depth = Number.isFinite(maxDepth) && maxDepth > 0 ? maxDepth : 3
+
+  // Build feature lookup
+  const featureMap = new Map()
+  for (const f of features || []) {
+    featureMap.set(f.id, f)
+  }
+
+  // Build reverse dependency lookup: what does each feature depend on?
+  const depsOf = new Map()
+  for (const e of edges || []) {
+    if (!depsOf.has(e.from)) depsOf.set(e.from, [])
+    depsOf.get(e.from).push(e.to)
+  }
+
+  const context = []
+  const visited = new Set([featureId])
+  const queue = [{ id: featureId, currentDepth: 0 }]
+
+  while (queue.length > 0) {
+    const { id, currentDepth } = queue.shift()
+
+    if (currentDepth >= depth) continue
+
+    const deps = depsOf.get(id) || []
+    for (const depId of deps.sort()) {
+      if (visited.has(depId)) continue
+      visited.add(depId)
+
+      const depFeature = featureMap.get(depId)
+      context.push({
+        id: depId,
+        depth: currentDepth + 1,
+        paths: (depFeature && depFeature.paths) || [],
+        digest: (depFeature && depFeature.digest) || null,
+      })
+
+      queue.push({ id: depId, currentDepth: currentDepth + 1 })
+    }
+  }
+
+  return {
+    featureId,
+    context,
+    bounded: visited.size > depth * 5, // heuristic: if we visited many nodes, context was bounded
+  }
+}
+
+// Overall schedulability decision for the full feature set.
+// Combines cycle detection, wave computation, and no-progress detection.
+//
+// features: [{ id, ... }]
+// edges: [{ from, to }]
+// cap: optional per-wave cap
+// cyclePolicy: optional map of supported cycle edges
+// Returns: { verdict, waves, unscheduled, cycleDetected, details }
+function schedulabilityDecision(features, edges, cap, cyclePolicy) {
+  const cycleResult = classifyCycle(edges || [], cyclePolicy || {})
+
+  if (cycleResult.classification === CYCLE_POLICIES.UNSUPPORTED) {
+    return {
+      verdict: SCHEDULABILITY_VERDICTS.UNSUPPORTED_CYCLE,
+      waves: [],
+      unscheduled: (features || []).map((f) => f.id).sort(),
+      cycleDetected: true,
+      cycle: cycleResult.cycle,
+      details: `Unsupported dependency cycle prevents scheduling: ${cycleResult.cycle.join(' -> ')}`,
+    }
+  }
+
+  const waveResult = computeWaves(features, edges, cap, cyclePolicy)
+
+  return {
+    verdict: waveResult.verdict,
+    waves: waveResult.waves,
+    unscheduled: waveResult.unscheduled,
+    cycleDetected: cycleResult.classification === CYCLE_POLICIES.SUPPORTED,
+    cycle: cycleResult.classification === CYCLE_POLICIES.SUPPORTED ? cycleResult.cycle : [],
+    details: waveResult.verdict === SCHEDULABILITY_VERDICTS.SCHEDULABLE
+      ? `All ${waveResult.waves.reduce((s, w) => s + w.length, 0)} features scheduled across ${waveResult.waves.length} wave(s)`
+      : `${waveResult.unscheduled.length} feature(s) cannot be scheduled (no progress)`,
+  }
+}
+
 // chunkPlanIntoStages (Phase H, design tail): split plan.md -> dependency-ordered stageNN.md files
 // via the plan-chunker agent. Stages become the implement progress unit (lanes collapse INTO a stage).
 // Called once in design mode after Gate 2 (Review/Refine) acceptance, BEFORE the design-stop.

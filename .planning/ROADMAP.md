@@ -47,7 +47,7 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 **Phase Numbering:** This is the first GSD roadmap. Phase numbering starts at 1; shipped v1.4.5 is the brownfield baseline, not part of the phase ledger.
 
 - [x] **Phase 1: State, Coverage, Migration, and Revision Contracts** - Versioned pure reducers, root-last migration, sharded state, and selective invalidation establish truthful foundations.
-- [ ] **Phase 2: Bounded Discovery, Validated Graph, and Schedulability** - Deterministic pages become a validated ownership/dependency graph and durable schedulable queue.
+- [x] **Phase 2: Bounded Discovery, Validated Graph, and Schedulability** - Deterministic pages become a validated ownership/dependency graph and durable schedulable queue.
 - [ ] **Phase 3: Multi-Entry Build, Install, and Version Lockstep** - Source, generated artifacts, copy/symlink installs, version metadata, and release contents expose both workflow entries together.
 - [ ] **Phase 4: Checkpointed Feature Leaf** - One feature runs through `fp-extract-slice` with transition-level acknowledgements and resumable gate evidence.
 - [ ] **Phase 5: Bounded Scheduler and Transactional Automatic Continuation** - Dependency-safe work advances through budgeted, isolated, monotonically acknowledged segments from one command.
@@ -336,7 +336,7 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. State, Coverage, Migration, and Revision Contracts | 1/1 | Complete | 2026-07-22 |
-| 2. Bounded Discovery, Validated Graph, and Schedulability | 0/TBD | Not started | - |
+| 2. Bounded Discovery, Validated Graph, and Schedulability | 1/1 | Complete | 2026-07-22 |
 | 3. Multi-Entry Build, Install, and Version Lockstep | 0/TBD | Not started | - |
 | 4. Checkpointed Feature Leaf | 0/TBD | Not started | - |
 | 5. Bounded Scheduler and Transactional Automatic Continuation | 0/TBD | Not started | - |
