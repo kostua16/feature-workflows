@@ -1565,6 +1565,61 @@ object in the "state" field. If the file does not exist, return state=null.`,
   )
 }
 
+
+// Retain a last-good snapshot before each state write so resume can auto-recover
+// from a truncated/partial chunked write. Before writing the new state, copies
+// the current pipeline-state.json to pipeline-state.last-good.json via agent I/O.
+// Non-blocking: a copy failure warns but does not prevent the new write.
+async function flushPipelineStateWithSnapshot(planDir, result, config) {
+  const lastGoodPath = planDir.replace(/\/$/, '') + '/pipeline-state.last-good.json'
+  try {
+    const current = await loadPipelineState(planDir)
+    if (current && current.state) {
+      await writeChunkedFile(
+        lastGoodPath,
+        JSON.stringify(current.state, null, 2),
+        'file-writer:last-good',
+        result
+      )
+    }
+  } catch (e) {
+    if (result && result.logLines) {
+      result.logLines.push(`snapshot: last-good copy skipped (${String(e)})`)
+    }
+  }
+  return flushPipelineState(planDir, result, config)
+}
+
+// Load pipeline state with auto-recovery from a last-good snapshot. If the
+// primary state file fails validation (truncated/corrupt chunked write), the
+// last-good snapshot is loaded and validated instead. Returns { state, recovered }
+// where recovered=true signals the primary file was bypassed.
+async function loadPipelineStateWithRecovery(planDir) {
+  const loaded = await loadPipelineState(planDir)
+  const state = loaded && loaded.state
+  if (state) {
+    const validation = validatePipelineState(state)
+    if (validation.ok) {
+      return { state, recovered: false }
+    }
+  }
+  const lastGoodPath = planDir.replace(/\/$/, '') + '/pipeline-state.last-good.json'
+  const lastGoodLoaded = await safeAgent(
+    `You are a file-reader agent. Read ${lastGoodPath} and return its full JSON content parsed as an
+object in the "state" field. If the file does not exist, return state=null.`,
+    { label: 'file-reader:last-good', phase: 'Checkpoint', schema: PIPELINE_STATE_READ, model: gm('todo') },
+    null
+  )
+  const lastGoodState = lastGoodLoaded && lastGoodLoaded.state
+  if (lastGoodState) {
+    const lastGoodValidation = validatePipelineState(lastGoodState)
+    if (lastGoodValidation.ok) {
+      return { state: lastGoodState, recovered: true }
+    }
+  }
+  return { state: null, recovered: false }
+}
+
 async function verifyArtifactPresence({ path, gate, expectedHeadings, result }) {
   if (!path || path === 'present') return { exists: !!path, sizeBytes: 0, hasExpectedHeadings: true, summary: 'not a file path' }
   const headingLine = expectedHeadings && expectedHeadings.length
@@ -1587,6 +1642,21 @@ Return summary with the evidence. Do not modify files.`,
 async function repairResumeArtifactFlags(result) {
   if (!result) return []
   const repairs = []
+  const checkpoints = result._designCheckpoints || {}
+  const digests = result._artifactDigests || {}
+
+  // Map each artifact to its checkpoint gate name so digest-driven skip can
+  // consult the durable checkpoint record. When a gate was durably
+  // acknowledged and its artifact digest was recorded, the artifact was
+  // verified at checkpoint time and the expensive LLM re-verification can be
+  // skipped entirely on resume.
+  const checkpointGateMap = {
+    definitionPath: 'define',
+    requirementsPath: 'requirements',
+    archPath: 'architecture',
+    designPath: 'detailed-design',
+    planPath: 'plan',
+  }
   const artifacts = [
     { pathKey: 'definitionPath', flags: ['_define'], gate: 'Define' },
     { pathKey: 'requirementsPath', flags: ['_requirements', '_reviewedRequirements'], gate: 'Requirements' },
@@ -1594,19 +1664,19 @@ async function repairResumeArtifactFlags(result) {
     { pathKey: 'designPath', flags: ['_design', '_reviewedDesign'], gate: 'Detailed Design' },
     { pathKey: 'planPath', flags: ['planned', '_plan', '_reviewedPlan', 'planAccepted', 'tddEnforced', 'reconcile'], gate: 'Plan' },
   ].filter((a) =>
-    // Verify the Plan artifact only when a plan was actually WRITTEN (result.planned).
-    // result.planPath is planDir math, set long before plan.md exists, so checking it
-    // unconditionally nulls result.planPath — which disables every later state flush in
-    // consolidate() and clears designReady. Three states hit this: extract-mode runs
-    // (extract writes no plan.md at all), extract slice-local states (design-shaped,
-    // mode:'design', no plan), and design runs resumed from a block BEFORE the Plan gate.
-    // When planned is falsy the Plan gate re-runs and rewrites plan.md anyway, so
-    // skipping the check loses nothing.
     !(a.pathKey === 'planPath' && !result.planned)
   )
   for (const artifact of artifacts) {
     const path = result[artifact.pathKey]
     if (!path) continue
+
+    const cpGate = checkpointGateMap[artifact.pathKey]
+    const cp = cpGate ? checkpoints[cpGate] : null
+    const storedDigest = digests[artifact.pathKey]
+    if (cp && cp.acknowledged && storedDigest) {
+      continue
+    }
+
     const checked = await verifyArtifactPresence({
       path,
       gate: `resume:${artifact.gate}`,
@@ -6736,8 +6806,11 @@ async function main() {
   if (resumeArg) {
     // resumeArg is a planDir (or a plan.md path); normalize to a dir.
     const resumeDir = resumeArg.replace(/(^|\/)plan\.md$/, '$1').replace(/\/$/, '') + '/'
-    const loaded = await loadPipelineState(resumeDir)
+    const loaded = await loadPipelineStateWithRecovery(resumeDir)
     resumed = loaded && loaded.state
+    if (loaded && loaded.recovered) {
+      log(`main: --resume auto-recovered from pipeline-state.last-good.json at ${resumeDir} (primary was corrupt/truncated)`)
+    }
     if (!resumed) {
       // No persisted state at the resume path. Return a clean blocked result instead of a raw
       // throw: this site sits BEFORE main()'s safety-net try-block, so a throw would escape as an
@@ -7159,6 +7232,8 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       useCasePath: null,
       openQuestionsPath: null, // F10/I4: <planDir>/open-questions.md tracked artifact
       reconcile: null,
+      _designCheckpoints: {}, // gate-name -> { acknowledged, artifactPath }
+      _artifactDigests: {}, // pathKey -> content digest recorded at checkpoint time
       published: null,
       recommendedPath: null,
       tddEnforced: false,
@@ -7237,6 +7312,30 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
   // gateDone: resume self-skip helper. Returns true (and logs) if the gate's
   // completion flag is already set, so the gate body can skip its agent call.
   const gateDone = (flag) => { if (result[flag]) { plog(`resume: skip gate (${flag} set)`); return true } return false }
+
+  // checkpointDesign: durably persist the in-memory result after each material
+  // design gate so an interrupted run resumes at the first incomplete gate
+  // without repeating verified work. Adopts the Phase 4 checkpointSlice pattern:
+  // record gate completion + artifact digest, then flush state to disk via the
+  // snapshot-retaining writer. Non-blocking — a flush failure only warns.
+  const checkpointDesign = async (gateName, artifactPathKey) => {
+    if (!result._designCheckpoints) result._designCheckpoints = {}
+    if (!result._artifactDigests) result._artifactDigests = {}
+    result._designCheckpoints[gateName] = {
+      acknowledged: true,
+      artifactPath: artifactPathKey ? (result[artifactPathKey] || null) : null,
+    }
+    if (artifactPathKey && result[artifactPathKey]) {
+      const dataKey = '_' + artifactPathKey.replace('Path', '')
+      result._artifactDigests[artifactPathKey] = computeContentDigest(result[dataKey] || result[artifactPathKey])
+    }
+    plog(`checkpointDesign: durable flush at gate '${gateName}'`)
+    try {
+      await flushPipelineStateWithSnapshot(planDir, result, config)
+    } catch (e) {
+      plog(`checkpointDesign: flush failed at '${gateName}' (non-blocking) — ${String(e)}`)
+    }
+  }
 
   // Surface the per-gate agent-call telemetry at terminal exits so users can see where a
   // run spent its calls/retries/escalations (and how much rode on fallbacks) without
@@ -8247,6 +8346,7 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
     plog(`Define: definition written to ${definition.definitionPath}; recommendedPath=${definition.recommendedPath || 'full'}`)
   }
   stateCheckpoint('Define', 'done')
+    await checkpointDesign('define', 'definitionPath')
 
     }
 
@@ -8295,6 +8395,7 @@ Return a concise brief the architecture + detailed-design agents can consume. Do
         plog('Knowledge Consult: failed (non-blocking) — ' + String(e))
       }
       stateCheckpoint('Knowledge', 'done')
+      await checkpointDesign('knowledge')
     }
 
     // Gate 0.2: Codebase Facts (Phase D2 — code-explorer routing) ---------
@@ -8346,6 +8447,7 @@ or commit. Return the path + a concise summary of the most important facts.`,
         plog('Codebase Facts: failed (non-blocking) — ' + String(e))
       }
       stateCheckpoint('Codebase Facts', 'done')
+      await checkpointDesign('codebase-facts', 'factsPath')
     }
 
 
@@ -8402,6 +8504,7 @@ mem:conventions first. Do NOT commit.`,
         await writeOpenQuestions(planDir, useCases.openQuestions.map((q) => ({ gate: 'E2E Use Cases', text: q, severity: 'unspecified' })), result)
       }
       stateCheckpoint('E2E Use Cases', 'done')
+      await checkpointDesign('e2e-use-cases', 'useCasePath')
     }
 
     // Gate 0.75: Requirements (Phase C1) ---------------------------------
@@ -8454,6 +8557,7 @@ Write the requirements doc to ${requirementsPath} and return requirementsPath se
         await writeOpenQuestions(planDir, requirements.openQuestions.map((q) => ({ gate: 'Requirements', text: q, severity: 'unspecified' })), result)
       }
       stateCheckpoint('Requirements', 'done')
+      await checkpointDesign('requirements', 'requirementsPath')
     }
 
     // Gate 0.75R: Requirements review loop (Phase C2) --------------------
@@ -8487,6 +8591,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       }
       plog(`Requirements Review: ${reqReview && reqReview.accepted ? 'accepted' : 'fail-forward'} after ${reqReview ? reqReview.iterations : 0} iteration(s)${reqReview && reqReview.failForward ? ' (fail-forward)' : ''}`)
       stateCheckpoint('Requirements Review', 'done')
+      await checkpointDesign('requirements-review')
     }
 
     // Gate 0.5: Architecture (adopted agent) -------------------------------
@@ -8550,8 +8655,10 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
         }
         plog(`Arch Review: ${archReview && archReview.accepted ? 'accepted' : 'fail-forward'} after ${archReview ? archReview.iterations : 0} iteration(s)${archReview && archReview.failForward ? ' (fail-forward)' : ''}`)
         stateCheckpoint('Arch Review', 'done')
+        await checkpointDesign('arch-review')
       }
       stateCheckpoint('Architecture', 'done')
+      await checkpointDesign('architecture', 'archPath')
     }
 
     // Gate 0.6: Detailed Design (adopted agent) ----------------------------
@@ -8590,6 +8697,7 @@ Do NOT commit.`,
         if ((design.openGaps || []).length) plog(`  design openGaps: ${(design.openGaps || []).join('; ')}`)
       }
       stateCheckpoint('Detailed Design', 'done')
+      await checkpointDesign('detailed-design', 'designPath')
     }
 
     // Gate 0.6R: Detailed-Design review loop (Phase C2) -------------------
@@ -8621,6 +8729,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       }
       plog(`Detailed Design Review: ${designReview && designReview.accepted ? 'accepted' : 'fail-forward'} after ${designReview ? designReview.iterations : 0} iteration(s)${designReview && designReview.failForward ? ' (fail-forward)' : ''}`)
       stateCheckpoint('Detailed Design Review', 'done')
+      await checkpointDesign('design-review')
     }
 
     // Gate 1: Plan ----------------------------------------------------------
@@ -8670,6 +8779,7 @@ single-lane execution). If the work is not cleanly separable, emit exactly ONE l
       plog(`Plan: plan written to ${plan.planPath}; lanes=${(plan.lanes || []).length}`)
     }
     stateCheckpoint('Plan', 'done')
+    await checkpointDesign('plan', 'planPath')
 
     // Gate 1.5: TDD Enforce (adopted agent) --------------------------------
     if (useTddEnforce) {
@@ -8713,6 +8823,7 @@ mem:suggested_commands before enforcing. Do NOT commit.`,
         }
       }
       stateCheckpoint('TDD Enforce', 'done')
+      await checkpointDesign('tdd-enforce')
     }
 
     // Gate 1.7: Reconcile design vs plan (adopted agent, NON-BLOCKING) ------
@@ -8847,6 +8958,7 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
         plog(`Reconcile: design-fix loop stopped — ${reason}; carrying conflict forward`)
       }
       stateCheckpoint('Reconcile', 'done')
+      await checkpointDesign('reconcile')
     }
 
     // Gate 2: Review / Refine loop (global-budget-bounded, never terminal) --
@@ -9062,6 +9174,7 @@ malformed output.`
       plog(`Review/Refine: plan accepted (iterations=${refineCount}, forceAccepted=${result.forceAccepted})`)
     }
     stateCheckpoint('Review/Refine', 'done')
+    await checkpointDesign('review-refine')
 
     // ===== Phase H: plan-chunker → stages (design tail) ===========================
     // In design mode the THINK section ends right after this. Plan-chunker splits plan.md into
@@ -9076,6 +9189,7 @@ malformed output.`
         result.stages = stages
         plog(`plan-chunker: ${stages.length} stage(s) — ${stages.map((s) => s.id).join(', ')}`)
         stateCheckpoint('Chunk Plan', 'done')
+        await checkpointDesign('chunk-plan')
       } else {
         // --no-chunker: single implicit stage covering the whole plan (single-executor behavior).
         result.stages = [{
@@ -9282,6 +9396,7 @@ tests were created or existing coverage was verified.`,
         plog(`Test Authoring: written=${authored.written}; files=${(authored.files || []).length}; summary=${authored.summary || '(none)'}`)
       }
       stateCheckpoint('Test Authoring', 'done')
+      await checkpointDesign('test-authoring')
     } else if (isImplementMode && !useTestWriter) {
       stateCheckpoint('Test Authoring', 'skipped')
     }
@@ -9494,6 +9609,7 @@ declaring completion. ${carriedBlockersLine}`,
       }
     }
     stateCheckpoint('Execute', 'done')
+    await checkpointDesign('execute')
 
   } // end full-path branch — Gate 4+ run at main() level for BOTH paths
 
@@ -9584,6 +9700,7 @@ resolves the failures, plus a change summary.`
     plog(`Test: PASSED — ${test.summary || '(no summary)'}`)
   }
   stateCheckpoint('Test', 'done')
+  await checkpointDesign('test')
 
   // Gate 5: Code review ---------------------------------------------------
   phase('Code Review')
@@ -9653,6 +9770,7 @@ Do NOT include formatting nits unless they change meaning.`,
     }
   }
   stateCheckpoint('Code Review', 'done')
+  await checkpointDesign('code-review')
 
   // Gate 5.1: Commit Goalkeeper (Phase E3 — complex-decision-analyst) ---------
   // After final code-review passes, an authoritative decision-agent decides COMMIT vs LOOP-BACK.

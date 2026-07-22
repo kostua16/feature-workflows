@@ -295,6 +295,61 @@ object in the "state" field. If the file does not exist, return state=null.`,
   )
 }
 
+
+// Retain a last-good snapshot before each state write so resume can auto-recover
+// from a truncated/partial chunked write. Before writing the new state, copies
+// the current pipeline-state.json to pipeline-state.last-good.json via agent I/O.
+// Non-blocking: a copy failure warns but does not prevent the new write.
+async function flushPipelineStateWithSnapshot(planDir, result, config) {
+  const lastGoodPath = planDir.replace(/\/$/, '') + '/pipeline-state.last-good.json'
+  try {
+    const current = await loadPipelineState(planDir)
+    if (current && current.state) {
+      await writeChunkedFile(
+        lastGoodPath,
+        JSON.stringify(current.state, null, 2),
+        'file-writer:last-good',
+        result
+      )
+    }
+  } catch (e) {
+    if (result && result.logLines) {
+      result.logLines.push(`snapshot: last-good copy skipped (${String(e)})`)
+    }
+  }
+  return flushPipelineState(planDir, result, config)
+}
+
+// Load pipeline state with auto-recovery from a last-good snapshot. If the
+// primary state file fails validation (truncated/corrupt chunked write), the
+// last-good snapshot is loaded and validated instead. Returns { state, recovered }
+// where recovered=true signals the primary file was bypassed.
+async function loadPipelineStateWithRecovery(planDir) {
+  const loaded = await loadPipelineState(planDir)
+  const state = loaded && loaded.state
+  if (state) {
+    const validation = validatePipelineState(state)
+    if (validation.ok) {
+      return { state, recovered: false }
+    }
+  }
+  const lastGoodPath = planDir.replace(/\/$/, '') + '/pipeline-state.last-good.json'
+  const lastGoodLoaded = await safeAgent(
+    `You are a file-reader agent. Read ${lastGoodPath} and return its full JSON content parsed as an
+object in the "state" field. If the file does not exist, return state=null.`,
+    { label: 'file-reader:last-good', phase: 'Checkpoint', schema: PIPELINE_STATE_READ, model: gm('todo') },
+    null
+  )
+  const lastGoodState = lastGoodLoaded && lastGoodLoaded.state
+  if (lastGoodState) {
+    const lastGoodValidation = validatePipelineState(lastGoodState)
+    if (lastGoodValidation.ok) {
+      return { state: lastGoodState, recovered: true }
+    }
+  }
+  return { state: null, recovered: false }
+}
+
 async function verifyArtifactPresence({ path, gate, expectedHeadings, result }) {
   if (!path || path === 'present') return { exists: !!path, sizeBytes: 0, hasExpectedHeadings: true, summary: 'not a file path' }
   const headingLine = expectedHeadings && expectedHeadings.length
@@ -317,6 +372,21 @@ Return summary with the evidence. Do not modify files.`,
 async function repairResumeArtifactFlags(result) {
   if (!result) return []
   const repairs = []
+  const checkpoints = result._designCheckpoints || {}
+  const digests = result._artifactDigests || {}
+
+  // Map each artifact to its checkpoint gate name so digest-driven skip can
+  // consult the durable checkpoint record. When a gate was durably
+  // acknowledged and its artifact digest was recorded, the artifact was
+  // verified at checkpoint time and the expensive LLM re-verification can be
+  // skipped entirely on resume.
+  const checkpointGateMap = {
+    definitionPath: 'define',
+    requirementsPath: 'requirements',
+    archPath: 'architecture',
+    designPath: 'detailed-design',
+    planPath: 'plan',
+  }
   const artifacts = [
     { pathKey: 'definitionPath', flags: ['_define'], gate: 'Define' },
     { pathKey: 'requirementsPath', flags: ['_requirements', '_reviewedRequirements'], gate: 'Requirements' },
@@ -324,19 +394,19 @@ async function repairResumeArtifactFlags(result) {
     { pathKey: 'designPath', flags: ['_design', '_reviewedDesign'], gate: 'Detailed Design' },
     { pathKey: 'planPath', flags: ['planned', '_plan', '_reviewedPlan', 'planAccepted', 'tddEnforced', 'reconcile'], gate: 'Plan' },
   ].filter((a) =>
-    // Verify the Plan artifact only when a plan was actually WRITTEN (result.planned).
-    // result.planPath is planDir math, set long before plan.md exists, so checking it
-    // unconditionally nulls result.planPath — which disables every later state flush in
-    // consolidate() and clears designReady. Three states hit this: extract-mode runs
-    // (extract writes no plan.md at all), extract slice-local states (design-shaped,
-    // mode:'design', no plan), and design runs resumed from a block BEFORE the Plan gate.
-    // When planned is falsy the Plan gate re-runs and rewrites plan.md anyway, so
-    // skipping the check loses nothing.
     !(a.pathKey === 'planPath' && !result.planned)
   )
   for (const artifact of artifacts) {
     const path = result[artifact.pathKey]
     if (!path) continue
+
+    const cpGate = checkpointGateMap[artifact.pathKey]
+    const cp = cpGate ? checkpoints[cpGate] : null
+    const storedDigest = digests[artifact.pathKey]
+    if (cp && cp.acknowledged && storedDigest) {
+      continue
+    }
+
     const checked = await verifyArtifactPresence({
       path,
       gate: `resume:${artifact.gate}`,
@@ -361,4 +431,4 @@ async function repairResumeArtifactFlags(result) {
   return repairs
 }
 
-export { consolidate, writeChunkedFile, flushPipelineLog, stateChecksum, validatePipelineState, summarizeGates, deriveNextCommand, renderStatusReport, flushPipelineState, loadPipelineState, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew }
+export { consolidate, writeChunkedFile, flushPipelineLog, stateChecksum, validatePipelineState, summarizeGates, deriveNextCommand, renderStatusReport, flushPipelineState, flushPipelineStateWithSnapshot, loadPipelineState, loadPipelineStateWithRecovery, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew }

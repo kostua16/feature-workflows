@@ -56,6 +56,8 @@ const CANDIDATES = [
   'renderTelemetrySummary',
   'summarizeGates',
   'flushPipelineState',
+  'flushPipelineStateWithSnapshot',
+  'loadPipelineStateWithRecovery',
   'detectResumeEngineSkew',
   'deriveNextCommand',
   'renderStatusReport',
