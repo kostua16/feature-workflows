@@ -20,11 +20,12 @@ const wfRoot = new URL('workflows/', pluginRoot)
 const version = JSON.parse(readFileSync(new URL('.claude-plugin/plugin.json', pluginRoot), 'utf8')).version
 if (!version) throw new Error('plugin.json has no version')
 
-// One entry today (stage 1: single engine). Stage 2 adds per-mode entries here;
 // `modules` is the emit order (original engine order — function decls hoist, but
 // top-level const initializers may only reference EARLIER modules).
 // NOTE: src/engine-version.mjs is Node-only (import target for state/main). It must
 // NEVER be listed in modules[] — dist gets the injected ENGINE_VERSION const instead.
+// Each entry has a `tail` — the sandbox-execution lines appended after module bodies.
+// The top-level entry calls main(); the leaf entry calls extractSliceMain().
 const ENTRIES = [
   {
     out: 'feature-pipeline.js',
@@ -38,6 +39,10 @@ const ENTRIES = [
       '// Run via:',
       '//   Workflow({ scriptPath: "~/.claude/workflows/feature-pipeline.js",  // user-level symlink to the plugin engine',
       '//              args: { task: "...", autoCommit: false, gsdQuick: false } })',
+    ],
+    tail: [
+      'const final = await main()',
+      'return final',
     ],
     modules: [
       'schemas.mjs',
@@ -64,6 +69,54 @@ const ENTRIES = [
       'review-loop.mjs',
       'decisions.mjs',
       'main.mjs',
+    ],
+  },
+  {
+    out: 'fp-extract-slice.js',
+    meta: 'src/meta/fp-extract-slice.meta.mjs',
+    banner: [
+      '// fp-extract-slice.js',
+      `// engine-version: ${version}`,
+      '// GENERATED FILE — do not edit. Source: workflows/src/*.mjs; rebuild with `npm run build`.',
+      '// Leaf workflow: extract design docs for one admitted feature.',
+      '//',
+      '// Run via:',
+      '//   Workflow({ scriptPath: "~/.claude/workflows/fp-extract-slice.js",',
+      '//              args: { slice: { id, name, planDir, files, ... }, task: "...", config: { ... } } })',
+    ],
+    tail: [
+      'const final = await extractSliceMain()',
+      'return final',
+    ],
+    // Same modules as the top-level entry EXCLUDING main.mjs (the leaf has its
+    // own entry point and main() is never called from any leaf module — the
+    // import binding is dead). This keeps the leaf dist focused: only the 2
+    // phase() labels the leaf actually uses appear in the text.
+    modules: [
+      'schemas.mjs',
+      'config.mjs',
+      'text-utils.mjs',
+      'state.mjs',
+      'lifecycle.mjs',
+      'migration.mjs',
+      'revision.mjs',
+      'inventory.mjs',
+      'discovery.mjs',
+      'graph-validation.mjs',
+      'queue-semantics.mjs',
+      'schedulability.mjs',
+      'stages-issues.mjs',
+      'tune.mjs',
+      'extract-scope.mjs',
+      'review-mode.mjs',
+      'extract-slice.mjs',
+      'publish-persist.mjs',
+      'test-run.mjs',
+      'agent-core.mjs',
+      'json-repair.mjs',
+      'review-loop.mjs',
+      'decisions.mjs',
+      'extract-slice-entry.mjs',
     ],
   },
 ]
@@ -119,8 +172,7 @@ for (const entry of ENTRIES) {
     '',
     bodies.join('\n\n'),
     '',
-    'const final = await main()',
-    'return final',
+    ...entry.tail,
     '',
   ].join('\n')
 

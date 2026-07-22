@@ -30,7 +30,7 @@ The milestone was extended with 15 additional user-approved design-mode themes (
 
 ### Generated Multi-Entry Distribution
 
-- [ ] **DIST-01**: The source build produces exactly two supported workflow entries for this flow, the top-level `feature-pipeline` entry and the `fp-extract-slice` leaf; copy and symlink installs expose both, and build drift, engine headers, plugin version, release contents, and installed entry resolution are validated in lockstep.
+- [x] **DIST-01**: The source build produces exactly two supported workflow entries for this flow, the top-level `feature-pipeline` entry and the `fp-extract-slice` leaf; copy and symlink installs expose both, and build drift, engine headers, plugin version, release contents, and installed entry resolution are validated in lockstep.
 
 ### Checkpointed Feature Leaf
 
@@ -155,7 +155,7 @@ Each v1 requirement is assigned to exactly one owning roadmap phase.
 | GRAPH-01 | Phase 2 | Pending |
 | QUEUE-01 | Phase 2 | Pending |
 | DEPCTX-01 | Phase 2 | Pending |
-| DIST-01 | Phase 3 | Pending |
+| DIST-01 | Phase 3 | Complete |
 | ORCH-01 | Phase 4 | Pending |
 | CHECKPOINT-01 | Phase 4 | Pending |
 | BUDGET-01 | Phase 5 | Pending |
