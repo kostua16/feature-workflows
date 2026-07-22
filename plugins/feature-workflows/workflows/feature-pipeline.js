@@ -7088,6 +7088,25 @@ function designBudgetSummary(budget) {
   }
 }
 
+// Remaining tokens for a specific gate (per-gate token cap minus spent).
+// Returns Infinity when tokenPerGate is 0 (uncharacterized — see note below).
+function gateTokensRemaining(budget, gateName) {
+  const cap = budget.caps.tokenPerGate || 0
+  if (!cap) return Infinity
+  const spent = (budget.gateSpend && budget.gateSpend[gateName]) || { tokens: 0 }
+  return Math.max(0, cap - spent.tokens)
+}
+
+// Post-gate token spend recording. Called after a gate's agent calls complete to
+// record actual token consumption. This is the measurement hook for D3: the
+// mechanism exists so a dogfood run can collect real per-gate token data and
+// feed it back into characterized tokenPerGate/tokenPerRun caps. Until then,
+// designBudgetGate always records 0 tokens and only the call ceiling is enforced.
+// Pure: returns a new budget object.
+function recordGateTokenSpend(budget, gateName, tokens) {
+  return spendDesignGate(budget, gateName, 0, tokens)
+}
+
 // Per-loop sub-budget tracker for design review/refine loops (DLOOP-01).
 //
 // Each design review/refine loop (refine, reconcile, debug, escalation) gets its
@@ -7312,6 +7331,16 @@ async function main() {
   // derive it from the task. Persisted state.slug is the source of truth (L904).
   const slug = resumeArg ? (resumed && resumed.slug) || taskSlug(task) : taskSlug(task)
 
+  // D2 (two parallel budget systems): the Phase-5 global retryState (below) and
+  // the Phase-10 designBudget (further below) coexist by design. retryState is a
+  // module-level mutable singleton in config.mjs that tracks extract-mode retry
+  // spend across the entire run; designBudget is a local immutable-per-spend
+  // accountant that tracks design-mode per-gate/per-run call budgets. They serve
+  // different modes (extract vs design) and neither ceiling has been approached
+  // in production runs. Unifying them would add abstraction risk on verified
+  // code for no proven benefit (YAGNI). Unification would be warranted only if:
+  // (a) a single mode started hitting both ceilings, or (b) cross-mode budget
+  // sharing became a requirement.
   // Single global retry budget — the only "stop" condition for loops. Per-loop
   // soft sub-caps keep one loop from monopolizing the whole budget.
   const retryBudget = (args && args.retryBudget) || RETRY_BUDGET_DEFAULT
@@ -7337,6 +7366,16 @@ async function main() {
   // DBUDGET-01: per-gate budget admission gate. Returns true if the caller must
   // block (budget exhausted); false if admitted (spend recorded). The non-spendable
   // HANDOFF reserve is protected by callsRemaining inside canAdmitDesignGate.
+  //
+  // D1 (call-counting trade-off): each gate INVOCATION counts as 1 call, not the
+  // actual intra-gate agent calls. This is conservative: a gate that short-circuits
+  // (e.g. cached result) still costs 1 (over-count), while a gate that retries or
+  // escalates internally costs only 1 (under-count). The per-gate cap (default 8)
+  // acts as a multiplier ceiling, and the per-run cap (default 200) bounds the
+  // total. Counting actual agent calls would require instrumenting every gate's
+  // agent invocation — a deep change with regression risk on verified code. The
+  // post-gate token recording hook (recordGateTokenSpend in design-budget.mjs)
+  // provides the plumbing for future finer-grained measurement.
   async function designBudgetGate(r, gateName) {
     var admit = canAdmitDesignGate(designBudget, gateName, { calls: 1 })
     if (admit.admitted) {

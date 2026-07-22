@@ -18,8 +18,10 @@ const {
   createDesignBudget,
   spendDesignGate,
   gateCallsRemaining,
+  gateTokensRemaining,
   canAdmitDesignGate,
   designBudgetSummary,
+  recordGateTokenSpend,
   createLoopBudgets,
   spendLoop,
   loopBudgetExhausted,
@@ -277,6 +279,45 @@ test('DPROMPT-01: compactList IS applied at escalation blocker sites', () => {
     distSource.includes('compactList((reviewState && reviewState.blockers)'),
     'dist must use compactList for review blockers in escalation prompt'
   )
+})
+
+// ---- D3: per-gate token budget measurement plumbing ----------------------------
+
+test('D3: gateTokensRemaining returns Infinity when tokenPerGate is 0 (uncharacterized)', () => {
+  const budget = createDesignBudget()
+  assert.equal(DESIGN_BUDGET_DEFAULTS.tokenPerGate, 0, 'default tokenPerGate must be 0')
+  assert.equal(gateTokensRemaining(budget, 'Plan'), Infinity)
+})
+
+test('D3: gateTokensRemaining returns cap minus spent when tokenPerGate is set', () => {
+  const budget = createDesignBudget({ tokenPerGate: 5000 })
+  assert.equal(gateTokensRemaining(budget, 'Plan'), 5000)
+  const spent = spendDesignGate(budget, 'Plan', 0, 1500)
+  assert.equal(gateTokensRemaining(spent, 'Plan'), 3500)
+})
+
+test('D3: recordGateTokenSpend records tokens without counting calls', () => {
+  const budget = createDesignBudget({ tokenPerGate: 10000, callPerGate: 5 })
+  const after = recordGateTokenSpend(budget, 'Architecture', 3000)
+  assert.equal(after.gateSpend.Architecture.tokens, 3000)
+  assert.equal(after.gateSpend.Architecture.calls, 0, 'token recording must NOT count as a call')
+  assert.equal(after.accountant.tokensSpent, 3000)
+  assert.equal(after.accountant.callsSpent, 0, 'token recording must NOT increment call spend')
+})
+
+test('D3: recordGateTokenSpend is pure — does not mutate input', () => {
+  const budget = createDesignBudget({ tokenPerGate: 10000 })
+  const after = recordGateTokenSpend(budget, 'Plan', 2000)
+  assert.equal(budget.gateSpend.Plan, undefined, 'original untouched')
+  assert.equal(after.gateSpend.Plan.tokens, 2000)
+})
+
+test('D3: recordGateTokenSpend accumulates across calls', () => {
+  let budget = createDesignBudget({ tokenPerGate: 10000 })
+  budget = recordGateTokenSpend(budget, 'Plan', 1000)
+  budget = recordGateTokenSpend(budget, 'Plan', 500)
+  assert.equal(budget.gateSpend.Plan.tokens, 1500)
+  assert.equal(gateTokensRemaining(budget, 'Plan'), 8500)
 })
 
 // ---- Regression: build integrity ------------------------------------------------

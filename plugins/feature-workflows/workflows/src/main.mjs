@@ -199,6 +199,16 @@ async function main() {
   // derive it from the task. Persisted state.slug is the source of truth (L904).
   const slug = resumeArg ? (resumed && resumed.slug) || taskSlug(task) : taskSlug(task)
 
+  // D2 (two parallel budget systems): the Phase-5 global retryState (below) and
+  // the Phase-10 designBudget (further below) coexist by design. retryState is a
+  // module-level mutable singleton in config.mjs that tracks extract-mode retry
+  // spend across the entire run; designBudget is a local immutable-per-spend
+  // accountant that tracks design-mode per-gate/per-run call budgets. They serve
+  // different modes (extract vs design) and neither ceiling has been approached
+  // in production runs. Unifying them would add abstraction risk on verified
+  // code for no proven benefit (YAGNI). Unification would be warranted only if:
+  // (a) a single mode started hitting both ceilings, or (b) cross-mode budget
+  // sharing became a requirement.
   // Single global retry budget — the only "stop" condition for loops. Per-loop
   // soft sub-caps keep one loop from monopolizing the whole budget.
   const retryBudget = (args && args.retryBudget) || RETRY_BUDGET_DEFAULT
@@ -224,6 +234,16 @@ async function main() {
   // DBUDGET-01: per-gate budget admission gate. Returns true if the caller must
   // block (budget exhausted); false if admitted (spend recorded). The non-spendable
   // HANDOFF reserve is protected by callsRemaining inside canAdmitDesignGate.
+  //
+  // D1 (call-counting trade-off): each gate INVOCATION counts as 1 call, not the
+  // actual intra-gate agent calls. This is conservative: a gate that short-circuits
+  // (e.g. cached result) still costs 1 (over-count), while a gate that retries or
+  // escalates internally costs only 1 (under-count). The per-gate cap (default 8)
+  // acts as a multiplier ceiling, and the per-run cap (default 200) bounds the
+  // total. Counting actual agent calls would require instrumenting every gate's
+  // agent invocation — a deep change with regression risk on verified code. The
+  // post-gate token recording hook (recordGateTokenSpend in design-budget.mjs)
+  // provides the plumbing for future finer-grained measurement.
   async function designBudgetGate(r, gateName) {
     var admit = canAdmitDesignGate(designBudget, gateName, { calls: 1 })
     if (admit.admitted) {

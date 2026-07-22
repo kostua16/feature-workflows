@@ -91,4 +91,23 @@ function designBudgetSummary(budget) {
   }
 }
 
-export { DESIGN_BUDGET_DEFAULTS, DESIGN_RESERVE_CALLS, createDesignBudget, spendDesignGate, gateCallsRemaining, canAdmitDesignGate, designBudgetSummary }
+// Remaining tokens for a specific gate (per-gate token cap minus spent).
+// Returns Infinity when tokenPerGate is 0 (uncharacterized — see note below).
+function gateTokensRemaining(budget, gateName) {
+  const cap = budget.caps.tokenPerGate || 0
+  if (!cap) return Infinity
+  const spent = (budget.gateSpend && budget.gateSpend[gateName]) || { tokens: 0 }
+  return Math.max(0, cap - spent.tokens)
+}
+
+// Post-gate token spend recording. Called after a gate's agent calls complete to
+// record actual token consumption. This is the measurement hook for D3: the
+// mechanism exists so a dogfood run can collect real per-gate token data and
+// feed it back into characterized tokenPerGate/tokenPerRun caps. Until then,
+// designBudgetGate always records 0 tokens and only the call ceiling is enforced.
+// Pure: returns a new budget object.
+function recordGateTokenSpend(budget, gateName, tokens) {
+  return spendDesignGate(budget, gateName, 0, tokens)
+}
+
+export { DESIGN_BUDGET_DEFAULTS, DESIGN_RESERVE_CALLS, createDesignBudget, spendDesignGate, gateCallsRemaining, gateTokensRemaining, canAdmitDesignGate, designBudgetSummary, recordGateTokenSpend }

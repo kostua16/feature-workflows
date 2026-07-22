@@ -47,5 +47,16 @@ Phase 5 enforced-budget/reserve pattern.
 ## Notes
 
 - Findings F11–F13 trace to `.planning/research/DESIGN-MODE-FINDINGS.md`.
-- Non-blocking observation: `designBudgetGate` counts 1 call per gate *invocation*, not actual intra-gate
-  agent calls (conservative — under-counts retries/escalations within a gate).
+- **D1 (call counting):** `designBudgetGate` counts 1 call per gate *invocation*, not actual intra-gate
+  agent calls (conservative — under-counts retries/escalations within a gate). The per-gate cap (default 8)
+  acts as a multiplier ceiling. Instrumenting actual agent calls would require modifying every gate's
+  invocation site — regression risk on verified code outweighs the precision gain. Documented in code.
+- **D2 (two budget systems):** Phase-5 global `retryState` (extract-mode retry tracking) and Phase-10
+  `designBudget` (design-mode per-gate enforcement) coexist by design. They serve different modes and
+  neither ceiling has been approached in production. Unification would be warranted only if a single mode
+  hit both ceilings or cross-mode budget sharing became a requirement. YAGNI — do NOT unify without need.
+- **D3 (token budgets uncharacterized):** `tokenPerGate`/`tokenPerRun` default to 0 (uncharacterized —
+  Infinity in practice), so only the call ceiling is enforced. The measurement plumbing exists:
+  `recordGateTokenSpend(budget, gateName, tokens)` and `gateTokensRemaining(budget, gateName)` in
+  `design-budget.mjs` provide the mechanism for post-gate token recording. Real per-gate token
+  characterization requires a dogfood run to collect actual agent token consumption data.
