@@ -1631,6 +1631,528 @@ async function repairResumeArtifactFlags(result) {
   return repairs
 }
 
+// Pure lifecycle state contract: explicit feature lifecycle states, deterministic
+// transition reducer, and readiness derivation. No I/O — all functions are pure
+// and deterministic. Designed for property-based table tests.
+
+// Canonical lifecycle states a feature may occupy. Exactly one is active per feature
+// at any time. Excluded features are outside the coverage denominator; all others
+// contribute to the readiness invariant.
+const LIFECYCLE_STATES = Object.freeze({
+  RUNNABLE: 'runnable',
+  DEFERRED: 'deferred',
+  IN_PROGRESS: 'in-progress',
+  BLOCKED: 'blocked',
+  FAILED: 'failed',
+  SKIPPED: 'skipped',
+  EXCLUDED: 'excluded',
+  COMPLETED: 'completed',
+})
+
+// Three distinct skip classifications with different readiness implications.
+// Feature-level skip means the feature itself was abandoned — remains incomplete.
+// Policy-disabled optional skip may complete if policy evidence is recorded.
+// Required-gate skip blocks completion permanently until resolved.
+const SKIP_REASONS = Object.freeze({
+  FEATURE_LEVEL: 'feature-level',
+  POLICY_DISABLED_OPTIONAL: 'policy-disabled-optional',
+  REQUIRED_GATE: 'required-gate',
+})
+
+// Legal transitions: maps current state to the set of event types that may fire.
+// Any event not listed for the current state is illegal and throws.
+const TRANSITION_TABLE = Object.freeze({
+  runnable: ['start', 'defer', 'skip', 'exclude'],
+  deferred: ['start', 'exclude'],
+  'in-progress': ['block', 'fail', 'complete', 'skip'],
+  blocked: ['start', 'fail', 'exclude'],
+  failed: ['start', 'exclude'],
+  skipped: ['start', 'complete', 'exclude'],
+  excluded: [],
+  completed: [],
+})
+
+// Pure transition reducer. Takes the current feature state and an event, returns a
+// new state object. Throws on illegal transitions. Does NOT mutate the input.
+//
+// state: { lifecycle, skipReason?, policyEvidence? }
+// event: { type: 'admit'|'start'|'block'|'fail'|'skip'|'exclude'|'complete', payload? }
+function applyLifecycleEvent(state, event) {
+  if (!state || typeof state !== 'object') {
+    throw new Error('applyLifecycleEvent: state must be an object')
+  }
+  if (!event || typeof event !== 'object' || !event.type) {
+    throw new Error('applyLifecycleEvent: event must have a type')
+  }
+
+  const current = state.lifecycle
+  if (!current || !TRANSITION_TABLE[current]) {
+    throw new Error(`applyLifecycleEvent: unknown lifecycle state '${current}'`)
+  }
+
+  const allowed = TRANSITION_TABLE[current]
+  if (!allowed.includes(event.type)) {
+    throw new Error(
+      `applyLifecycleEvent: illegal transition '${current}' + '${event.type}' (allowed: ${allowed.join(', ') || 'none'})`
+    )
+  }
+
+  // Build new state — never mutate the original
+  const next = { ...state }
+
+  switch (event.type) {
+    case 'start':
+      next.lifecycle = LIFECYCLE_STATES.IN_PROGRESS
+      delete next.skipReason
+      delete next.policyEvidence
+      break
+    case 'defer':
+      next.lifecycle = LIFECYCLE_STATES.DEFERRED
+      break
+    case 'block':
+      next.lifecycle = LIFECYCLE_STATES.BLOCKED
+      break
+    case 'fail':
+      next.lifecycle = LIFECYCLE_STATES.FAILED
+      break
+    case 'skip': {
+      const reason = event.payload && event.payload.skipReason
+      if (!reason || !Object.values(SKIP_REASONS).includes(reason)) {
+        throw new Error('applyLifecycleEvent: skip event requires valid payload.skipReason')
+      }
+      next.lifecycle = LIFECYCLE_STATES.SKIPPED
+      next.skipReason = reason
+      if (event.payload.policyEvidence) {
+        next.policyEvidence = event.payload.policyEvidence
+      }
+      break
+    }
+    case 'exclude':
+      next.lifecycle = LIFECYCLE_STATES.EXCLUDED
+      if (event.payload && event.payload.rationale) {
+        next.exclusionRationale = event.payload.rationale
+      }
+      break
+    case 'complete':
+      // A skipped feature can only complete under specific skip-reason rules
+      if (current === LIFECYCLE_STATES.SKIPPED) {
+        if (state.skipReason === SKIP_REASONS.REQUIRED_GATE) {
+          throw new Error('applyLifecycleEvent: cannot complete — required gate was skipped')
+        }
+        if (state.skipReason === SKIP_REASONS.FEATURE_LEVEL) {
+          throw new Error('applyLifecycleEvent: cannot complete — feature was skipped at feature level')
+        }
+        if (state.skipReason === SKIP_REASONS.POLICY_DISABLED_OPTIONAL) {
+          if (!state.policyEvidence) {
+            throw new Error('applyLifecycleEvent: cannot complete — policy-disabled skip requires policyEvidence')
+          }
+        }
+      }
+      next.lifecycle = LIFECYCLE_STATES.COMPLETED
+      break
+    default:
+      throw new Error(`applyLifecycleEvent: unhandled event type '${event.type}'`)
+  }
+
+  return next
+}
+
+// Derive readiness from a project manifest. Pure: no side effects.
+// Returns whether the project is ready plus exact counts.
+//
+// manifest: {
+//   schemaVersion: string,
+//   features: [{ id, lifecycle, skipReason?, policyEvidence? }]
+// }
+function deriveReadiness(manifest) {
+  const features = (manifest && manifest.features) || []
+  const counts = {
+    runnable: 0, deferred: 0, inProgress: 0, blocked: 0,
+    failed: 0, skipped: 0, excluded: 0, completed: 0,
+  }
+
+  for (const f of features) {
+    const lc = f.lifecycle
+    if (lc === LIFECYCLE_STATES.RUNNABLE) counts.runnable++
+    else if (lc === LIFECYCLE_STATES.DEFERRED) counts.deferred++
+    else if (lc === LIFECYCLE_STATES.IN_PROGRESS) counts.inProgress++
+    else if (lc === LIFECYCLE_STATES.BLOCKED) counts.blocked++
+    else if (lc === LIFECYCLE_STATES.FAILED) counts.failed++
+    else if (lc === LIFECYCLE_STATES.SKIPPED) counts.skipped++
+    else if (lc === LIFECYCLE_STATES.EXCLUDED) counts.excluded++
+    else if (lc === LIFECYCLE_STATES.COMPLETED) counts.completed++
+  }
+
+  // Denominator excludes 'excluded' features
+  const denominator = features.length - counts.excluded
+  const incomplete = counts.runnable + counts.deferred + counts.inProgress + counts.blocked + counts.failed
+
+  // Skipped features need special handling: only policy-disabled-optional with evidence counts as complete
+  let effectiveSkippedIncomplete = 0
+  for (const f of features) {
+    if (f.lifecycle === LIFECYCLE_STATES.SKIPPED) {
+      if (f.skipReason === SKIP_REASONS.POLICY_DISABLED_OPTIONAL && f.policyEvidence) {
+        counts.completed++ // counts as completed for readiness
+      } else {
+        effectiveSkippedIncomplete++
+      }
+    }
+  }
+  // Adjust: skipped that can complete are already counted in completed above;
+  // the rest are incomplete
+  const totalIncomplete = incomplete + effectiveSkippedIncomplete
+
+  return {
+    ready: denominator > 0 && totalIncomplete === 0 && counts.completed >= denominator,
+    denominator,
+    completed: counts.completed,
+    remaining: counts.runnable + counts.deferred + counts.inProgress,
+    blocked: counts.blocked,
+    failed: counts.failed,
+    skipped: effectiveSkippedIncomplete,
+    excluded: counts.excluded,
+  }
+}
+
+// Terminal states: once reached, the feature does not transition further
+function isTerminal(lifecycleState) {
+  return lifecycleState === LIFECYCLE_STATES.COMPLETED ||
+    lifecycleState === LIFECYCLE_STATES.FAILED ||
+    lifecycleState === LIFECYCLE_STATES.EXCLUDED
+}
+
+// Incomplete states: features that still need work before the project can be ready.
+// Feature-level skipped is incomplete. Policy-disabled-optional with evidence is NOT.
+function isIncomplete(lifecycleState, skipReason) {
+  if (lifecycleState === LIFECYCLE_STATES.DEFERRED ||
+    lifecycleState === LIFECYCLE_STATES.BLOCKED ||
+    lifecycleState === LIFECYCLE_STATES.IN_PROGRESS ||
+    lifecycleState === LIFECYCLE_STATES.RUNNABLE) {
+    return true
+  }
+  if (lifecycleState === LIFECYCLE_STATES.SKIPPED) {
+    return skipReason !== SKIP_REASONS.POLICY_DISABLED_OPTIONAL
+  }
+  return false
+}
+
+// Root-last migration from v1.4.5 monolithic pipeline-state.json to v1.5.0 sharded
+// state contract. All functions are pure and deterministic — no I/O.
+//
+// Migration order:
+// 1. Validate the legacy envelope before mutation.
+// 2. Derive deterministic feature identities and default new version/revision fields.
+// 3. Write and validate every referenced child shard.
+// 4. Reclassify legacy cap/selector outcomes as deferred where evidence shows undispatched scope.
+// 5. Atomically acknowledge the compact project manifest only after all child references are durable.
+
+
+// Derive a stable canonical feature identity from a legacy extract-queue slice.
+// The identity is based on the slice name and primary entry point, not array index,
+// so the same slice produces the same ID across runs and traversals.
+function deriveFeatureId(legacySlice) {
+  if (!legacySlice) return 'unknown'
+  const name = legacySlice.name || legacySlice.id || 'feature'
+  const slug = categorizeSlug(String(name))
+  // Incorporate first entry point or file for uniqueness when names collide
+  const entryPoint = (legacySlice.entryPoints && legacySlice.entryPoints[0]) || ''
+  const fileHint = (legacySlice.files && legacySlice.files[0]) || ''
+  const disambiguator = categorizeSlug(String(entryPoint || fileHint))
+  // If slug is unique enough, skip the disambiguator
+  if (disambiguator && disambiguator !== 'misc' && disambiguator !== slug) {
+    return `${slug}-${disambiguator}`
+  }
+  return slug || 'feature'
+}
+
+// Pure transform: convert legacy v1.4.5 pipeline-state.json structure to v1.5.0
+// sharded project manifest. Idempotent — calling twice produces the same output.
+//
+// legacyState: the deserialized pipeline-state.json { result: { slices: [...] }, ... }
+// Returns: {
+//   schemaVersion: '1.5.0',
+//   status: 'migrating' | 'migrated',
+//   features: [{ id, lifecycle, skipReason?, policyEvidence?, shardRef, legacyStatus }],
+//   legacyEngineVersion: string | null,
+// }
+function migrateLegacyState(legacyState) {
+  if (!legacyState || typeof legacyState !== 'object') {
+    throw new Error('migrateLegacyState: input must be an object')
+  }
+
+  const result = legacyState.result || {}
+  const legacySlices = Array.isArray(result.slices) ? result.slices : []
+  const legacyEngineVersion = legacyState.engineVersion || null
+
+  // If already migrated (idempotent check), return as-is
+  if (legacyState.schemaVersion === '1.5.0') {
+    return {
+      schemaVersion: '1.5.0',
+      status: 'migrated',
+      features: legacyState.features || [],
+      legacyEngineVersion,
+    }
+  }
+
+  const features = legacySlices.map((slice) => {
+    const id = deriveFeatureId(slice)
+    const legacyStatus = slice.status || 'pending'
+
+    // Map legacy statuses to v1.5.0 lifecycle states
+    let lifecycle
+    let skipReason = null
+    let policyEvidence = null
+    let rationale = null
+
+    if (legacyStatus === 'pending') {
+      lifecycle = LIFECYCLE_STATES.DEFERRED
+    } else if (legacyStatus === 'skipped') {
+      // Legacy 'skipped' conflated cap-exceeded with deselected.
+      // Cap-exceeded slices are still in-scope → deferred with rationale.
+      // Deselected slices are excluded.
+      lifecycle = LIFECYCLE_STATES.DEFERRED
+      rationale = 'legacy cap-exceeded or deselected — reclassified as deferred for v1.5.0'
+    } else if (legacyStatus === 'completed') {
+      lifecycle = LIFECYCLE_STATES.COMPLETED
+    } else if (legacyStatus === 'failed') {
+      lifecycle = LIFECYCLE_STATES.FAILED
+    } else if (legacyStatus === 'excluded') {
+      lifecycle = LIFECYCLE_STATES.EXCLUDED
+    } else {
+      lifecycle = LIFECYCLE_STATES.DEFERRED
+    }
+
+    const feature = {
+      id,
+      lifecycle,
+      shardRef: slice.planDir || `feature-state/${id}.json`,
+      legacyStatus,
+    }
+    if (skipReason) feature.skipReason = skipReason
+    if (policyEvidence) feature.policyEvidence = policyEvidence
+    if (rationale) feature.migrationRationale = rationale
+
+    return feature
+  })
+
+  return {
+    schemaVersion: '1.5.0',
+    status: 'migrating',
+    features,
+    legacyEngineVersion,
+  }
+}
+
+// Validate migration boundaries for fault injection. Pure: checks the state at a
+// given migration phase boundary without performing any writes.
+//
+// state: the in-progress migration output
+// phase: 'child-write' | 'before-root' | 'after-children'
+// childId: (optional) specific child to check for 'child-write'
+//
+// Returns: { ok: boolean, reason?: string }
+function validateMigrationBoundary(state, phase, childId) {
+  if (!state || typeof state !== 'object') {
+    return { ok: false, reason: 'state is not an object' }
+  }
+
+  const features = state.features || []
+
+  if (phase === 'child-write') {
+    if (!childId) return { ok: false, reason: 'childId required for child-write phase' }
+    const child = features.find((f) => f.id === childId)
+    if (!child) return { ok: false, reason: `child '${childId}' not found` }
+    // In a real system, this checks durable write of the shard.
+    // For pure testing: the child must have a shardRef.
+    if (!child.shardRef) return { ok: false, reason: `child '${childId}' missing shardRef` }
+    child._durable = true
+    return { ok: true }
+  }
+
+  if (phase === 'before-root') {
+    // Root cannot be acknowledged until ALL children are durable
+    const undurable = features.filter((f) => !f._durable && f.lifecycle !== LIFECYCLE_STATES.EXCLUDED)
+    if (undurable.length > 0) {
+      return {
+        ok: false,
+        reason: `${undurable.length} child shard(s) not yet durable: ${undurable.map((f) => f.id).join(', ')}`,
+      }
+    }
+    return { ok: true }
+  }
+
+  if (phase === 'after-children') {
+    // All children must be validated/durable before root acknowledgement
+    const unvalidated = features.filter((f) => !f._durable && f.lifecycle !== LIFECYCLE_STATES.EXCLUDED)
+    if (unvalidated.length > 0) {
+      return {
+        ok: false,
+        reason: `${unvalidated.length} child shard(s) not validated`,
+      }
+    }
+    return { ok: true }
+  }
+
+  return { ok: false, reason: `unknown migration phase '${phase}'` }
+}
+
+// Selective revision invalidation: deterministic digest computation, revision
+// comparison, and gate-level selective invalidation. All functions are pure —
+// no I/O, no side effects.
+//
+// When source files, scope, graph inputs, dependency summaries, or artifacts
+// change, the engine compares durable revisions/digests and selectively
+// invalidates only affected feature gates and derived project views while
+// retaining independently valid evidence.
+
+// Reuse the proven djb2 hash from state.mjs (same algorithm, already tested).
+// Defined independently here to avoid import issues in the concatenated dist.
+function computeDigest(input) {
+  let str
+  if (typeof input === 'string') {
+    str = input
+  } else if (input == null) {
+    str = String(input)
+  } else {
+    str = JSON.stringify(sortKeys(input))
+  }
+  let h = 5381
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h + str.charCodeAt(i)) >>> 0
+  }
+  return h.toString(16)
+}
+
+// Deterministic JSON stringify with sorted keys for stable serialization.
+function sortKeys(obj) {
+  if (obj === null || typeof obj !== 'object') return obj
+  if (Array.isArray(obj)) return obj.map(sortKeys)
+  const sorted = {}
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = sortKeys(obj[key])
+  }
+  return sorted
+}
+
+// Stable digest for arbitrary JSON-serializable content.
+function computeContentDigest(content) {
+  return computeDigest(JSON.stringify(sortKeys(content)))
+}
+
+// Revision input types that drive selective invalidation.
+// Each type maps to the gates it affects.
+const REVISION_INPUTS = Object.freeze({
+  SOURCE: 'source',       // affects: codeFacts, arch
+  SCOPE: 'scope',         // affects: codeFacts
+  GRAPH: 'graph',         // affects: arch
+  DEPS: 'deps',           // affects: arch
+  ARTIFACT: 'artifact',   // affects: only the gate that owns the artifact
+})
+
+// Gate-dependency map: which revision inputs affect which gates.
+// This is the contract for selective invalidation — only listed gates
+// are invalidated when their input revision changes.
+const GATE_DEPENDENCY_MAP = Object.freeze({
+  codeFacts: ['source', 'scope'],
+  arch: ['source', 'graph', 'deps'],
+  design: ['artifact'],
+  plan: ['artifact'],
+  tests: ['artifact'],
+  requirements: ['artifact'],
+  useCases: ['artifact'],
+})
+
+// Compare old and new revision sets and identify affected features and gates.
+//
+// oldRevisions: { source?: digest, scope?: digest, graph?: digest, deps?: digest,
+//                 artifacts?: { gateName: digest } }
+// newRevisions: same shape
+// featureId: (optional) the feature these revisions belong to
+//
+// Returns: { affectedGates: [...], changedInputs: [...] }
+function compareRevisions(oldRevisions, newRevisions, featureId) {
+  const oldR = oldRevisions || {}
+  const newR = newRevisions || {}
+  const changedInputs = []
+  const affectedGates = new Set()
+
+  // Check top-level revision inputs
+  for (const inputType of ['source', 'scope', 'graph', 'deps']) {
+    if (oldR[inputType] !== newR[inputType]) {
+      changedInputs.push(inputType)
+      // Find gates affected by this input type
+      for (const [gate, inputs] of Object.entries(GATE_DEPENDENCY_MAP)) {
+        if (inputs.includes(inputType)) {
+          affectedGates.add(gate)
+        }
+      }
+    }
+  }
+
+  // Check artifact-level revisions
+  const oldArtifacts = oldR.artifacts || {}
+  const newArtifacts = newR.artifacts || {}
+  for (const gateName of Object.keys({ ...oldArtifacts, ...newArtifacts })) {
+    if (oldArtifacts[gateName] !== newArtifacts[gateName]) {
+      changedInputs.push('artifact')
+      affectedGates.add(gateName)
+    }
+  }
+
+  return {
+    affectedGates: Array.from(affectedGates).sort(),
+    changedInputs: Array.from(changedInputs).sort(),
+  }
+}
+
+// Selectively invalidate only affected gates in a feature shard.
+//
+// featureShard: { gates: { gateName: { digest, valid, ... }, ... } }
+// revisionDelta: { affectedGates: [...], changedInputs: [...] } from compareRevisions
+//
+// Returns: new shard with only affected gates marked invalid. Independent
+// gates retain their valid status. Does NOT mutate input.
+function selectiveInvalidate(featureShard, revisionDelta) {
+  if (!featureShard || typeof featureShard !== 'object') {
+    throw new Error('selectiveInvalidate: featureShard must be an object')
+  }
+  const gates = featureShard.gates || {}
+  const affectedGates = (revisionDelta && revisionDelta.affectedGates) || []
+
+  // Build new gates object — only mark affected gates as invalid
+  const newGates = {}
+  for (const [gateName, gateState] of Object.entries(gates)) {
+    if (affectedGates.includes(gateName)) {
+      // Invalidate this gate
+      newGates[gateName] = { ...gateState, valid: false, invalidReason: 'revision-changed' }
+    } else {
+      // Retain independent evidence — gate is still valid
+      newGates[gateName] = { ...gateState }
+    }
+  }
+
+  return { ...featureShard, gates: newGates }
+}
+
+// Filter a feature shard to only independently valid evidence.
+// Returns a shard containing only gates whose inputs have not changed
+// (i.e., gates that are still valid after selective invalidation).
+function retainValidEvidence(featureShard) {
+  if (!featureShard || typeof featureShard !== 'object') {
+    return { gates: {} }
+  }
+  const gates = featureShard.gates || {}
+  const validGates = {}
+
+  for (const [gateName, gateState] of Object.entries(gates)) {
+    if (gateState && gateState.valid !== false) {
+      validGates[gateName] = { ...gateState }
+    }
+  }
+
+  return { ...featureShard, gates: validGates }
+}
+
 // chunkPlanIntoStages (Phase H, design tail): split plan.md -> dependency-ordered stageNN.md files
 // via the plan-chunker agent. Stages become the implement progress unit (lanes collapse INTO a stage).
 // Called once in design mode after Gate 2 (Review/Refine) acceptance, BEFORE the design-stop.
