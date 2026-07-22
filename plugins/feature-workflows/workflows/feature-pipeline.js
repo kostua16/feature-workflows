@@ -3204,6 +3204,544 @@ function schedulabilityDecision(features, edges, cap, cyclePolicy) {
   }
 }
 
+// Budget admission: characterize limits, track spend, and reserve non-spendable
+// capacity for checkpoint, reconciliation, synthesis, and handoff.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Non-spendable reserve categories — capacity reserved for system-critical work
+// that must never be consumed by gate/feature processing.
+const RESERVE_TYPES = Object.freeze({
+  CHECKPOINT: 'checkpoint',
+  RECONCILIATION: 'reconciliation',
+  SYNTHESIS: 'synthesis',
+  HANDOFF: 'handoff',
+})
+
+// Characterized budget limits derived from runtime evidence, not guessed.
+// callCeiling: shared runtime agent-call ceiling (default 1000)
+// tokenCeiling: shared token budget (0 = uncharacterized)
+// concurrency: max parallel features per segment
+// retryPerGate: max retry attempts per gate per feature
+// retryPerFeature: max total retries per feature
+function createBudgetLimits(opts) {
+  const o = opts || {}
+  return {
+    callCeiling: o.callCeiling || 1000,
+    tokenCeiling: o.tokenCeiling || 0,
+    concurrency: o.concurrency || 1,
+    retryPerGate: o.retryPerGate || 3,
+    retryPerFeature: o.retryPerFeature || 10,
+  }
+}
+
+// Create a budget accountant that tracks actual spend against limits.
+// Pure: all state is in the returned object, no mutation of inputs.
+function createBudgetAccountant(limits) {
+  return {
+    limits,
+    callsSpent: 0,
+    tokensSpent: 0,
+    reserve: {
+      [RESERVE_TYPES.CHECKPOINT]: 0,
+      [RESERVE_TYPES.RECONCILIATION]: 0,
+      [RESERVE_TYPES.SYNTHESIS]: 0,
+      [RESERVE_TYPES.HANDOFF]: 0,
+    },
+  }
+}
+
+// Set aside non-spendable reserve capacity. Returns a new accountant.
+function setReserve(accountant, category, amount) {
+  const next = {
+    ...accountant,
+    reserve: { ...accountant.reserve },
+  }
+  next.reserve[category] = amount
+  return next
+}
+
+// Compute total reserved capacity across all categories.
+function totalReserve(accountant) {
+  return Object.values(accountant.reserve).reduce(function (s, v) { return s + v }, 0)
+}
+
+// Compute remaining callable budget after subtracting spent and reserved.
+function callsRemaining(accountant) {
+  var reserved = totalReserve(accountant)
+  return Math.max(0, accountant.limits.callCeiling - accountant.callsSpent - reserved)
+}
+
+// Compute remaining token budget after subtracting spent and reserved.
+function tokensRemaining(accountant) {
+  if (!accountant.limits.tokenCeiling) return Infinity
+  var reserved = totalReserve(accountant)
+  return Math.max(0, accountant.limits.tokenCeiling - accountant.tokensSpent - reserved)
+}
+
+// Admit a segment: check if estimated work fits within remaining budget
+// after reserving non-spendable capacity. Never accept a segment that
+// crosses the characterized ceiling.
+function admitSegment(accountant, segmentCost) {
+  var calls = callsRemaining(accountant)
+  var tokens = tokensRemaining(accountant)
+  var neededCalls = (segmentCost && segmentCost.calls) || 0
+  var neededTokens = (segmentCost && segmentCost.tokens) || 0
+
+  if (neededCalls > calls) {
+    return { admitted: false, reason: 'call-ceiling', remaining: { calls: calls, tokens: tokens } }
+  }
+  if (neededTokens > tokens) {
+    return { admitted: false, reason: 'token-ceiling', remaining: { calls: calls, tokens: tokens } }
+  }
+  return { admitted: true, remaining: { calls: calls, tokens: tokens } }
+}
+
+// Record actual budget spend. Pure: returns a new accountant.
+function spendBudget(accountant, calls, tokens) {
+  return {
+    ...accountant,
+    callsSpent: accountant.callsSpent + (calls || 0),
+    tokensSpent: accountant.tokensSpent + (tokens || 0),
+    reserve: { ...accountant.reserve },
+  }
+}
+
+// Check if a feature's next atomic gate can complete within remaining budget.
+// Prevents admitting a feature whose next gate would cross the ceiling.
+function canFinishNextGate(accountant, gateCost) {
+  var calls = callsRemaining(accountant)
+  var tokens = tokensRemaining(accountant)
+  var neededCalls = (gateCost && gateCost.calls) || 0
+  var neededTokens = (gateCost && gateCost.tokens) || 0
+  return neededCalls <= calls && neededTokens <= tokens
+}
+
+// Budget summary for handoff/status reporting.
+function budgetSummary(accountant) {
+  return {
+    callCeiling: accountant.limits.callCeiling,
+    callsSpent: accountant.callsSpent,
+    callsRemaining: callsRemaining(accountant),
+    reserved: totalReserve(accountant),
+    reserveBreakdown: { ...accountant.reserve },
+  }
+}
+
+// Bounded retry policy: per-gate and per-feature retry limits, persistent
+// attempt history with monotonic sequence, and terminal reason tracking.
+// Exhausted retries are never reclassified as completed.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Attempt outcomes
+const ATTEMPT_OUTCOMES = Object.freeze({
+  SUCCESS: 'success',
+  RETRYABLE_FAILURE: 'retryable-failure',
+  TIMEOUT: 'timeout',
+  INVALID_OUTPUT: 'invalid-output',
+  PERMANENT_FAILURE: 'permanent-failure',
+  BLOCKED_DEPENDENCY: 'blocked-dependency',
+})
+
+// Outcomes that count toward retry exhaustion
+var EXHAUSTING_OUTCOMES = {
+  'retryable-failure': true,
+  'timeout': true,
+  'invalid-output': true,
+}
+
+// Create a retry policy with per-gate and per-feature limits.
+function createRetryPolicy(opts) {
+  var o = opts || {}
+  return {
+    maxPerGate: o.maxPerGate || 3,
+    maxPerFeature: o.maxPerFeature || 10,
+  }
+}
+
+// Create a fresh attempt history. The _seq counter is monotonic.
+function createAttemptHistory() {
+  return {
+    attempts: [],
+    _seq: 0,
+  }
+}
+
+// Record an attempt. Pure: returns a new history with a new monotonic sequence number.
+function recordAttempt(history, featureId, gate, outcome, reason) {
+  var seq = history._seq + 1
+  var attempt = {
+    seq: seq,
+    featureId: featureId,
+    gate: gate,
+    outcome: outcome,
+    reason: reason || null,
+  }
+  return {
+    attempts: history.attempts.concat([attempt]),
+    _seq: seq,
+  }
+}
+
+// Count retryable attempts for a specific feature+gate combination.
+// Only exhausting outcomes (retryable-failure, timeout, invalid-output) count.
+function gateAttemptCount(history, featureId, gate) {
+  var count = 0
+  for (var i = 0; i < history.attempts.length; i++) {
+    var a = history.attempts[i]
+    if (a.featureId === featureId && a.gate === gate && EXHAUSTING_OUTCOMES[a.outcome]) {
+      count++
+    }
+  }
+  return count
+}
+
+// Count total retryable attempts for a feature across all gates.
+function featureAttemptCount(history, featureId) {
+  var count = 0
+  for (var i = 0; i < history.attempts.length; i++) {
+    var a = history.attempts[i]
+    if (a.featureId === featureId && EXHAUSTING_OUTCOMES[a.outcome]) {
+      count++
+    }
+  }
+  return count
+}
+
+// Check if per-gate retries are exhausted for a feature+gate.
+function isGateRetriesExhausted(history, featureId, gate, policy) {
+  return gateAttemptCount(history, featureId, gate) >= policy.maxPerGate
+}
+
+// Check if total per-feature retries are exhausted.
+function isFeatureRetriesExhausted(history, featureId, policy) {
+  return featureAttemptCount(history, featureId) >= policy.maxPerFeature
+}
+
+// Check if a feature is terminally failed — no more retries possible.
+// A permanent failure or blocked dependency is immediately terminal.
+// Exhausted retries (per-gate or per-feature) are also terminal.
+function isTerminalFailure(history, featureId, policy) {
+  var featureAttempts = history.attempts.filter(function (a) { return a.featureId === featureId })
+  if (featureAttempts.length === 0) return false
+
+  var lastOutcome = featureAttempts[featureAttempts.length - 1].outcome
+  if (lastOutcome === ATTEMPT_OUTCOMES.PERMANENT_FAILURE) return true
+  if (lastOutcome === ATTEMPT_OUTCOMES.BLOCKED_DEPENDENCY) return true
+
+  return isFeatureRetriesExhausted(history, featureId, policy)
+}
+
+// Get the terminal reason for a feature (if terminally failed).
+function terminalReason(history, featureId) {
+  var featureAttempts = history.attempts.filter(function (a) { return a.featureId === featureId })
+  if (featureAttempts.length === 0) return null
+  var last = featureAttempts[featureAttempts.length - 1]
+  return last.reason || last.outcome
+}
+
+// Summary of attempts for a feature for handoff/status reporting.
+function attemptSummary(history, featureId) {
+  var featureAttempts = history.attempts.filter(function (a) { return a.featureId === featureId })
+  return {
+    totalAttempts: featureAttempts.length,
+    lastOutcome: featureAttempts.length > 0 ? featureAttempts[featureAttempts.length - 1].outcome : null,
+    lastReason: featureAttempts.length > 0 ? featureAttempts[featureAttempts.length - 1].reason : null,
+    gates: featureAttempts.map(function (a) { return a.gate }).filter(function (v, i, arr) { return arr.indexOf(v) === i }),
+  }
+}
+
+// Failure isolation: one feature failure does not lose or poison independent work.
+// Updates only the failed feature's shard; eligible independent features continue.
+// Verified artifacts are preserved on failure.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Isolate a feature failure: update only the failed feature's lifecycle,
+// preserving all other features' state and verified artifacts.
+// Pure: returns a new queue array, does NOT mutate the input.
+// Timeout and blocked failures are resumable (status='blocked'); other
+// failure types are terminal (status='failed').
+function isolateFailure(queue, failedId, failureType) {
+  var resumable = failureType === 'timeout' || failureType === 'blocked'
+  return queue.map(function (entry) {
+    if (entry.id !== failedId) {
+      return Object.assign({}, entry)
+    }
+    // Failed feature: preserve verified artifacts, update status
+    return Object.assign({}, entry, {
+      status: resumable ? 'blocked' : 'failed',
+      failureType: failureType || 'unknown',
+      // Artifacts are PRESERVED — failure does not lose verified work
+      artifacts: entry.artifacts || {},
+    })
+  })
+}
+
+// Given a failed feature, determine which other features are eligible to
+// continue independently (not blocked by the failure through dependencies).
+// Uses transitive closure: any feature whose dependency chain reaches the
+// failed feature is blocked.
+function eligibleIndependents(queue, failedId, edges) {
+  var transitivelyBlocked = {}
+  transitivelyBlocked[failedId] = true
+
+  // Propagate: any feature whose dependency is blocked is itself blocked
+  var changed = true
+  while (changed) {
+    changed = false
+    for (var i = 0; i < (edges || []).length; i++) {
+      var e = edges[i]
+      if (transitivelyBlocked[e.to] && !transitivelyBlocked[e.from]) {
+        transitivelyBlocked[e.from] = true
+        changed = true
+      }
+    }
+  }
+
+  // Eligible: not transitively blocked, and still has work to do
+  return queue.filter(function (entry) {
+    if (transitivelyBlocked[entry.id]) return false
+    return entry.status === 'pending' || entry.status === 'in-progress'
+  })
+}
+
+// Preserve verified artifacts from a failed feature slice.
+// Returns only the artifacts that were actually produced (truthy paths).
+function preserveVerifiedArtifacts(slice) {
+  var artifacts = slice.artifacts || {}
+  var verified = {}
+  for (var key in artifacts) {
+    if (artifacts[key]) verified[key] = artifacts[key]
+  }
+  return verified
+}
+
+// Determine if a segment should continue after a feature failure.
+// True if at least one eligible independent feature remains.
+function shouldContinueAfterFailure(queue, failedId, edges) {
+  return eligibleIndependents(queue, failedId, edges).length > 0
+}
+
+// Count features by terminal status within a segment.
+// Maps both 'done' and 'completed' to the completed bucket since the
+// extract queue uses 'done' while the lifecycle reducer uses 'completed'.
+function segmentOutcome(queue) {
+  var counts = {
+    completed: 0,
+    blocked: 0,
+    failed: 0,
+    deferred: 0,
+    skipped: 0,
+    pending: 0,
+  }
+  for (var i = 0; i < queue.length; i++) {
+    var status = queue[i].status
+    if (status === 'done' || status === 'completed') counts.completed++
+    else if (status in counts) counts[status]++
+    else counts.pending++
+  }
+  return counts
+}
+
+// Transactional automatic continuation: monotonic segment identifiers,
+// idempotency keys, and convergence of duplicate/lost/out-of-order launches.
+// One command launches the next segment while progress is possible; every
+// stop emits an exact idempotent manual resume command.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Create a continuation state tracker.
+function createContinuationState() {
+  return {
+    lastSegmentId: 0,
+    intents: [],
+    acknowledgements: [],
+  }
+}
+
+// Allocate the next monotonic segment identifier. Pure: returns new state + id.
+function nextSegmentId(state) {
+  var segmentId = state.lastSegmentId + 1
+  return {
+    state: Object.assign({}, state, { lastSegmentId: segmentId }),
+    segmentId: segmentId,
+  }
+}
+
+// Generate an idempotency key for a segment. Deterministic: same features + revision
+// produce the same key, so duplicate launches converge to one outcome.
+function idempotencyKey(segmentId, featureIds, revision) {
+  var ids = featureIds.slice().sort().join(',')
+  return 'seg-' + segmentId + '-' + ids + '-' + (revision || 'none')
+}
+
+// Create a segment intent: the orchestrator declares it is about to launch
+// a segment. This is the write-intent phase before actual work begins.
+// Duplicate intents for the same segment converge (idempotent).
+function createSegmentIntent(state, segmentId, featureIds, revision) {
+  var key = idempotencyKey(segmentId, featureIds, revision)
+  // Check if this exact intent already exists (duplicate launch)
+  for (var i = 0; i < state.intents.length; i++) {
+    if (state.intents[i].segmentId === segmentId && state.intents[i].idempotencyKey === key) {
+      return { state: state, duplicate: true, intent: state.intents[i] }
+    }
+  }
+  var intent = {
+    segmentId: segmentId,
+    idempotencyKey: key,
+    features: featureIds.slice().sort(),
+    revision: revision || null,
+    acknowledged: false,
+  }
+  return {
+    state: Object.assign({}, state, { intents: state.intents.concat([intent]) }),
+    duplicate: false,
+    intent: intent,
+  }
+}
+
+// Acknowledge a segment completion: the commit phase.
+// Idempotent: acknowledging the same segment twice converges to one outcome.
+function acknowledgeSegment(state, segmentId, key, outcome, counts) {
+  // Check if already acknowledged (duplicate acknowledgement)
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    if (state.acknowledgements[i].segmentId === segmentId) {
+      return { state: state, duplicate: true, acknowledgement: state.acknowledgements[i] }
+    }
+  }
+
+  var acknowledgement = {
+    segmentId: segmentId,
+    idempotencyKey: key,
+    outcome: outcome || 'partial',
+    counts: counts || {},
+  }
+
+  // Mark intent as acknowledged
+  var intents = state.intents.map(function (i) {
+    if (i.segmentId === segmentId) return Object.assign({}, i, { acknowledged: true })
+    return i
+  })
+
+  return {
+    state: Object.assign({}, state, {
+      intents: intents,
+      acknowledgements: state.acknowledgements.concat([acknowledgement]),
+    }),
+    duplicate: false,
+    acknowledgement: acknowledgement,
+  }
+}
+
+// Resolve convergence of duplicate, lost, resumed, or out-of-order launches.
+// Produces the canonical durable outcome — one outcome per segment, no skipped
+// or double-applied work. First acknowledgement for each segment wins.
+function resolveConvergence(state) {
+  var seen = {} // segmentId -> canonical ack
+
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    var ack = state.acknowledgements[i]
+    if (!seen[ack.segmentId]) {
+      seen[ack.segmentId] = ack
+    }
+    // Duplicate: first acknowledgement wins (idempotent)
+  }
+
+  var converged = Object.keys(seen).map(function (k) { return seen[k] })
+  converged.sort(function (a, b) { return a.segmentId - b.segmentId })
+
+  // Check for unacknowledged intents (lost acknowledgements / crashes)
+  var unacknowledged = state.intents.filter(function (intent) {
+    return !seen[intent.segmentId]
+  })
+
+  return {
+    converged: converged,
+    unacknowledged: unacknowledged,
+    pendingRetry: unacknowledged.map(function (i) {
+      return {
+        segmentId: i.segmentId,
+        idempotencyKey: i.idempotencyKey,
+        features: i.features,
+      }
+    }),
+  }
+}
+
+// Determine if progress is still possible (continuation decision).
+// True if there are pending or in-progress features.
+function shouldContinue(queue) {
+  for (var i = 0; i < queue.length; i++) {
+    if (queue[i].status === 'pending' || queue[i].status === 'in-progress') {
+      return true
+    }
+  }
+  return false
+}
+
+// Count features by outcome across all acknowledged segments.
+function segmentCounts(state) {
+  var counts = { completed: 0, deferred: 0, blocked: 0, failed: 0, skipped: 0 }
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    var c = state.acknowledgements[i].counts || {}
+    counts.completed += c.completed || 0
+    counts.deferred += c.deferred || 0
+    counts.blocked += c.blocked || 0
+    counts.failed += c.failed || 0
+    counts.skipped += c.skipped || 0
+  }
+  return counts
+}
+
+// Generate the exact idempotent manual resume command for a stopped segment.
+// This command reproduces the same state transition when run manually.
+function resumeCommand(planDir, segmentId, state) {
+  var convergence = resolveConvergence(state)
+  var hasUnack = convergence.unacknowledged.length > 0
+  return {
+    command: '/feature-workflows:extract-design --resume ' + planDir,
+    segmentId: segmentId,
+    reason: hasUnack ? 'unacknowledged-intent' : 'no-progress-or-ceiling',
+    counts: segmentCounts(state),
+    idempotent: true,
+  }
+}
+
+// Detect out-of-order delivery: an acknowledgement for segment N+1 arriving
+// before segment N's acknowledgement. Out-of-order acks converge correctly.
+function isOutOfOrder(state, segmentId) {
+  var ackedIds = {}
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    ackedIds[state.acknowledgements[i].segmentId] = true
+  }
+  // Out-of-order if a lower segment has an intent but no ack
+  for (var j = 0; j < state.intents.length; j++) {
+    if (state.intents[j].segmentId < segmentId && !ackedIds[state.intents[j].segmentId]) {
+      return true
+    }
+  }
+  return false
+}
+
+// Check if automatic relaunch is possible (not refused).
+// Returns false when the budget is exhausted or too many unacknowledged
+// intents exist (potential crash loop).
+function canAutoRelaunch(state, budgetCallsRemaining) {
+  if (budgetCallsRemaining <= 0) return false
+  var convergence = resolveConvergence(state)
+  return convergence.unacknowledged.length < 3
+}
+
+// Full continuation summary for handoff/status reporting.
+function continuationSummary(state) {
+  var convergence = resolveConvergence(state)
+  return {
+    lastSegmentId: state.lastSegmentId,
+    acknowledgedSegments: convergence.converged.length,
+    unacknowledgedIntents: convergence.unacknowledged.length,
+    totalCounts: segmentCounts(state),
+    hasUnacknowledged: convergence.unacknowledged.length > 0,
+  }
+}
+
 // chunkPlanIntoStages (Phase H, design tail): split plan.md -> dependency-ordered stageNN.md files
 // via the plan-chunker agent. Stages become the implement progress unit (lanes collapse INTO a stage).
 // Called once in design mode after Gate 2 (Review/Refine) acceptance, BEFORE the design-stop.
@@ -5921,6 +6459,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (!result.extractQueue) result.extractQueue = []
     if (result.overviewPath === undefined) result.overviewPath = null
     if (result.extractReady === undefined) result.extractReady = false
+    // Phase 5: backfill bounded scheduler state on pre-v1.5 resume.
+    if (result.continuationState === undefined) result.continuationState = null
+    if (result.budgetAccountant === undefined) result.budgetAccountant = null
+    if (result.attemptHistory === undefined) result.attemptHistory = null
     if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
     // The user-level install is a symlink that tracks the plugin, so a resume after a
@@ -6018,6 +6560,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       overviewPath: null, // <planDir>/system-overview.md (multi-slice only)
       extractReady: false, // extract terminal: all pending slices processed
       auditPath: null, // <planDir>/design-audit.md (single-slice; per-slice audits live on queue entries)
+      // Phase 5: bounded scheduler and transactional automatic continuation state.
+      continuationState: null, // monotonic segment tracking + idempotency keys
+      budgetAccountant: null, // characterized budget admission with non-spendable reserve
+      attemptHistory: null, // per-gate/per-feature retry attempt journal
       // Review mode (standalone design-docset audit) state. Defaults keep older
       // pipeline-state.json hydrating without breakage (same backward-compat rule).
       reviewPath: null, // <planDir>/design-review.md report
@@ -6561,6 +7107,45 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       const multiSlice = result.extractQueue.length > 1
         || (result.extractQueue[0] && result.extractQueue[0].planDir !== planDir)
 
+      // Phase 5: initialize bounded scheduler state on first entry (not on resume).
+      // Budget accountant reserves non-spendable capacity for checkpoint, reconciliation,
+      // synthesis, and handoff so gate work cannot starve system-critical operations.
+      // Continuation state tracks monotonic segment IDs and idempotency keys.
+      // Attempt history journals every retry with a terminal reason.
+      if (!result.continuationState) {
+        result.continuationState = createContinuationState()
+      }
+      if (!result.budgetAccountant) {
+        const limits = createBudgetLimits({
+          callCeiling: 1000,
+          retryPerGate: 3,
+          retryPerFeature: 10,
+        })
+        let acct = createBudgetAccountant(limits)
+        // Reserve non-spendable capacity for each system-critical category.
+        // These reserves ensure checkpoint/synthesis/handoff can always complete
+        // even when gate work approaches the shared call ceiling.
+        acct = setReserve(acct, RESERVE_TYPES.CHECKPOINT, 5)
+        acct = setReserve(acct, RESERVE_TYPES.RECONCILIATION, 5)
+        acct = setReserve(acct, RESERVE_TYPES.SYNTHESIS, 5)
+        acct = setReserve(acct, RESERVE_TYPES.HANDOFF, 5)
+        result.budgetAccountant = acct
+      }
+      if (!result.attemptHistory) {
+        result.attemptHistory = createAttemptHistory()
+      }
+      // Allocate a monotonic segment ID and declare intent for this batch.
+      var segAlloc = nextSegmentId(result.continuationState)
+      result.continuationState = segAlloc.state
+      var currentSegmentId = segAlloc.segmentId
+      var segmentFeatureIds = result.extractQueue
+        .filter(function (s) { return s.status === 'pending' })
+        .map(function (s) { return s.id })
+      var segIntent = createSegmentIntent(
+        result.continuationState, currentSegmentId, segmentFeatureIds, result.scopeManifestPath
+      )
+      result.continuationState = segIntent.state
+
       // Slice loop: one full extraction cycle per pending slice, state flushed after each
       // slice so a kill/resume continues mid-queue. A blocked slice logs and the queue moves
       // on (one slice failing to extract is information, not a reason to abandon the rest).
@@ -6568,13 +7153,37 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       while ((slice = nextPendingSlice(result.extractQueue))) {
         if (budgetExhausted(retryBudget)) {
           result.blockedAt = 'extract-budget'
+          var budgetResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
           result.handoff = {
             from: 'extract',
             message: `Retry budget exhausted mid-queue (${retryState.used}/${retryBudget}). Completed slices are preserved; resume the rest: /extract-design --resume ${planDir}`,
             nextMode: 'extract',
             planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: budgetResume.counts,
           }
           plog(`Extract: retry budget exhausted with ${result.extractQueue.filter((s) => s.status === 'pending').length} slice(s) pending — blocking (resumable)`)
+          stateCheckpoint('Extract Slice', 'blocked')
+          await consolidate(slug, result, config)
+          return result
+        }
+        // Budget admission: verify the next slice can complete its gates without
+        // crossing the characterized call ceiling or spending non-spendable reserve.
+        var nextGateCost = { calls: 20 }
+        if (!canFinishNextGate(result.budgetAccountant, nextGateCost)) {
+          var adm = admitSegment(result.budgetAccountant, nextGateCost)
+          result.blockedAt = 'extract-budget-ceiling'
+          var ceilingResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
+          result.handoff = {
+            from: 'extract',
+            message: `Budget ceiling reached. Remaining calls: ${callsRemaining(result.budgetAccountant)} (reserve preserved). Resume: /extract-design --resume ${planDir}`,
+            nextMode: 'extract',
+            planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: ceilingResume.counts,
+            budget: budgetSummary(result.budgetAccountant),
+          }
+          plog(`Extract: budget ceiling — admission denied (${adm.reason}), blocking (resumable)`)
           stateCheckpoint('Extract Slice', 'blocked')
           await consolidate(slug, result, config)
           return result
@@ -6642,9 +7251,22 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           reviewed: !!sliceState._reviewedDesign,
         }
         slice.status = outcome.status === 'done' ? 'done' : 'blocked'
+        // Phase 5: record the attempt in the durable history journal.
+        // Success records a terminal-success entry; failure records the outcome
+        // and reason so exhausted retries are never reclassified as completed.
+        var attemptOutcome = outcome.status === 'done'
+          ? ATTEMPT_OUTCOMES.SUCCESS
+          : (outcome.gate === 'uncaught-throw' ? ATTEMPT_OUTCOMES.RETRYABLE_FAILURE : ATTEMPT_OUTCOMES.INVALID_OUTPUT)
+        result.attemptHistory = recordAttempt(
+          result.attemptHistory, slice.id, outcome.gate || 'extract', attemptOutcome, outcome.status !== 'done' ? ('blocked at ' + outcome.gate) : null
+        )
+        // Phase 5: spend budget for the completed gate work.
+        result.budgetAccountant = spendBudget(result.budgetAccountant, 10, 0)
         if (outcome.status !== 'done') {
           slice.blockedGate = outcome.gate
-          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — continuing with remaining slices`)
+          // Isolate the failure: only this slice is affected; independent work continues.
+          result.extractQueue = isolateFailure(result.extractQueue, slice.id, 'blocked')
+          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — isolated; continuing with remaining slices`)
         } else {
           plog(`Extract: slice ${slice.id} done`)
         }
@@ -6661,6 +7283,17 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         stateCheckpoint('Extract Slice', slice.status)
         await flushPipelineState(planDir, result, config)
       }
+
+      // Phase 5: acknowledge the segment completion with exact counts.
+      // The monotonic segment ID plus idempotency key ensures duplicate, lost,
+      // or out-of-order launches converge to one durable outcome.
+      var segCounts = segmentOutcome(result.extractQueue)
+      var segKey = idempotencyKey(currentSegmentId, segmentFeatureIds, result.scopeManifestPath)
+      var segAck = acknowledgeSegment(
+        result.continuationState, currentSegmentId, segKey,
+        segCounts.completed > 0 ? 'partial' : 'no-progress', segCounts
+      )
+      result.continuationState = segAck.state
 
       // Gate X8: system overview (multi-slice only, non-blocking).
       if (multiSlice && !result.overviewPath) {
@@ -6738,6 +7371,8 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         nextMode: 'tune',
         planDir,
         slices: result.extractQueue.map((s) => ({ id: s.id, name: s.name, planDir: s.planDir, status: s.status })),
+        segments: continuationSummary(result.continuationState),
+        budget: budgetSummary(result.budgetAccountant),
         message: multiSlice
           ? `Extraction complete: ${doneSlices.length} slice(s) documented under ${planDir}slices/ (overview: ${result.overviewPath || '(none)'})${blockedCount ? `; ${blockedCount} blocked` : ''}${skippedCount ? `; ${skippedCount} skipped — resume later with --slices` : ''}. Per slice: audit findings are in issues-and-improvements.md — run /tune-feature <sliceDir> to fix, or /design-feature --resume <sliceDir> to build on the baseline.`
           : `Extraction complete. As-is design docs are in ${planDir}. Audit findings (if any) are in issues-and-improvements.md — run /tune-feature ${planDir} to fix them, or /design-feature --resume ${planDir} to build on the baseline.`,

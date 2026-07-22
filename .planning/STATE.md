@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.5.0
 milestone_name: Project-Scale Extract Design
 status: executing
-stopped_at: Phase 4 complete — ready for Phase 5 planning
-last_updated: "2026-07-22T23:00:00.000Z"
-last_activity: "2026-07-22 — Phase 4 complete: checkpointed feature leaf (per-gate durable checkpoint, lifecycle reducer integration, Workflow spawn), 24 new tests, 421 total)"
+stopped_at: Phase 5 complete — ready for Phase 6 planning
+last_updated: "2026-07-22T23:30:00.000Z"
+last_activity: "2026-07-22 — Phase 5 complete: bounded scheduler (budget admission, retry policy, failure isolation, transactional continuation), 68 new tests, 489 total)"
 progress:
   total_phases: 11
-  completed_phases: 4
-  total_plans: 4
-  completed_plans: 4
-  percent: 36
+  completed_phases: 5
+  total_plans: 5
+  completed_plans: 5
+  percent: 45
 ---
 
 # Project State
@@ -25,18 +25,18 @@ See: .planning/PROJECT.md (updated 2026-07-22)
 
 ## Current Position
 
-Phase: 5 of 11 (Bounded Scheduler and Transactional Automatic Continuation)
+Phase: 6 of 11 (Synthesis, Publish, Persist, and Status Truth)
 Plan: 0 of TBD in current phase
 Status: Ready to plan
-Last activity: 2026-07-22 — Phase 4 complete: checkpointed feature leaf, gate-level durable persistence, lifecycle integration, Workflow spawn (24 new tests, 421 total)
+Last activity: 2026-07-22 — Phase 5 complete: bounded scheduler, budget admission, retry policy, failure isolation, transactional continuation (68 new tests, 489 total)
 
-Progress: [████░░░░░░] 36%
+Progress: [█████░░░░░] 45%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 4
+- Total plans completed: 5
 - Average duration: —
 - Total execution time: —
 
@@ -48,6 +48,7 @@ Progress: [████░░░░░░] 36%
 | 2 | 1 | 1 | — |
 | 3 | 1 | 1 | — |
 | 4 | 1 | 1 | — |
+| 5 | 1 | 1 | — |
 
 **Recent Trend:** Phases 1-4 complete with 421 tests passing.
 
@@ -77,7 +78,7 @@ None yet.
 - Phase 2 COMPLETE: bounded discovery, validated graph, schedulability (113 new tests, 375 total).
 - Phase 3 COMPLETE: multi-entry build, version lockstep, install resolution (22 new tests, 397 total).
 - Phase 4 COMPLETE: checkpointed feature leaf — per-gate durable checkpoint, lifecycle reducer integration, Workflow() spawn with fallback (24 new tests, 421 total).
-- Phase 5 budget limits, reserve, and wave width require characterization rather than guessed constants.
+- Phase 5 COMPLETE: bounded scheduler — budget admission with non-spendable reserve, retry policy with attempt history, failure isolation preserving independent work, transactional continuation with monotonic segment IDs and idempotency keys (68 new tests, 489 total).
 - Phase 6 must establish the minimal faithful bounded feature-summary schema under the Phase 1 revision contract.
 - Phase 7 dogfooding requires observable whole-repository evidence across multiple automatically acknowledged segments.
 
@@ -91,5 +92,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-07-22
-Stopped at: Phase 4 complete — ready for Phase 5 planning
+Stopped at: Phase 5 complete — ready for Phase 6 planning
 Resume file: None

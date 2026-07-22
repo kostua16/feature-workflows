@@ -39,10 +39,10 @@ The milestone was extended with 15 additional user-approved design-mode themes (
 
 ### Bounded Scheduling and Automatic Continuation
 
-- [ ] **BUDGET-01**: A user can run large-project extraction without hitting the shared runtime ceiling because each gate, feature, and segment is admitted against bounded call, token, concurrency, and retry budgets with non-spendable capacity reserved for checkpointing, reconciliation, synthesis, and truthful handoff.
-- [ ] **RETRY-01**: A user can resume a failed or blocked feature under bounded per-gate and per-feature retry rules that persist attempt history and terminal reasons, continue eligible independent work, and never reclassify exhausted retries as completed.
-- [ ] **ISOLATE-01**: A user retains all verified work when one feature times out, fails, or returns invalid output because the failure updates only that feature's durable outcome and dependency-independent features continue within the current segment.
-- [ ] **CONT-01**: One `/feature-workflows:extract-design` command automatically launches durably acknowledged bounded segments while progress is possible; segment intents and completions use monotonic identifiers and idempotency keys so duplicate, lost, or interrupted launches cannot skip or double-apply work, and every stop preserves an exact manual resume command.
+- [x] **BUDGET-01**: A user can run large-project extraction without hitting the shared runtime ceiling because each gate, feature, and segment is admitted against bounded call, token, concurrency, and retry budgets with non-spendable capacity reserved for checkpointing, reconciliation, synthesis, and truthful handoff.
+- [x] **RETRY-01**: A user can resume a failed or blocked feature under bounded per-gate and per-feature retry rules that persist attempt history and terminal reasons, continue eligible independent work, and never reclassify exhausted retries as completed.
+- [x] **ISOLATE-01**: A user retains all verified work when one feature times out, fails, or returns invalid output because the failure updates only that feature's durable outcome and dependency-independent features continue within the current segment.
+- [x] **CONT-01**: One `/feature-workflows:extract-design` command automatically launches durably acknowledged bounded segments while progress is possible; segment intents and completions use monotonic identifiers and idempotency keys so duplicate, lost, or interrupted launches cannot skip or double-apply work, and every stop preserves an exact manual resume command.
 
 ### Synthesis, Publishing, Persistence, and Status Truth
 
@@ -158,10 +158,10 @@ Each v1 requirement is assigned to exactly one owning roadmap phase.
 | DIST-01 | Phase 3 | Complete |
 | ORCH-01 | Phase 4 | Complete |
 | CHECKPOINT-01 | Phase 4 | Complete |
-| BUDGET-01 | Phase 5 | Pending |
-| RETRY-01 | Phase 5 | Pending |
-| ISOLATE-01 | Phase 5 | Pending |
-| CONT-01 | Phase 5 | Pending |
+| BUDGET-01 | Phase 5 | Complete |
+| RETRY-01 | Phase 5 | Complete |
+| ISOLATE-01 | Phase 5 | Complete |
+| CONT-01 | Phase 5 | Complete |
 | SYNTH-01 | Phase 6 | Pending |
 | OBSERVE-01 | Phase 6 | Pending |
 | STATUS-01 | Phase 6 | Pending |

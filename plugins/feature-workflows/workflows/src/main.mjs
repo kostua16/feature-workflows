@@ -13,6 +13,10 @@ import { runTests } from './test-run.mjs'
 import { safeAgent, flexibleAgent, renderTelemetrySummary } from './agent-core.mjs'
 import { reviewLoop, enhancePrompt } from './review-loop.mjs'
 import { runQuickDecider, runGoalkeeper, appendDecisionLog, writeOpenQuestions, writeFailedLaunch, LOOPBACK_FLAG_MAP, clearGateAndDownstream, normalizeGateTarget, resetStageForRerun, applyApprovalDecision, detectOwnershipViolations, compactList } from './decisions.mjs'
+import { createBudgetLimits, createBudgetAccountant, setReserve, callsRemaining, admitSegment, spendBudget, canFinishNextGate, budgetSummary, RESERVE_TYPES } from './budget-admission.mjs'
+import { createRetryPolicy, createAttemptHistory, recordAttempt, isTerminalFailure, terminalReason, attemptSummary, ATTEMPT_OUTCOMES } from './retry-policy.mjs'
+import { isolateFailure, shouldContinueAfterFailure, segmentOutcome, eligibleIndependents } from './failure-isolation.mjs'
+import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIntent, acknowledgeSegment, resolveConvergence, shouldContinue, resumeCommand, continuationSummary, canAutoRelaunch } from './continuation.mjs'
 
 
 // ---- Script body -----------------------------------------------------------
@@ -449,6 +453,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (!result.extractQueue) result.extractQueue = []
     if (result.overviewPath === undefined) result.overviewPath = null
     if (result.extractReady === undefined) result.extractReady = false
+    // Phase 5: backfill bounded scheduler state on pre-v1.5 resume.
+    if (result.continuationState === undefined) result.continuationState = null
+    if (result.budgetAccountant === undefined) result.budgetAccountant = null
+    if (result.attemptHistory === undefined) result.attemptHistory = null
     if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
     // The user-level install is a symlink that tracks the plugin, so a resume after a
@@ -546,6 +554,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       overviewPath: null, // <planDir>/system-overview.md (multi-slice only)
       extractReady: false, // extract terminal: all pending slices processed
       auditPath: null, // <planDir>/design-audit.md (single-slice; per-slice audits live on queue entries)
+      // Phase 5: bounded scheduler and transactional automatic continuation state.
+      continuationState: null, // monotonic segment tracking + idempotency keys
+      budgetAccountant: null, // characterized budget admission with non-spendable reserve
+      attemptHistory: null, // per-gate/per-feature retry attempt journal
       // Review mode (standalone design-docset audit) state. Defaults keep older
       // pipeline-state.json hydrating without breakage (same backward-compat rule).
       reviewPath: null, // <planDir>/design-review.md report
@@ -1089,6 +1101,45 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       const multiSlice = result.extractQueue.length > 1
         || (result.extractQueue[0] && result.extractQueue[0].planDir !== planDir)
 
+      // Phase 5: initialize bounded scheduler state on first entry (not on resume).
+      // Budget accountant reserves non-spendable capacity for checkpoint, reconciliation,
+      // synthesis, and handoff so gate work cannot starve system-critical operations.
+      // Continuation state tracks monotonic segment IDs and idempotency keys.
+      // Attempt history journals every retry with a terminal reason.
+      if (!result.continuationState) {
+        result.continuationState = createContinuationState()
+      }
+      if (!result.budgetAccountant) {
+        const limits = createBudgetLimits({
+          callCeiling: 1000,
+          retryPerGate: 3,
+          retryPerFeature: 10,
+        })
+        let acct = createBudgetAccountant(limits)
+        // Reserve non-spendable capacity for each system-critical category.
+        // These reserves ensure checkpoint/synthesis/handoff can always complete
+        // even when gate work approaches the shared call ceiling.
+        acct = setReserve(acct, RESERVE_TYPES.CHECKPOINT, 5)
+        acct = setReserve(acct, RESERVE_TYPES.RECONCILIATION, 5)
+        acct = setReserve(acct, RESERVE_TYPES.SYNTHESIS, 5)
+        acct = setReserve(acct, RESERVE_TYPES.HANDOFF, 5)
+        result.budgetAccountant = acct
+      }
+      if (!result.attemptHistory) {
+        result.attemptHistory = createAttemptHistory()
+      }
+      // Allocate a monotonic segment ID and declare intent for this batch.
+      var segAlloc = nextSegmentId(result.continuationState)
+      result.continuationState = segAlloc.state
+      var currentSegmentId = segAlloc.segmentId
+      var segmentFeatureIds = result.extractQueue
+        .filter(function (s) { return s.status === 'pending' })
+        .map(function (s) { return s.id })
+      var segIntent = createSegmentIntent(
+        result.continuationState, currentSegmentId, segmentFeatureIds, result.scopeManifestPath
+      )
+      result.continuationState = segIntent.state
+
       // Slice loop: one full extraction cycle per pending slice, state flushed after each
       // slice so a kill/resume continues mid-queue. A blocked slice logs and the queue moves
       // on (one slice failing to extract is information, not a reason to abandon the rest).
@@ -1096,13 +1147,37 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       while ((slice = nextPendingSlice(result.extractQueue))) {
         if (budgetExhausted(retryBudget)) {
           result.blockedAt = 'extract-budget'
+          var budgetResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
           result.handoff = {
             from: 'extract',
             message: `Retry budget exhausted mid-queue (${retryState.used}/${retryBudget}). Completed slices are preserved; resume the rest: /extract-design --resume ${planDir}`,
             nextMode: 'extract',
             planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: budgetResume.counts,
           }
           plog(`Extract: retry budget exhausted with ${result.extractQueue.filter((s) => s.status === 'pending').length} slice(s) pending — blocking (resumable)`)
+          stateCheckpoint('Extract Slice', 'blocked')
+          await consolidate(slug, result, config)
+          return result
+        }
+        // Budget admission: verify the next slice can complete its gates without
+        // crossing the characterized call ceiling or spending non-spendable reserve.
+        var nextGateCost = { calls: 20 }
+        if (!canFinishNextGate(result.budgetAccountant, nextGateCost)) {
+          var adm = admitSegment(result.budgetAccountant, nextGateCost)
+          result.blockedAt = 'extract-budget-ceiling'
+          var ceilingResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
+          result.handoff = {
+            from: 'extract',
+            message: `Budget ceiling reached. Remaining calls: ${callsRemaining(result.budgetAccountant)} (reserve preserved). Resume: /extract-design --resume ${planDir}`,
+            nextMode: 'extract',
+            planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: ceilingResume.counts,
+            budget: budgetSummary(result.budgetAccountant),
+          }
+          plog(`Extract: budget ceiling — admission denied (${adm.reason}), blocking (resumable)`)
           stateCheckpoint('Extract Slice', 'blocked')
           await consolidate(slug, result, config)
           return result
@@ -1170,9 +1245,22 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           reviewed: !!sliceState._reviewedDesign,
         }
         slice.status = outcome.status === 'done' ? 'done' : 'blocked'
+        // Phase 5: record the attempt in the durable history journal.
+        // Success records a terminal-success entry; failure records the outcome
+        // and reason so exhausted retries are never reclassified as completed.
+        var attemptOutcome = outcome.status === 'done'
+          ? ATTEMPT_OUTCOMES.SUCCESS
+          : (outcome.gate === 'uncaught-throw' ? ATTEMPT_OUTCOMES.RETRYABLE_FAILURE : ATTEMPT_OUTCOMES.INVALID_OUTPUT)
+        result.attemptHistory = recordAttempt(
+          result.attemptHistory, slice.id, outcome.gate || 'extract', attemptOutcome, outcome.status !== 'done' ? ('blocked at ' + outcome.gate) : null
+        )
+        // Phase 5: spend budget for the completed gate work.
+        result.budgetAccountant = spendBudget(result.budgetAccountant, 10, 0)
         if (outcome.status !== 'done') {
           slice.blockedGate = outcome.gate
-          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — continuing with remaining slices`)
+          // Isolate the failure: only this slice is affected; independent work continues.
+          result.extractQueue = isolateFailure(result.extractQueue, slice.id, 'blocked')
+          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — isolated; continuing with remaining slices`)
         } else {
           plog(`Extract: slice ${slice.id} done`)
         }
@@ -1189,6 +1277,17 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         stateCheckpoint('Extract Slice', slice.status)
         await flushPipelineState(planDir, result, config)
       }
+
+      // Phase 5: acknowledge the segment completion with exact counts.
+      // The monotonic segment ID plus idempotency key ensures duplicate, lost,
+      // or out-of-order launches converge to one durable outcome.
+      var segCounts = segmentOutcome(result.extractQueue)
+      var segKey = idempotencyKey(currentSegmentId, segmentFeatureIds, result.scopeManifestPath)
+      var segAck = acknowledgeSegment(
+        result.continuationState, currentSegmentId, segKey,
+        segCounts.completed > 0 ? 'partial' : 'no-progress', segCounts
+      )
+      result.continuationState = segAck.state
 
       // Gate X8: system overview (multi-slice only, non-blocking).
       if (multiSlice && !result.overviewPath) {
@@ -1266,6 +1365,8 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         nextMode: 'tune',
         planDir,
         slices: result.extractQueue.map((s) => ({ id: s.id, name: s.name, planDir: s.planDir, status: s.status })),
+        segments: continuationSummary(result.continuationState),
+        budget: budgetSummary(result.budgetAccountant),
         message: multiSlice
           ? `Extraction complete: ${doneSlices.length} slice(s) documented under ${planDir}slices/ (overview: ${result.overviewPath || '(none)'})${blockedCount ? `; ${blockedCount} blocked` : ''}${skippedCount ? `; ${skippedCount} skipped — resume later with --slices` : ''}. Per slice: audit findings are in issues-and-improvements.md — run /tune-feature <sliceDir> to fix, or /design-feature --resume <sliceDir> to build on the baseline.`
           : `Extraction complete. As-is design docs are in ${planDir}. Audit findings (if any) are in issues-and-improvements.md — run /tune-feature ${planDir} to fix them, or /design-feature --resume ${planDir} to build on the baseline.`,
