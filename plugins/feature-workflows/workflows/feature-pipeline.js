@@ -2804,29 +2804,55 @@ function validateGraph(features, edges, ownershipMap, cyclePolicy) {
     }
   }
 
-  // 2. Check ownership gaps and overlaps
+  // 2. Check ownership gaps (explicit ownership map references unknown features)
   if (ownershipMap) {
-    const featureIds = new Set(features.map((f) => f.id))
-    const pathOwners = new Map()
+    const featureIds = new Set((features || []).map((f) => f.id))
 
     for (const [path, ownerId] of Object.entries(ownershipMap)) {
       if (!featureIds.has(ownerId)) {
         errors.push({ type: 'ownership-gap', detail: `Path '${path}' owned by unknown feature '${ownerId}'` })
       }
-      if (pathOwners.has(path)) {
-        errors.push({
-          type: 'ownership-overlap',
-          detail: `Path '${path}' owned by both '${pathOwners.get(path)}' and '${ownerId}'`,
-        })
-      } else {
-        pathOwners.set(path, ownerId)
+    }
+  }
+
+  // 2b. Check for path overlaps between features.
+  // Two features claiming the same path is an ownership overlap; if an
+  // ownershipMap resolves the path to one of the claimants, the overlap is
+  // explained (warning), otherwise it is unexplained (error).
+  const pathClaims = new Map()
+  for (const f of features || []) {
+    for (const p of (f.paths || [])) {
+      if (!pathClaims.has(p)) {
+        pathClaims.set(p, [])
+      }
+      pathClaims.get(p).push(f.id)
+    }
+  }
+  for (const [path, claimants] of pathClaims) {
+    if (claimants.length > 1) {
+      const uniqueClaimants = [...new Set(claimants)]
+      if (uniqueClaimants.length > 1) {
+        const resolvedBy = ownershipMap ? ownershipMap[path] : undefined
+        if (resolvedBy && uniqueClaimants.includes(resolvedBy)) {
+          warnings.push({
+            type: 'ownership-overlap-explained',
+            detail: `Path '${path}' claimed by ${uniqueClaimants.join(', ')}; resolved to '${resolvedBy}'`,
+          })
+        } else {
+          errors.push({
+            type: 'ownership-overlap',
+            detail: `Path '${path}' claimed by multiple features: ${uniqueClaimants.join(', ')}`,
+          })
+        }
       }
     }
+  }
 
-    // Check for uncovered paths (gaps in ownership)
+  // 2c. Warn about feature paths not covered by the ownership map
+  if (ownershipMap) {
     const allFeaturePaths = new Set((features || []).flatMap((f) => f.paths || []))
     for (const p of allFeaturePaths) {
-      if (!pathOwners.has(p)) {
+      if (!(p in ownershipMap)) {
         warnings.push({ type: 'ownership-unassigned', detail: `Path '${p}' not in ownership map` })
       }
     }

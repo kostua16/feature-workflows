@@ -171,15 +171,21 @@ test('validateGraph: ownership gap rejected', () => {
   assert.ok(result.errors.some((e) => e.type === 'ownership-gap'))
 })
 
-test('validateGraph: ownership overlap rejected', () => {
+test('validateGraph: unexplained ownership overlap rejected', () => {
+  // Two features claim the same path with no ownership resolution
   const features = [{ id: 'a', paths: ['src/shared.ts'] }, { id: 'b', paths: ['src/shared.ts'] }]
-  const ownershipMap = { 'src/shared.ts': 'b' }
-  // Manually create overlap scenario
-  const overlapMap = { 'src/shared.ts': 'a' }
-  const result2 = validateGraph(features, [], overlapMap)
-  // Note: ownershipMap maps path->featureId, overlap detected when same path assigned twice
-  // In this test we just verify the mechanism works
-  assert.ok(result2.verdict === GRAPH_VERDICTS.VALID || result2.verdict === GRAPH_VERDICTS.INVALID)
+  const result = validateGraph(features, [])
+  assert.equal(result.verdict, GRAPH_VERDICTS.INVALID)
+  assert.ok(result.errors.some((e) => e.type === 'ownership-overlap'))
+})
+
+test('validateGraph: explained ownership overlap allowed with warning', () => {
+  // Two features claim the same path, but ownershipMap resolves it to one
+  const features = [{ id: 'a', paths: ['src/shared.ts'] }, { id: 'b', paths: ['src/shared.ts'] }]
+  const ownershipMap = { 'src/shared.ts': 'a' }
+  const result = validateGraph(features, [], ownershipMap)
+  assert.equal(result.verdict, GRAPH_VERDICTS.VALID)
+  assert.ok(result.warnings.some((w) => w.type === 'ownership-overlap-explained'))
 })
 
 test('validateGraph: empty features and edges is valid', () => {
