@@ -34,8 +34,8 @@ The milestone was extended with 15 additional user-approved design-mode themes (
 
 ### Checkpointed Feature Leaf
 
-- [ ] **ORCH-01**: A user can extract one admitted feature through `fp-extract-slice`, which owns exactly that feature's extraction gates while the top-level workflow alone owns discovery, scheduling, reconciliation, synthesis, continuation, and readiness and the leaf performs no further workflow composition.
-- [ ] **CHECKPOINT-01**: A user can resume an interrupted feature at its first incomplete material extraction gate because the leaf durably acknowledges before/after, retry, invalidation, and terminal transitions together with artifact evidence using the shared state reducer.
+- [x] **ORCH-01**: A user can extract one admitted feature through `fp-extract-slice`, which owns exactly that feature's extraction gates while the top-level workflow alone owns discovery, scheduling, reconciliation, synthesis, continuation, and readiness and the leaf performs no further workflow composition.
+- [x] **CHECKPOINT-01**: A user can resume an interrupted feature at its first incomplete material extraction gate because the leaf durably acknowledges before/after, retry, invalidation, and terminal transitions together with artifact evidence using the shared state reducer.
 
 ### Bounded Scheduling and Automatic Continuation
 
@@ -156,8 +156,8 @@ Each v1 requirement is assigned to exactly one owning roadmap phase.
 | QUEUE-01 | Phase 2 | Pending |
 | DEPCTX-01 | Phase 2 | Pending |
 | DIST-01 | Phase 3 | Complete |
-| ORCH-01 | Phase 4 | Pending |
-| CHECKPOINT-01 | Phase 4 | Pending |
+| ORCH-01 | Phase 4 | Complete |
+| CHECKPOINT-01 | Phase 4 | Complete |
 | BUDGET-01 | Phase 5 | Pending |
 | RETRY-01 | Phase 5 | Pending |
 | ISOLATE-01 | Phase 5 | Pending |

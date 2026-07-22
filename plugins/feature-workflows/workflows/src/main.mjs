@@ -1131,10 +1131,30 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           auditPath: (slice.artifacts && slice.artifacts.auditPath) || null,
           _reviewedDesign: !!(slice.artifacts && slice.artifacts.reviewed),
           _reviewedArch: !!(slice.artifacts && slice.artifacts.reviewed),
+          lifecycle: 'in-progress',
+          _gateCheckpoints: {},
         }
         let outcome
         try {
-          outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          // For multi-slice runs, spawn the leaf via Workflow() composition (one level,
+          // no recursion). The leaf processes exactly one feature in its own sandbox;
+          // the top-level retains all scheduling/readiness authority. Fallback to direct
+          // call for single-slice runs or when Workflow is unavailable (test harness).
+          if (typeof Workflow === 'function' && !single && Workflow.name !== '') {
+            const leafResult = await Workflow({
+              name: 'fp-extract-slice',
+              args: { slice, task, config, sliceState, retryBudget, refineSubcap, decisionCap },
+            })
+            if (leafResult && leafResult.status) {
+              outcome = { status: leafResult.status, gate: leafResult.gate }
+              if (leafResult.sliceState) Object.assign(sliceState, leafResult.sliceState)
+              if (leafResult.logLines) for (const line of leafResult.logLines) plog(line)
+            } else {
+              outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+            }
+          } else {
+            outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          }
         } catch (e) {
           outcome = { status: 'blocked', gate: 'uncaught-throw' }
           plog(`Extract: slice ${slice.id} threw (${String(e)}) — marking blocked and continuing`)

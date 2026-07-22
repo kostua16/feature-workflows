@@ -3889,6 +3889,40 @@ ${sections}`,
   }
 }
 
+// Per-gate durable checkpoint: persist slice state after each material gate so an
+// interrupted leaf resumes at the first incomplete gate without repeating verified
+// work. Uses the same flushPipelineState pattern as the top-level, writing to the
+// slice's own planDir. Agent-mediated I/O — no direct filesystem access.
+let _checkpointSeq = 0
+async function checkpointSlice(slice, sliceState, gateName, result) {
+  if (!sliceState._gateCheckpoints) sliceState._gateCheckpoints = {}
+  _checkpointSeq++
+  const artifactKey = {
+    'extract-facts': 'factsPath',
+    'extract-e2e': 'useCasePath',
+    'extract-design': 'designPath',
+    'extract-arch': 'archPath',
+    'extract-requirements': 'requirementsPath',
+    'extract-audit': 'auditPath',
+  }[gateName]
+  sliceState._gateCheckpoints[gateName] = {
+    seq: _checkpointSeq,
+    acknowledged: true,
+    artifactPath: artifactKey ? (sliceState[artifactKey] || null) : null,
+  }
+  plogFromResult(result, `Extract [${slice.id}]: checkpoint acknowledged at gate '${gateName}'`)
+  try {
+    await flushPipelineState(slice.planDir, sliceState, {
+      mode: 'extract-slice',
+      profile: 'checkpoint',
+      useChunker: false,
+    })
+  } catch (e) {
+    plogFromResult(result, `Extract [${slice.id}]: checkpoint flush failed at '${gateName}' (non-blocking) — ${String(e)}`)
+  }
+}
+
+
 // extractSlice: run the per-slice extraction cycle (facts -> e2e use cases -> detailed
 // design -> architecture [-> fidelity reviews] [-> requirements] [-> audit]) writing all
 // artifacts under slice.planDir. `sliceState` receives the artifact paths — it is the main
@@ -3931,6 +3965,7 @@ Return factsPath set to ${dir}codebase-facts.md.`,
     if (!facts || !facts.factsPath) return { status: 'blocked', gate: 'extract-facts' }
     sliceState.factsPath = facts.factsPath
     sliceState._facts = facts
+    await checkpointSlice(slice, sliceState, 'extract-facts', result)
   }
 
   // X3: behavioral e2e use cases (early — they anchor intent for the design extraction).
@@ -3968,6 +4003,7 @@ Do NOT commit. Return useCasePath set to ${dir}e2e-use-cases.md.`,
     if ((useCases.openQuestions || []).length) {
       await writeOpenQuestions(dir, useCases.openQuestions.map((q) => ({ gate: 'Extract E2E', text: q, severity: 'unspecified' })), result)
     }
+    await checkpointSlice(slice, sliceState, 'extract-e2e', result)
   }
 
   // X4: detailed design reverse-engineered from the code.
@@ -3996,6 +4032,7 @@ Return designPath set to ${dir}detailed-design.md.`,
     if (!design || !design.designPath) return { status: 'blocked', gate: 'extract-design' }
     sliceState.designPath = design.designPath
     sliceState._design = design
+    await checkpointSlice(slice, sliceState, 'extract-design', result)
   }
 
   // X5: high-level architecture abstracted from the detailed design + facts.
@@ -4022,6 +4059,7 @@ Do NOT redesign or propose changes. Do NOT commit. Return archPath set to ${dir}
     if (!arch || !arch.archPath) return { status: 'blocked', gate: 'extract-arch' }
     sliceState.archPath = arch.archPath
     sliceState._arch = arch
+    await checkpointSlice(slice, sliceState, 'extract-arch', result)
   }
 
   // X5.5: fidelity reviews (optional) — does each doc faithfully describe the code?
@@ -4056,6 +4094,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
     }
     sliceState._reviewedDesign = true
     sliceState._reviewedArch = true
+    await checkpointSlice(slice, sliceState, 'extract-review', result)
   }
 
   // X6: reverse-derived requirements (optional; highest abstraction, extracted last).
@@ -4085,6 +4124,7 @@ Do NOT commit. Return requirementsPath set to ${dir}requirements.md.`,
       if ((requirements.openQuestions || []).length) {
         await writeOpenQuestions(dir, requirements.openQuestions.map((q) => ({ gate: 'Extract Requirements', text: q, severity: 'unspecified' })), result)
       }
+      await checkpointSlice(slice, sliceState, 'extract-requirements', result)
     } else {
       plogFromResult(result, `Extract [${slice.id}]: requirements extraction returned no path (non-blocking) — continuing`)
     }
@@ -4094,6 +4134,7 @@ Do NOT commit. Return requirementsPath set to ${dir}requirements.md.`,
   if (config.useAudit && !sliceState.auditPath) {
     phase('Design Audit')
     await auditExtractedDesign({ slicePlanDir: dir, sliceState, task, result })
+    await checkpointSlice(slice, sliceState, 'extract-audit', result)
   }
 
   return { status: 'done' }
@@ -5419,7 +5460,7 @@ function compactList(items, max = 5) {
 //
 // The sandbox provides `args` as a global (same contract as the top-level main()).
 // The caller passes { slice, task, config, sliceState?, retryBudget?, ... }.
-// Returns { mode, sliceId, status, gate?, sliceState, logLines }.
+// Returns { mode, sliceId, status, gate?, lifecycle, sliceState, logLines, gateCheckpoints }.
 async function extractSliceMain() {
   // Coerce args to object (sandbox sometimes delivers a JSON string).
   if (args !== null && typeof args === 'string') {
@@ -5443,6 +5484,13 @@ async function extractSliceMain() {
   const result = { logLines: [], gateLog: [], telemetry: {} }
   const sliceState = args.sliceState || {}
 
+  // Initialize lifecycle state if not already set by the top-level orchestrator.
+  // The leaf transitions the feature through the shared lifecycle reducer so
+  // readiness derivation stays consistent across the top-level and leaf.
+  if (!sliceState.lifecycle) {
+    sliceState.lifecycle = LIFECYCLE_STATES.IN_PROGRESS
+  }
+
   const outcome = await extractSlice({
     slice,
     task,
@@ -5454,13 +5502,32 @@ async function extractSliceMain() {
     decisionCap: args.decisionCap || DECISION_CAP_DEFAULT,
   })
 
+  // Apply lifecycle transitions via the shared reducer. On 'done', transition
+  // to 'completed'. On 'blocked', the feature stays 'in-progress' (resumable,
+  // not terminal). The top-level orchestrator retains scheduling/readiness
+  // authority — the leaf only reports its own feature's lifecycle.
+  if (outcome.status === 'done') {
+    try {
+      const transitioned = applyLifecycleEvent(
+        { lifecycle: sliceState.lifecycle },
+        { type: 'complete' }
+      )
+      sliceState.lifecycle = transitioned.lifecycle
+    } catch (e) {
+      // If already completed or illegal transition, keep current state
+      result.logLines.push(`extractSliceMain: lifecycle transition to complete failed — ${String(e)}`)
+    }
+  }
+
   return {
     mode: 'extract-slice',
     sliceId: slice.id,
     status: outcome.status,
     gate: outcome.gate,
+    lifecycle: sliceState.lifecycle,
     sliceState,
     logLines: result.logLines,
+    gateCheckpoints: sliceState._gateCheckpoints || {},
   }
 }
 

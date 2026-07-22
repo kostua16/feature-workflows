@@ -67,6 +67,8 @@ const CANDIDATES = [
   'seedExtractQueue',
   'nextPendingSlice',
   'repairResumeArtifactFlags',
+  'checkpointSlice',
+  'extractSlice',
   'LIFECYCLE_STATES',
   'SKIP_REASONS',
   'TRANSITION_TABLE',

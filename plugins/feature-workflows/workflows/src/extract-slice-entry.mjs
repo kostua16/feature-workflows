@@ -1,5 +1,6 @@
 import { RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DECISION_CAP_DEFAULT } from './config.mjs'
 import { extractSlice } from './extract-slice.mjs'
+import { applyLifecycleEvent, LIFECYCLE_STATES } from './lifecycle.mjs'
 
 
 // extractSliceMain: the leaf entry point for the fp-extract-slice workflow.
@@ -11,7 +12,7 @@ import { extractSlice } from './extract-slice.mjs'
 //
 // The sandbox provides `args` as a global (same contract as the top-level main()).
 // The caller passes { slice, task, config, sliceState?, retryBudget?, ... }.
-// Returns { mode, sliceId, status, gate?, sliceState, logLines }.
+// Returns { mode, sliceId, status, gate?, lifecycle, sliceState, logLines, gateCheckpoints }.
 async function extractSliceMain() {
   // Coerce args to object (sandbox sometimes delivers a JSON string).
   if (args !== null && typeof args === 'string') {
@@ -35,6 +36,13 @@ async function extractSliceMain() {
   const result = { logLines: [], gateLog: [], telemetry: {} }
   const sliceState = args.sliceState || {}
 
+  // Initialize lifecycle state if not already set by the top-level orchestrator.
+  // The leaf transitions the feature through the shared lifecycle reducer so
+  // readiness derivation stays consistent across the top-level and leaf.
+  if (!sliceState.lifecycle) {
+    sliceState.lifecycle = LIFECYCLE_STATES.IN_PROGRESS
+  }
+
   const outcome = await extractSlice({
     slice,
     task,
@@ -46,12 +54,33 @@ async function extractSliceMain() {
     decisionCap: args.decisionCap || DECISION_CAP_DEFAULT,
   })
 
+  // Apply lifecycle transitions via the shared reducer. On 'done', transition
+  // to 'completed'. On 'blocked', the feature stays 'in-progress' (resumable,
+  // not terminal). The top-level orchestrator retains scheduling/readiness
+  // authority — the leaf only reports its own feature's lifecycle.
+  if (outcome.status === 'done') {
+    try {
+      const transitioned = applyLifecycleEvent(
+        { lifecycle: sliceState.lifecycle },
+        { type: 'complete' }
+      )
+      sliceState.lifecycle = transitioned.lifecycle
+    } catch (e) {
+      // If already completed or illegal transition, keep current state
+      result.logLines.push(`extractSliceMain: lifecycle transition to complete failed — ${String(e)}`)
+    }
+  }
+
   return {
     mode: 'extract-slice',
     sliceId: slice.id,
     status: outcome.status,
     gate: outcome.gate,
+    lifecycle: sliceState.lifecycle,
     sliceState,
     logLines: result.logLines,
+    gateCheckpoints: sliceState._gateCheckpoints || {},
   }
 }
+
+export { extractSliceMain }

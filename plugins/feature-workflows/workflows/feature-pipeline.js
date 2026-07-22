@@ -3925,6 +3925,40 @@ ${sections}`,
   }
 }
 
+// Per-gate durable checkpoint: persist slice state after each material gate so an
+// interrupted leaf resumes at the first incomplete gate without repeating verified
+// work. Uses the same flushPipelineState pattern as the top-level, writing to the
+// slice's own planDir. Agent-mediated I/O — no direct filesystem access.
+let _checkpointSeq = 0
+async function checkpointSlice(slice, sliceState, gateName, result) {
+  if (!sliceState._gateCheckpoints) sliceState._gateCheckpoints = {}
+  _checkpointSeq++
+  const artifactKey = {
+    'extract-facts': 'factsPath',
+    'extract-e2e': 'useCasePath',
+    'extract-design': 'designPath',
+    'extract-arch': 'archPath',
+    'extract-requirements': 'requirementsPath',
+    'extract-audit': 'auditPath',
+  }[gateName]
+  sliceState._gateCheckpoints[gateName] = {
+    seq: _checkpointSeq,
+    acknowledged: true,
+    artifactPath: artifactKey ? (sliceState[artifactKey] || null) : null,
+  }
+  plogFromResult(result, `Extract [${slice.id}]: checkpoint acknowledged at gate '${gateName}'`)
+  try {
+    await flushPipelineState(slice.planDir, sliceState, {
+      mode: 'extract-slice',
+      profile: 'checkpoint',
+      useChunker: false,
+    })
+  } catch (e) {
+    plogFromResult(result, `Extract [${slice.id}]: checkpoint flush failed at '${gateName}' (non-blocking) — ${String(e)}`)
+  }
+}
+
+
 // extractSlice: run the per-slice extraction cycle (facts -> e2e use cases -> detailed
 // design -> architecture [-> fidelity reviews] [-> requirements] [-> audit]) writing all
 // artifacts under slice.planDir. `sliceState` receives the artifact paths — it is the main
@@ -3967,6 +4001,7 @@ Return factsPath set to ${dir}codebase-facts.md.`,
     if (!facts || !facts.factsPath) return { status: 'blocked', gate: 'extract-facts' }
     sliceState.factsPath = facts.factsPath
     sliceState._facts = facts
+    await checkpointSlice(slice, sliceState, 'extract-facts', result)
   }
 
   // X3: behavioral e2e use cases (early — they anchor intent for the design extraction).
@@ -4004,6 +4039,7 @@ Do NOT commit. Return useCasePath set to ${dir}e2e-use-cases.md.`,
     if ((useCases.openQuestions || []).length) {
       await writeOpenQuestions(dir, useCases.openQuestions.map((q) => ({ gate: 'Extract E2E', text: q, severity: 'unspecified' })), result)
     }
+    await checkpointSlice(slice, sliceState, 'extract-e2e', result)
   }
 
   // X4: detailed design reverse-engineered from the code.
@@ -4032,6 +4068,7 @@ Return designPath set to ${dir}detailed-design.md.`,
     if (!design || !design.designPath) return { status: 'blocked', gate: 'extract-design' }
     sliceState.designPath = design.designPath
     sliceState._design = design
+    await checkpointSlice(slice, sliceState, 'extract-design', result)
   }
 
   // X5: high-level architecture abstracted from the detailed design + facts.
@@ -4058,6 +4095,7 @@ Do NOT redesign or propose changes. Do NOT commit. Return archPath set to ${dir}
     if (!arch || !arch.archPath) return { status: 'blocked', gate: 'extract-arch' }
     sliceState.archPath = arch.archPath
     sliceState._arch = arch
+    await checkpointSlice(slice, sliceState, 'extract-arch', result)
   }
 
   // X5.5: fidelity reviews (optional) — does each doc faithfully describe the code?
@@ -4092,6 +4130,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
     }
     sliceState._reviewedDesign = true
     sliceState._reviewedArch = true
+    await checkpointSlice(slice, sliceState, 'extract-review', result)
   }
 
   // X6: reverse-derived requirements (optional; highest abstraction, extracted last).
@@ -4121,6 +4160,7 @@ Do NOT commit. Return requirementsPath set to ${dir}requirements.md.`,
       if ((requirements.openQuestions || []).length) {
         await writeOpenQuestions(dir, requirements.openQuestions.map((q) => ({ gate: 'Extract Requirements', text: q, severity: 'unspecified' })), result)
       }
+      await checkpointSlice(slice, sliceState, 'extract-requirements', result)
     } else {
       plogFromResult(result, `Extract [${slice.id}]: requirements extraction returned no path (non-blocking) — continuing`)
     }
@@ -4130,6 +4170,7 @@ Do NOT commit. Return requirementsPath set to ${dir}requirements.md.`,
   if (config.useAudit && !sliceState.auditPath) {
     phase('Design Audit')
     await auditExtractedDesign({ slicePlanDir: dir, sliceState, task, result })
+    await checkpointSlice(slice, sliceState, 'extract-audit', result)
   }
 
   return { status: 'done' }
@@ -6562,10 +6603,30 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           auditPath: (slice.artifacts && slice.artifacts.auditPath) || null,
           _reviewedDesign: !!(slice.artifacts && slice.artifacts.reviewed),
           _reviewedArch: !!(slice.artifacts && slice.artifacts.reviewed),
+          lifecycle: 'in-progress',
+          _gateCheckpoints: {},
         }
         let outcome
         try {
-          outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          // For multi-slice runs, spawn the leaf via Workflow() composition (one level,
+          // no recursion). The leaf processes exactly one feature in its own sandbox;
+          // the top-level retains all scheduling/readiness authority. Fallback to direct
+          // call for single-slice runs or when Workflow is unavailable (test harness).
+          if (typeof Workflow === 'function' && !single && Workflow.name !== '') {
+            const leafResult = await Workflow({
+              name: 'fp-extract-slice',
+              args: { slice, task, config, sliceState, retryBudget, refineSubcap, decisionCap },
+            })
+            if (leafResult && leafResult.status) {
+              outcome = { status: leafResult.status, gate: leafResult.gate }
+              if (leafResult.sliceState) Object.assign(sliceState, leafResult.sliceState)
+              if (leafResult.logLines) for (const line of leafResult.logLines) plog(line)
+            } else {
+              outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+            }
+          } else {
+            outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          }
         } catch (e) {
           outcome = { status: 'blocked', gate: 'uncaught-throw' }
           plog(`Extract: slice ${slice.id} threw (${String(e)}) — marking blocked and continuing`)
