@@ -8,9 +8,13 @@
 
 One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts without silently losing work or overstating completion.
 
-## Current Milestone: v1.5.0 Project-Scale Extract Design
+## Last Shipped Milestone: v1.5.0 Project-Scale Extract Design (shipped 2026-07-22)
 
-**Goal:** Make `/feature-workflows:extract-design` automatically process an entire large project through bounded, durable per-feature segments from one user command, while reporting coverage and completion truthfully — and extend the same durability, truthfulness, and bounded-execution contracts to `/feature-workflows:design-feature` and the shared engine where the same defects are proven.
+**Status:** ✅ SHIPPED, Nyquist-validated, UAT-verified (36/36 requirements GOAL MET), audit passed. Tagged `v1.5.0` (local). Full record: `.planning/milestones/v1.5.0-ROADMAP.md`.
+
+**Goal (delivered):** Make `/feature-workflows:extract-design` automatically process an entire large project through bounded, durable per-feature segments from one user command, while reporting coverage and completion truthfully — and extend the same durability, truthfulness, and bounded-execution contracts to `/feature-workflows:design-feature` and the shared engine where the same defects are proven.
+
+**Next:** Not yet planned — run `/gsd-new-milestone`.
 
 **Target features:**
 
@@ -37,6 +41,8 @@ One user command must drive a trustworthy feature workflow from intent to durabl
 - ✓ Generated workflow distribution, version lockstep, sandbox checks, and repository-native validation protect the installed plugin artifact — v1.4.5 baseline.
 
 ### Active
+
+> ✅ **All 30 v1.5.0 themes below shipped in v1.5.0** — validated, Nyquist-validated, and UAT-verified GOAL MET. Archived in `milestones/v1.5.0-REQUIREMENTS.md`. Retained here for reference until the next milestone's requirements are defined.
 
 <!-- The 15 user-approved improvement themes for v1.5.0. Atomic enabling
 contracts for state, revision invalidation, distribution, continuation,
@@ -161,4 +167,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-22 after extending milestone v1.5.0 with design-mode durability, truthfulness, and bounded-execution themes (16-30)*
+*Last updated: 2026-07-23 after v1.5.0 milestone shipped (archived to `.planning/milestones/`, tagged `v1.5.0`)*

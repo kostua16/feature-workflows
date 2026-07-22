@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.5.0
 milestone_name: Project-Scale Extract Design
-status: completed
+status: Awaiting next milestone
 stopped_at: Phase 10 complete — ready for Phase 11 planning
-last_updated: "2026-07-22T19:37:38.810Z"
-last_activity: "2026-07-22 — Phase 11 complete: transient-error backoff (DTRANS-01), deterministic artifact verification (DVERIFY-01), behavioral characterization tests (DTEST-01) (55 new tests, 787 total)"
+last_updated: "2026-07-22T23:32:16.357Z"
+last_activity: 2026-07-22 — Milestone v1.5.0 completed and archived
 progress:
   total_phases: 11
-  completed_phases: 9
+  completed_phases: 11
   total_plans: 11
-  completed_plans: 9
-  percent: 82
+  completed_plans: 11
+  percent: 100
 ---
 
 # Project State
@@ -21,16 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-22)
 
 **Core value:** One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts without silently losing work or overstating completion.
-**Current focus:** Phase 11 — Design-Mode Reliability, Verification, and Characterization Proof
+**Current focus:** v1.5.0 shipped & archived — run `/gsd-new-milestone` to plan the next milestone
 
 ## Current Position
 
-Phase: 11 — COMPLETE
-Plan: 1 of 1 in current phase
-Status: Phase 11 complete — milestone v1.5.0 finished
-Last activity: 2026-07-22 — Phase 11 complete: transient-error backoff (DTRANS-01), deterministic artifact verification (DVERIFY-01), behavioral characterization tests (DTEST-01) (55 new tests, 787 total)
-
-Progress: [█████████░] 91%
+Phase: Milestone v1.5.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-07-22 — Milestone v1.5.0 completed and archived
 
 ## Performance Metrics
 
@@ -106,3 +104,7 @@ None yet.
 Last session: 2026-07-22T19:37:38.803Z
 Stopped at: Phase 10 complete — ready for Phase 11 planning
 Resume file: None
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone
