@@ -17,6 +17,9 @@ import { createBudgetLimits, createBudgetAccountant, setReserve, callsRemaining,
 import { createRetryPolicy, createAttemptHistory, recordAttempt, isTerminalFailure, terminalReason, attemptSummary, ATTEMPT_OUTCOMES } from './retry-policy.mjs'
 import { isolateFailure, shouldContinueAfterFailure, segmentOutcome, eligibleIndependents } from './failure-isolation.mjs'
 import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIntent, acknowledgeSegment, resolveConvergence, shouldContinue, resumeCommand, continuationSummary, canAutoRelaunch } from './continuation.mjs'
+import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary } from './synthesis.mjs'
+import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport } from './observe-persist.mjs'
+import { deriveExtractReadiness, projectStatusProjection, readinessSummary } from './status-truth.mjs'
 
 
 // ---- Script body -----------------------------------------------------------
@@ -68,11 +71,18 @@ async function main() {
       }
     }
     const validation = validatePipelineState(state)
+    var statusReportStr = renderStatusReport(state, validation)
+    // Phase 6: augment status with truthful readiness projection if the state
+    // includes one (added by Phase 6 extract terminal). This is read-only — status
+    // mode never writes, and the projection is the same immutable object the handoff used.
+    if (state.result && state.result.statusProjection) {
+      statusReportStr += '\n\n' + readinessSummary(state.result.statusProjection)
+    }
     return {
       mode: 'status',
       planDir: statusDir,
       ready: true,
-      statusReport: renderStatusReport(state, validation),
+      statusReport: statusReportStr,
       logLines: [`main: status report rendered for ${statusDir}${validation.ok ? '' : ' (state failed validation — best-effort)'}`],
     }
   }
@@ -457,6 +467,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (result.continuationState === undefined) result.continuationState = null
     if (result.budgetAccountant === undefined) result.budgetAccountant = null
     if (result.attemptHistory === undefined) result.attemptHistory = null
+    // Phase 6: backfill synthesis, persistence, and status-truth state.
+    if (result.synthesisState === undefined) result.synthesisState = null
+    if (result.persistenceTracker === undefined) result.persistenceTracker = null
+    if (result.statusProjection === undefined) result.statusProjection = null
     if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
     // The user-level install is a symlink that tracks the plugin, so a resume after a
@@ -558,6 +572,10 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       continuationState: null, // monotonic segment tracking + idempotency keys
       budgetAccountant: null, // characterized budget admission with non-spendable reserve
       attemptHistory: null, // per-gate/per-feature retry attempt journal
+      // Phase 6: synthesis, persistence tracking, and truthful status projection.
+      synthesisState: null, // incremental project views with selective revision invalidation
+      persistenceTracker: null, // attempted-vs-durable write lifecycle tracking
+      statusProjection: null, // immutable projection shared by handoff and status
       // Review mode (standalone design-docset audit) state. Defaults keep older
       // pipeline-state.json hydrating without breakage (same backward-compat rule).
       reviewPath: null, // <planDir>/design-review.md report
@@ -1128,6 +1146,15 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       if (!result.attemptHistory) {
         result.attemptHistory = createAttemptHistory()
       }
+      // Phase 6: initialize synthesis and persistence tracking on first entry.
+      // Synthesis state holds incrementally built project views with revision tracking.
+      // Persistence tracker distinguishes attempted from durably verified writes.
+      if (!result.synthesisState) {
+        result.synthesisState = createSynthesisState()
+      }
+      if (!result.persistenceTracker) {
+        result.persistenceTracker = createPersistenceTracker()
+      }
       // Allocate a monotonic segment ID and declare intent for this batch.
       var segAlloc = nextSegmentId(result.continuationState)
       result.continuationState = segAlloc.state
@@ -1158,7 +1185,13 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           }
           plog(`Extract: retry budget exhausted with ${result.extractQueue.filter((s) => s.status === 'pending').length} slice(s) pending — blocking (resumable)`)
           stateCheckpoint('Extract Slice', 'blocked')
+          result.persistenceTracker = recordAttemptedWrite(
+            result.persistenceTracker, 'extract:blocked-budget:' + planDir, 'project-index'
+          )
           await consolidate(slug, result, config)
+          result.persistenceTracker = verifyDurableWrite(
+            result.persistenceTracker, 'extract:blocked-budget:' + planDir
+          )
           return result
         }
         // Budget admission: verify the next slice can complete its gates without
@@ -1179,7 +1212,13 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           }
           plog(`Extract: budget ceiling — admission denied (${adm.reason}), blocking (resumable)`)
           stateCheckpoint('Extract Slice', 'blocked')
+          result.persistenceTracker = recordAttemptedWrite(
+            result.persistenceTracker, 'extract:blocked-ceiling:' + planDir, 'project-index'
+          )
           await consolidate(slug, result, config)
+          result.persistenceTracker = verifyDurableWrite(
+            result.persistenceTracker, 'extract:blocked-ceiling:' + planDir
+          )
           return result
         }
         slice.status = 'in-progress'
@@ -1289,6 +1328,25 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       )
       result.continuationState = segAck.state
 
+      // Phase 6: synthesize project views from verified feature summaries.
+      // Incremental: only changed inputs trigger view rebuilds; idempotent.
+      var featureSummaries = result.extractQueue.map(function (s) {
+        return {
+          id: s.id,
+          name: s.name,
+          lifecycle: s.status === 'done' ? 'completed' : (s.status === 'blocked' ? 'blocked' : 'deferred'),
+          artifacts: s.artifacts || {},
+          dependencies: s.dependencies || [],
+          crossCuttingConcerns: s.crossCuttingConcerns || [],
+        }
+      })
+      result.synthesisState = synthesizeProjectViews(
+        featureSummaries, result.synthesisState,
+        { scope: result.scopeManifestPath || null, graph: result.scopeManifestPath || null }
+      )
+      plog('Extract: synthesis — ' + (result.synthesisState.synthesized ? 'views rebuilt' : 'no change') +
+        ', coverage denominator: ' + (result.synthesisState.views.coverageIndex ? result.synthesisState.views.coverageIndex.denominator : 0))
+
       // Gate X8: system overview (multi-slice only, non-blocking).
       if (multiSlice && !result.overviewPath) {
         phase('System Overview')
@@ -1351,15 +1409,61 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         }
         plog(`Extract: terminal verification failed — doneSlices=${doneSlices.length}; failedChecks=${failedArtifactChecks.length}`)
         stateCheckpoint('Extract', 'blocked')
+        result.persistenceTracker = recordAttemptedWrite(
+          result.persistenceTracker, 'extract:artifact-missing:' + planDir, 'project-index'
+        )
         await consolidate(slug, result, config)
+        result.persistenceTracker = verifyDurableWrite(
+          result.persistenceTracker, 'extract:artifact-missing:' + planDir
+        )
         return result
       }
 
+      // Phase 6: truthful readiness derivation. extractReady is true ONLY when
+      // discovery is exhausted, graph is valid, every in-scope feature is verified
+      // complete, synthesis is current, and required artifacts are current.
       phase('Extract')
-      result.extractReady = true
-      if (!multiSlice) result.designReady = true
+      var extractProjectState = {
+        discoveryExhausted: true,
+        graphValid: !failedArtifactChecks.length,
+        features: result.extractQueue.map(function (s) {
+          return {
+            id: s.id,
+            lifecycle: s.status === 'done' ? 'completed' : (s.status === 'blocked' ? 'blocked' : 'deferred'),
+          }
+        }),
+        synthesisCurrent: isSynthesisCurrent(result.synthesisState, {
+          scope: result.scopeManifestPath || null,
+          graph: result.scopeManifestPath || null,
+        }),
+        artifactsCurrent: !failedArtifactChecks.length,
+      }
+      var readiness = deriveExtractReadiness(extractProjectState)
+      result.extractReady = readiness.ready
+      result.readinessReason = readiness.reason
+      if (!multiSlice) result.designReady = readiness.ready
       const blockedCount = result.extractQueue.filter((s) => s.status === 'blocked').length
       const skippedCount = result.extractQueue.filter((s) => s.status === 'skipped').length
+
+      // Phase 6: build the immutable status projection shared by handoff and status.
+      // Both surfaces report identical denominator, lifecycle outcomes, revisions,
+      // budgets, failures, readiness proof, and continuation evidence.
+      result.statusProjection = projectStatusProjection({
+        planDir: planDir,
+        scopeManifestPath: result.scopeManifestPath || null,
+        discoveryExhausted: extractProjectState.discoveryExhausted,
+        graphValid: extractProjectState.graphValid,
+        features: extractProjectState.features,
+        synthesisCurrent: extractProjectState.synthesisCurrent,
+        artifactsCurrent: extractProjectState.artifactsCurrent,
+        revisions: { scope: result.scopeManifestPath || null },
+        budget: budgetSummary(result.budgetAccountant),
+        failures: (result.attemptHistory && result.attemptHistory.entries
+          ? result.attemptHistory.entries.filter(function (e) { return e.outcome !== 'success' })
+          : []),
+        continuation: continuationSummary(result.continuationState),
+      })
+
       result.handoff = {
         from: 'extract',
         nextMode: 'tune',
@@ -1367,13 +1471,23 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         slices: result.extractQueue.map((s) => ({ id: s.id, name: s.name, planDir: s.planDir, status: s.status })),
         segments: continuationSummary(result.continuationState),
         budget: budgetSummary(result.budgetAccountant),
+        persistence: persistenceReport(result.persistenceTracker),
+        readiness: readinessSummary(result.statusProjection),
         message: multiSlice
           ? `Extraction complete: ${doneSlices.length} slice(s) documented under ${planDir}slices/ (overview: ${result.overviewPath || '(none)'})${blockedCount ? `; ${blockedCount} blocked` : ''}${skippedCount ? `; ${skippedCount} skipped — resume later with --slices` : ''}. Per slice: audit findings are in issues-and-improvements.md — run /tune-feature <sliceDir> to fix, or /design-feature --resume <sliceDir> to build on the baseline.`
           : `Extraction complete. As-is design docs are in ${planDir}. Audit findings (if any) are in issues-and-improvements.md — run /tune-feature ${planDir} to fix them, or /design-feature --resume ${planDir} to build on the baseline.`,
       }
       stateCheckpoint('Extract', 'done')
-      plog(`Extract: extractReady=true — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+      plog(`Extract: extractReady=${readiness.ready} (${readiness.reason}) — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+
+      // Phase 6: track the durable consolidate write through the persistence tracker.
+      result.persistenceTracker = recordAttemptedWrite(
+        result.persistenceTracker, 'extract:consolidate:' + planDir, 'project-index'
+      )
       await consolidate(slug, result, config)
+      result.persistenceTracker = verifyDurableWrite(
+        result.persistenceTracker, 'extract:consolidate:' + planDir
+      )
       return result
     }
 

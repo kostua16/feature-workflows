@@ -162,9 +162,9 @@ Each v1 requirement is assigned to exactly one owning roadmap phase.
 | RETRY-01 | Phase 5 | Complete |
 | ISOLATE-01 | Phase 5 | Complete |
 | CONT-01 | Phase 5 | Complete |
-| SYNTH-01 | Phase 6 | Pending |
-| OBSERVE-01 | Phase 6 | Pending |
-| STATUS-01 | Phase 6 | Pending |
+| SYNTH-01 | Phase 6 | Complete |
+| OBSERVE-01 | Phase 6 | Complete |
+| STATUS-01 | Phase 6 | Complete |
 | COMPAT-01 | Phase 7 | Pending |
 | QUAL-01 | Phase 7 | Pending |
 | DOGFOOD-01 | Phase 7 | Pending |
