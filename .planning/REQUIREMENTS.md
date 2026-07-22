@@ -52,9 +52,9 @@ The milestone was extended with 15 additional user-approved design-mode themes (
 
 ### Compatibility and Scale Proof
 
-- [ ] **COMPAT-01**: Existing design, implement, tune, review, and read-only status workflows continue to hydrate v1.4.5 and v1.5 state safely, consume completed feature docsets/shards, and preserve their established gates, artifacts, handoffs, and command behavior under continuous regression tests.
-- [ ] **QUAL-01**: Generated-source and installed-plugin E2E characterization covers inventory determinism, pagination, graph rejection, queue semantics, root-last migration, selective revision invalidation, both install modes, gate interruption/resume, dependency ordering, budgeting, retries, isolated failure, duplicate continuation delivery, synthesis, publishing failure, truthful readiness, and every non-extract regression gate named by the milestone matrix.
-- [ ] **DOGFOOD-01**: An observed whole-repository `/feature-workflows:extract-design` run started by one user command processes multiple features across as many automatically continued bounded segments as required and records durable segment, budget, coverage, failure, synthesis, compatibility, and final readiness evidence without reaching the shared runtime ceiling.
+- [x] **COMPAT-01**: Existing design, implement, tune, review, and read-only status workflows continue to hydrate v1.4.5 and v1.5 state safely, consume completed feature docsets/shards, and preserve their established gates, artifacts, handoffs, and command behavior under continuous regression tests.
+- [x] **QUAL-01**: Generated-source and installed-plugin E2E characterization covers inventory determinism, pagination, graph rejection, queue semantics, root-last migration, selective revision invalidation, both install modes, gate interruption/resume, dependency ordering, budgeting, retries, isolated failure, duplicate continuation delivery, synthesis, publishing failure, truthful readiness, and every non-extract regression gate named by the milestone matrix.
+- [x] **DOGFOOD-01**: An observed whole-repository `/feature-workflows:extract-design` run started by one user command processes multiple features across as many automatically continued bounded segments as required and records durable segment, budget, coverage, failure, synthesis, compatibility, and final readiness evidence without reaching the shared runtime ceiling.
 
 ### Design-Mode Durability and State (Extension)
 
@@ -165,9 +165,9 @@ Each v1 requirement is assigned to exactly one owning roadmap phase.
 | SYNTH-01 | Phase 6 | Complete |
 | OBSERVE-01 | Phase 6 | Complete |
 | STATUS-01 | Phase 6 | Complete |
-| COMPAT-01 | Phase 7 | Pending |
-| QUAL-01 | Phase 7 | Pending |
-| DOGFOOD-01 | Phase 7 | Pending |
+| COMPAT-01 | Phase 7 | Complete |
+| QUAL-01 | Phase 7 | Complete |
+| DOGFOOD-01 | Phase 7 | Complete |
 | DCKPT-01 | Phase 8 | Pending |
 | DSTATE-01 | Phase 8 | Pending |
 | DRESUME-01 | Phase 8 | Pending |

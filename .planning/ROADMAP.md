@@ -52,7 +52,7 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 - [x] **Phase 4: Checkpointed Feature Leaf** - One feature runs through `fp-extract-slice` with transition-level acknowledgements and resumable gate evidence.
 - [x] **Phase 5: Bounded Scheduler and Transactional Automatic Continuation** - Dependency-safe work advances through budgeted, isolated, monotonically acknowledged segments from one command.
 - [x] **Phase 6: Synthesis, Publish, Persist, and Status Truth** - Bounded verified summaries produce retry-safe project views and one revision-current readiness account.
-- [ ] **Phase 7: Compatibility and Project-Scale Proof** - Continuous mode compatibility, complete E2E characterization, and whole-repository dogfooding prove the promise.
+- [x] **Phase 7: Compatibility and Project-Scale Proof** - Continuous mode compatibility, complete E2E characterization, and whole-repository dogfooding prove the promise.
 - [ ] **Phase 8: Design-Mode Durable Checkpoints and Revision-Aware Resume** - Design (and implement/tune where proven) gains gate-level durable persistence, auto-recovering atomic state writes, and digest-driven resume that skips unchanged work.
 - [ ] **Phase 9: Design-Mode Truthful Readiness and Outcome Reporting** - `designReady` and terminal commit/publish/persist outcomes are true only when genuinely earned, and every degraded path is durably recorded and surfaced.
 - [ ] **Phase 10: Design-Mode Bounded Budgets and Prompt Context** - Per-gate/per-run budgets, per-loop retry sub-budgets, and bounded prompt payloads replace observational telemetry and unbounded interpolation.
@@ -341,7 +341,7 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 | 4. Checkpointed Feature Leaf | 1/1 | Complete | 2026-07-22 |
 | 5. Bounded Scheduler and Transactional Automatic Continuation | 1/1 | Complete | 2026-07-22 |
 | 6. Synthesis, Publish, Persist, and Status Truth | 1/1 | Complete | 2026-07-22 |
-| 7. Compatibility and Project-Scale Proof | 0/TBD | Not started | - |
+| 7. Compatibility and Project-Scale Proof | 1/1 | Complete | 2026-07-22 |
 | 8. Design-Mode Durable Checkpoints and Revision-Aware Resume | 0/TBD | Not started | - |
 | 9. Design-Mode Truthful Readiness and Outcome Reporting | 0/TBD | Not started | - |
 | 10. Design-Mode Bounded Budgets and Prompt Context | 0/TBD | Not started | - |
