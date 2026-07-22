@@ -73,9 +73,9 @@ The milestone was extended with 15 additional user-approved design-mode themes (
 
 ### Design-Mode Bounded Execution (Extension)
 
-- [ ] **DBUDGET-01**: A user's design run enforces per-gate and per-run call/token budgets derived from existing gate telemetry, with non-spendable reserve for state persistence and handoff, instead of purely observational counters. (F11)
-- [ ] **DLOOP-01**: A user's later design gates cannot be starved by earlier ones because each review/refine loop draws from its own bounded sub-budget, and escalation retry limits are configurable rather than hardcoded. (F12)
-- [ ] **DPROMPT-01**: A user's design-gate prompts stay bounded because conflict, blocker, and fix payloads are capped and compacted with the existing prompt-hygiene helpers before interpolation. (F13)
+- [x] **DBUDGET-01**: A user's design run enforces per-gate and per-run call/token budgets derived from existing gate telemetry, with non-spendable reserve for state persistence and handoff, instead of purely observational counters. (F11)
+- [x] **DLOOP-01**: A user's later design gates cannot be starved by earlier ones because each review/refine loop draws from its own bounded sub-budget, and escalation retry limits are configurable rather than hardcoded. (F12)
+- [x] **DPROMPT-01**: A user's design-gate prompts stay bounded because conflict, blocker, and fix payloads are capped and compacted with the existing prompt-hygiene helpers before interpolation. (F13)
 
 ### Design-Mode Reliability and Proof (Extension)
 
@@ -177,9 +177,9 @@ Each v1 requirement is assigned to exactly one owning roadmap phase.
 | DQUEST-01 | Phase 9 | Pending |
 | DCHUNK-01 | Phase 9 | Pending |
 | DYAGNI-01 | Phase 9 | Pending |
-| DBUDGET-01 | Phase 10 | Pending |
-| DLOOP-01 | Phase 10 | Pending |
-| DPROMPT-01 | Phase 10 | Pending |
+| DBUDGET-01 | Phase 10 | Complete |
+| DLOOP-01 | Phase 10 | Complete |
+| DPROMPT-01 | Phase 10 | Complete |
 | DTRANS-01 | Phase 11 | Pending |
 | DVERIFY-01 | Phase 11 | Pending |
 | DTEST-01 | Phase 11 | Pending |

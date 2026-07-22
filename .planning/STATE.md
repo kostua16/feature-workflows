@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.5.0
 milestone_name: Project-Scale Extract Design
 status: executing
-stopped_at: Phase 9 complete — ready for Phase 10 planning
-last_updated: "2026-07-22T14:28:45.914Z"
-last_activity: "2026-07-22 — Phase 9 complete: truthful design readiness, degradation journal, terminal outcome blocking, open-questions gate, chunker surfacing, YAGNI routing (54 new tests, 700 total)"
+stopped_at: Phase 10 complete — ready for Phase 11 planning
+last_updated: "2026-07-22T23:59:00.000Z"
+last_activity: "2026-07-22 — Phase 10 complete: bounded design budgets, per-loop sub-budgets, compactList prompts (32 new tests, 732 total)"
 progress:
   total_phases: 11
-  completed_phases: 9
-  total_plans: 9
-  completed_plans: 9
-  percent: 82
+  completed_phases: 10
+  total_plans: 10
+  completed_plans: 10
+  percent: 91
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-22)
 
 **Core value:** One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts without silently losing work or overstating completion.
-**Current focus:** Phase 10 — Design-Mode Bounded Budgets and Prompt Context
+**Current focus:** Phase 11 — Design-Mode Reliability, Verification, and Characterization Proof
 
 ## Current Position
 
-Phase: 10 of 11 (Design-Mode Bounded Budgets and Prompt Context)
+Phase: 11 of 11 (Design-Mode Reliability, Verification, and Characterization Proof)
 Plan: 0 of TBD in current phase
-Status: Ready to execute
-Last activity: 2026-07-22 — Phase 9 complete: truthful design readiness, degradation journal, terminal outcome blocking, open-questions gate, chunker surfacing, YAGNI routing (54 new tests, 700 total)
+Status: Ready to plan
+Last activity: 2026-07-22 — Phase 10 complete: bounded design budgets (DBUDGET-01), per-loop sub-budgets (DLOOP-01), compactList prompts (DPROMPT-01) (32 new tests, 732 total)
 
-Progress: [████████░░] 82%
+Progress: [█████████░] 91%
 
 ## Performance Metrics
 
@@ -53,8 +53,9 @@ Progress: [████████░░] 82%
 | 7 | 1 | 1 | — |
 | 8 | 1 | 1 | — |
 | 9 | 1 | 1 | — |
+| 10 | 1 | 1 | — |
 
-**Recent Trend:** Phases 1-9 complete with 700 tests passing.
+**Recent Trend:** Phases 1-10 complete with 732 tests passing.
 
 ## Accumulated Context
 
@@ -90,6 +91,7 @@ None yet.
 - Phase 7 COMPLETE: continuous mode compatibility regression, complete E2E matrix characterization, whole-repository dogfood scale proof (80 new tests, 624 total).
 - Phase 8 COMPLETE: design-mode durable checkpoints (DCKPT-01 — 19 material gates), auto-recovering atomic state writes (DSTATE-01 — last-good snapshot), digest-driven resume (DRESUME-01 — skip unchanged artifacts) (22 new tests, 646 total).
 - Phase 9 COMPLETE: truthful design readiness (DREADY-01 — deriveDesignReadiness pure gate), durable degradation journal (DHIST-01 — fail-forward/retry/escalation/fallback events), terminal outcome blocking (DTERM-01 — commit failure blocks, publish/persist verified), open-questions enforcement (DQUEST-01), chunker degradation surfacing (DCHUNK-01), YAGNI blocker routing (DYAGNI-01) (54 new tests, 700 total).
+- Phase 10 COMPLETE: enforced design budgets (DBUDGET-01 — design-budget.mjs wrapping Phase 5 budget-admission with per-gate/per-run caps + HANDOFF reserve), per-loop sub-budgets (DLOOP-01 — design-loops.mjs with independent refine/reconcile/debug/escalation budgets; configurable escalation retries), bounded prompt payloads (DPROMPT-01 — compactList applied at all design-gate JSON.stringify sites) (32 new tests, 732 total).
 
 ## Deferred Items
 
@@ -101,5 +103,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-07-22
-Stopped at: Phase 9 complete — ready for Phase 10 planning
+Stopped at: Phase 10 complete — ready for Phase 11 planning
 Resume file: None

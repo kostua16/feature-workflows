@@ -55,7 +55,7 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 - [x] **Phase 7: Compatibility and Project-Scale Proof** - Continuous mode compatibility, complete E2E characterization, and whole-repository dogfooding prove the promise.
 - [x] **Phase 8: Design-Mode Durable Checkpoints and Revision-Aware Resume** - Design (and implement/tune where proven) gains gate-level durable persistence, auto-recovering atomic state writes, and digest-driven resume that skips unchanged work.
 - [x] **Phase 9: Design-Mode Truthful Readiness and Outcome Reporting** - `designReady` and terminal commit/publish/persist outcomes are true only when genuinely earned, and every degraded path is durably recorded and surfaced.
-- [ ] **Phase 10: Design-Mode Bounded Budgets and Prompt Context** - Per-gate/per-run budgets, per-loop retry sub-budgets, and bounded prompt payloads replace observational telemetry and unbounded interpolation.
+- [x] **Phase 10: Design-Mode Bounded Budgets and Prompt Context** - Per-gate/per-run budgets, per-loop retry sub-budgets, and bounded prompt payloads replace observational telemetry and unbounded interpolation.
 - [ ] **Phase 11: Design-Mode Reliability, Verification, and Characterization Proof** - Transient-error backoff, deterministic artifact verification, and end-to-end behavioral tests prove the extended design flow.
 
 ## Phase Details
@@ -344,5 +344,5 @@ These gates run at every phase exit after the relevant fixtures exist; a phase m
 | 7. Compatibility and Project-Scale Proof | 1/1 | Complete | 2026-07-22 |
 | 8. Design-Mode Durable Checkpoints and Revision-Aware Resume | 1/1 | Complete | 2026-07-22 |
 | 9. Design-Mode Truthful Readiness and Outcome Reporting | 1/1 | Complete | 2026-07-22 |
-| 10. Design-Mode Bounded Budgets and Prompt Context | 0/TBD | Not started | - |
+| 10. Design-Mode Bounded Budgets and Prompt Context | 1/1 | Complete | 2026-07-22 |
 | 11. Design-Mode Reliability, Verification, and Characterization Proof | 0/TBD | Not started | - |
