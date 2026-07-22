@@ -2,6 +2,34 @@ import { ENGINE_VERSION } from './engine-version.mjs'
 import { TODO_ACK, FILE_ACK, PIPELINE_STATE_READ, ARTIFACT_CHECK } from './schemas.mjs'
 import { nsAgent, retryState, decisionState, gm } from './config.mjs'
 import { safeAgent, renderTelemetrySummary } from './agent-core.mjs'
+import { computeContentDigest } from './revision.mjs'
+
+// Maps artifact path keys to their checkpoint gate names so digest-driven
+// verification can look up the durable checkpoint recorded at gate completion.
+const ARTIFACT_CHECKPOINT_GATE_MAP = {
+  definitionPath: 'define',
+  requirementsPath: 'requirements',
+  archPath: 'architecture',
+  designPath: 'detailed-design',
+  planPath: 'plan',
+}
+
+// Deterministic artifact verification using the durable digest/revision
+// contract. When a gate was durably checkpointed and its artifact digest was
+// recorded, the artifact is verified without trusting an LLM self-report.
+// Pure: no I/O, no side effects.
+function verifyArtifactDigest(result, pathKey) {
+  if (!result || !pathKey) return { verified: false, reason: 'no-path-key', digest: null }
+  const checkpoints = result._designCheckpoints || {}
+  const digests = result._artifactDigests || {}
+  const gateName = ARTIFACT_CHECKPOINT_GATE_MAP[pathKey]
+  if (!gateName) return { verified: false, reason: 'no-gate-mapping', digest: null }
+  const cp = checkpoints[gateName]
+  const digest = digests[pathKey]
+  if (!cp || !cp.acknowledged) return { verified: false, reason: 'no-checkpoint', digest: null }
+  if (!digest) return { verified: false, reason: 'no-digest', digest: null }
+  return { verified: true, reason: 'checkpoint-verified', digest }
+}
 
 
 // Consolidate the full pipeline result into ONE durable todo-store record.
@@ -350,8 +378,18 @@ object in the "state" field. If the file does not exist, return state=null.`,
   return { state: null, recovered: false }
 }
 
-async function verifyArtifactPresence({ path, gate, expectedHeadings, result }) {
+async function verifyArtifactPresence({ path, gate, expectedHeadings, result, pathKey }) {
   if (!path || path === 'present') return { exists: !!path, sizeBytes: 0, hasExpectedHeadings: true, summary: 'not a file path' }
+  // Deterministic verification via durable digest contract. An LLM file-reader's
+  // self-reported existence cannot be trusted — a hallucinated claim could pass
+  // a missing artifact. When a durable checkpoint recorded this artifact with a
+  // digest, that is the authoritative verification and the LLM call is skipped.
+  if (pathKey) {
+    const digestResult = verifyArtifactDigest(result, pathKey)
+    if (digestResult.verified) {
+      return { exists: true, sizeBytes: 1, hasExpectedHeadings: true, summary: 'verified via durable digest checkpoint' }
+    }
+  }
   const headingLine = expectedHeadings && expectedHeadings.length
     ? `Also verify the file contains at least one of these headings/markers: ${expectedHeadings.join(', ')}.`
     : 'No specific heading marker is required.'
@@ -380,13 +418,7 @@ async function repairResumeArtifactFlags(result) {
   // acknowledged and its artifact digest was recorded, the artifact was
   // verified at checkpoint time and the expensive LLM re-verification can be
   // skipped entirely on resume.
-  const checkpointGateMap = {
-    definitionPath: 'define',
-    requirementsPath: 'requirements',
-    archPath: 'architecture',
-    designPath: 'detailed-design',
-    planPath: 'plan',
-  }
+  const checkpointGateMap = ARTIFACT_CHECKPOINT_GATE_MAP
   const artifacts = [
     { pathKey: 'definitionPath', flags: ['_define'], gate: 'Define' },
     { pathKey: 'requirementsPath', flags: ['_requirements', '_reviewedRequirements'], gate: 'Requirements' },
@@ -412,6 +444,7 @@ async function repairResumeArtifactFlags(result) {
       gate: `resume:${artifact.gate}`,
       expectedHeadings: ['#'],
       result,
+      pathKey: artifact.pathKey,
     })
     if (checked.exists && checked.sizeBytes > 0 && checked.hasExpectedHeadings !== false) continue
     for (const flag of artifact.flags) {
@@ -431,4 +464,4 @@ async function repairResumeArtifactFlags(result) {
   return repairs
 }
 
-export { consolidate, writeChunkedFile, flushPipelineLog, stateChecksum, validatePipelineState, summarizeGates, deriveNextCommand, renderStatusReport, flushPipelineState, flushPipelineStateWithSnapshot, loadPipelineState, loadPipelineStateWithRecovery, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew }
+export { consolidate, writeChunkedFile, flushPipelineLog, stateChecksum, validatePipelineState, summarizeGates, deriveNextCommand, renderStatusReport, flushPipelineState, flushPipelineStateWithSnapshot, loadPipelineState, loadPipelineStateWithRecovery, verifyArtifactPresence, verifyArtifactDigest, repairResumeArtifactFlags, detectResumeEngineSkew }

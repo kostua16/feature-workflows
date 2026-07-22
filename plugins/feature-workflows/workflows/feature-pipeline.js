@@ -1275,6 +1275,34 @@ function detectNonEnglish(text) {
   return { isEnglish: letters === 0 || ratio < 0.15, ratio }
 }
 
+// Maps artifact path keys to their checkpoint gate names so digest-driven
+// verification can look up the durable checkpoint recorded at gate completion.
+const ARTIFACT_CHECKPOINT_GATE_MAP = {
+  definitionPath: 'define',
+  requirementsPath: 'requirements',
+  archPath: 'architecture',
+  designPath: 'detailed-design',
+  planPath: 'plan',
+}
+
+// Deterministic artifact verification using the durable digest/revision
+// contract. When a gate was durably checkpointed and its artifact digest was
+// recorded, the artifact is verified without trusting an LLM self-report.
+// Pure: no I/O, no side effects.
+function verifyArtifactDigest(result, pathKey) {
+  if (!result || !pathKey) return { verified: false, reason: 'no-path-key', digest: null }
+  const checkpoints = result._designCheckpoints || {}
+  const digests = result._artifactDigests || {}
+  const gateName = ARTIFACT_CHECKPOINT_GATE_MAP[pathKey]
+  if (!gateName) return { verified: false, reason: 'no-gate-mapping', digest: null }
+  const cp = checkpoints[gateName]
+  const digest = digests[pathKey]
+  if (!cp || !cp.acknowledged) return { verified: false, reason: 'no-checkpoint', digest: null }
+  if (!digest) return { verified: false, reason: 'no-digest', digest: null }
+  return { verified: true, reason: 'checkpoint-verified', digest }
+}
+
+
 // Consolidate the full pipeline result into ONE durable todo-store record.
 // R4 replaces ~16 per-gate checkpoint() calls with this single write: gate
 // verdicts (with their self-summarizing notes/evidence fields) already carry
@@ -1621,8 +1649,18 @@ object in the "state" field. If the file does not exist, return state=null.`,
   return { state: null, recovered: false }
 }
 
-async function verifyArtifactPresence({ path, gate, expectedHeadings, result }) {
+async function verifyArtifactPresence({ path, gate, expectedHeadings, result, pathKey }) {
   if (!path || path === 'present') return { exists: !!path, sizeBytes: 0, hasExpectedHeadings: true, summary: 'not a file path' }
+  // Deterministic verification via durable digest contract. An LLM file-reader's
+  // self-reported existence cannot be trusted — a hallucinated claim could pass
+  // a missing artifact. When a durable checkpoint recorded this artifact with a
+  // digest, that is the authoritative verification and the LLM call is skipped.
+  if (pathKey) {
+    const digestResult = verifyArtifactDigest(result, pathKey)
+    if (digestResult.verified) {
+      return { exists: true, sizeBytes: 1, hasExpectedHeadings: true, summary: 'verified via durable digest checkpoint' }
+    }
+  }
   const headingLine = expectedHeadings && expectedHeadings.length
     ? `Also verify the file contains at least one of these headings/markers: ${expectedHeadings.join(', ')}.`
     : 'No specific heading marker is required.'
@@ -1651,13 +1689,7 @@ async function repairResumeArtifactFlags(result) {
   // acknowledged and its artifact digest was recorded, the artifact was
   // verified at checkpoint time and the expensive LLM re-verification can be
   // skipped entirely on resume.
-  const checkpointGateMap = {
-    definitionPath: 'define',
-    requirementsPath: 'requirements',
-    archPath: 'architecture',
-    designPath: 'detailed-design',
-    planPath: 'plan',
-  }
+  const checkpointGateMap = ARTIFACT_CHECKPOINT_GATE_MAP
   const artifacts = [
     { pathKey: 'definitionPath', flags: ['_define'], gate: 'Define' },
     { pathKey: 'requirementsPath', flags: ['_requirements', '_reviewedRequirements'], gate: 'Requirements' },
@@ -1683,6 +1715,7 @@ async function repairResumeArtifactFlags(result) {
       gate: `resume:${artifact.gate}`,
       expectedHeadings: ['#'],
       result,
+      pathKey: artifact.pathKey,
     })
     if (checked.exists && checked.sizeBytes > 0 && checked.hasExpectedHeadings !== false) continue
     for (const flag of artifact.flags) {
@@ -5620,6 +5653,60 @@ Report the exact command you ran in the "command" field and the exit status hone
   )
 }
 
+// Bounded backoff retry for transient provider/network errors. A transient error
+// (network timeout, 429, 503, connection reset) is inherently retryable — treating
+// it as immediately fatal hard-blocks every blocking design gate on a single
+// blip. These constants bound the retry loop so it cannot spin indefinitely.
+const TRANSIENT_RETRY_MAX = 3
+const TRANSIENT_BACKOFF_BASE_MS = 500
+
+// Classify an agent error message as transient, schema, or fatal.
+// Transient errors are retryable (network/provider). Schema errors use the
+// existing plain-text JSON fallback path. Fatal errors are non-retryable.
+// Pure: no side effects, deterministic for the same input.
+function classifyAgentError(errorMsg) {
+  const msg = String(errorMsg || '')
+  if (/StructuredOutput|schema|valid output/i.test(msg)) return 'schema'
+  if (/network|timeout|connection|ECONNRESET|ENOTFOUND|ETIMEDOUT|429|503|502|rate.?limit|overloaded|service.unavailable|temporarily/i.test(msg)) return 'transient'
+  return 'fatal'
+}
+
+// Retry a failed agent call with bounded exponential backoff. Only called when
+// classifyAgentError returns 'transient'. Returns the raw output from
+// callAgentWithWatchdog on success, or null if all retries are exhausted.
+// Each attempt is journaled via recordDegradationEvent for durable inspection.
+async function retryTransientError(prompt, opts, result, originalError) {
+  for (let attempt = 1; attempt <= TRANSIENT_RETRY_MAX; attempt++) {
+    const delayMs = TRANSIENT_BACKOFF_BASE_MS * Math.pow(2, attempt - 1)
+    await new Promise((resolve) => setTimeout(resolve, delayMs))
+    if (result && Array.isArray(result.logLines)) {
+      result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} for "${opts && opts.label}" after ${delayMs}ms backoff`)
+    }
+    bumpGateTelemetry(result, opts, 'retry')
+    recordDegradationEvent(result, 'retry', opts && opts.phase, opts && opts.label, `transient error retry ${attempt}/${TRANSIENT_RETRY_MAX}: ${originalError}`)
+    try {
+      const out = await callAgentWithWatchdog(prompt, opts, result)
+      if (out) {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} succeeded for "${opts && opts.label}"`)
+        }
+        return out
+      }
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e)
+      const errorClass = classifyAgentError(msg)
+      if (errorClass !== 'transient') {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} stopped for "${opts && opts.label}": error reclassified as ${errorClass}`)
+        }
+        return null
+      }
+    }
+  }
+  return null
+}
+
+
 // agent() contract: returns null on user-skip or terminal API error. But a StructuredOutput
 // retry-cap throw (TelemetrySafeError) escapes that contract and propagates uncaught — killing
 // the workflow. safeAgent converts ANY throw into a null + log line so gate logic's existing
@@ -5655,16 +5742,31 @@ async function flexibleAgent(prompt, opts, result) {
     originalError = String(e && e.message ? e.message : e)
     schemaFailed = /StructuredOutput|schema|valid output/i.test(originalError)
     if (!schemaFailed) {
-      if (result && Array.isArray(result.logLines)) {
-        result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (caught): ${originalError}`)
+      const errorClass = classifyAgentError(originalError)
+      if (errorClass === 'transient') {
+        const recovered = await retryTransientError(effectivePrompt, callOpts, result, originalError)
+        if (recovered !== null) {
+          out = recovered
+        } else {
+          if (result && Array.isArray(result.logLines)) {
+            result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (transient retries exhausted): ${originalError}`)
+          }
+          log(`Agent "${opts && opts.label}" threw — transient retries exhausted, converting to null: ${originalError}`)
+          return null
+        }
+      } else {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (caught): ${originalError}`)
+        }
+        log(`Agent "${opts && opts.label}" threw — converting to null (graceful degradation): ${originalError}`)
+        return null
       }
-      log(`Agent "${opts && opts.label}" threw — converting to null (graceful degradation): ${originalError}`)
-      return null
+    } else {
+      if (result && Array.isArray(result.logLines)) {
+        result.logLines.push(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
+      }
+      log(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
     }
-    if (result && Array.isArray(result.logLines)) {
-      result.logLines.push(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
-    }
-    log(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
   }
   if (out) {
     if (typeof out === 'object') {
@@ -6735,11 +6837,29 @@ function applyApprovalDecision(result, decision) {
 function verifyAppendGrowth(result, path, ack) {
   if (!result) return { ok: true, unknown: true }
   if (!result._appendSizes) result._appendSizes = {}
+  // Digest-based comparison is authoritative when content is available — a
+  // writer-reported byte count can be hallucinated, but a content digest
+  // deterministically reflects what was actually written.
+  if (ack && ack.content != null) {
+    if (!result._appendDigests) result._appendDigests = {}
+    const currentDigest = computeContentDigest(ack.content)
+    const prevDigest = result._appendDigests[path] || null
+    result._appendDigests[path] = currentDigest
+    if (prevDigest == null) return { ok: true, prev: null, now: currentDigest, reason: 'digest-first-write' }
+    const ok = currentDigest !== prevDigest
+    const outcome = { ok, shrank: !ok, prev: prevDigest, now: currentDigest, reason: ok ? 'digest-grew' : 'digest-unchanged' }
+    if (!ok) {
+      if (!result.appendWarnings) result.appendWarnings = []
+      result.appendWarnings.push(`append-only file content unchanged (possible overwrite): ${path}`)
+    }
+    return outcome
+  }
+  // Fall back to byte-count comparison when no content is available
   const now = ack && Number.isFinite(ack.totalBytes) ? ack.totalBytes : null
-  if (now == null) return { ok: true, unknown: true } // writer didn't report a size — can't check
+  if (now == null) return { ok: true, unknown: true }
   const prev = Number.isFinite(result._appendSizes[path]) ? result._appendSizes[path] : null
   result._appendSizes[path] = now
-  if (prev == null) return { ok: true, prev: null, now } // first write to this path this run
+  if (prev == null) return { ok: true, prev: null, now }
   const ok = now > prev
   const outcome = { ok, shrank: now < prev, prev, now }
   if (!ok) {

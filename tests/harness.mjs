@@ -218,6 +218,12 @@ const CANDIDATES = [
   'loopBudgetExhausted',
   'loopBudgetSummary',
   'ESCALATION_RETRIES_DEFAULT',
+  // Phase 11 — design-mode reliability, verification, characterization
+  'classifyAgentError',
+  'TRANSIENT_RETRY_MAX',
+  'TRANSIENT_BACKOFF_BASE_MS',
+  'verifyArtifactDigest',
+  'flexibleAgent',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

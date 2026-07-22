@@ -3,6 +3,59 @@ import { detectNonEnglish } from './text-utils.mjs'
 import { extractJson } from './json-repair.mjs'
 import { main } from './main.mjs'
 
+// Bounded backoff retry for transient provider/network errors. A transient error
+// (network timeout, 429, 503, connection reset) is inherently retryable — treating
+// it as immediately fatal hard-blocks every blocking design gate on a single
+// blip. These constants bound the retry loop so it cannot spin indefinitely.
+const TRANSIENT_RETRY_MAX = 3
+const TRANSIENT_BACKOFF_BASE_MS = 500
+
+// Classify an agent error message as transient, schema, or fatal.
+// Transient errors are retryable (network/provider). Schema errors use the
+// existing plain-text JSON fallback path. Fatal errors are non-retryable.
+// Pure: no side effects, deterministic for the same input.
+function classifyAgentError(errorMsg) {
+  const msg = String(errorMsg || '')
+  if (/StructuredOutput|schema|valid output/i.test(msg)) return 'schema'
+  if (/network|timeout|connection|ECONNRESET|ENOTFOUND|ETIMEDOUT|429|503|502|rate.?limit|overloaded|service.unavailable|temporarily/i.test(msg)) return 'transient'
+  return 'fatal'
+}
+
+// Retry a failed agent call with bounded exponential backoff. Only called when
+// classifyAgentError returns 'transient'. Returns the raw output from
+// callAgentWithWatchdog on success, or null if all retries are exhausted.
+// Each attempt is journaled via recordDegradationEvent for durable inspection.
+async function retryTransientError(prompt, opts, result, originalError) {
+  for (let attempt = 1; attempt <= TRANSIENT_RETRY_MAX; attempt++) {
+    const delayMs = TRANSIENT_BACKOFF_BASE_MS * Math.pow(2, attempt - 1)
+    await new Promise((resolve) => setTimeout(resolve, delayMs))
+    if (result && Array.isArray(result.logLines)) {
+      result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} for "${opts && opts.label}" after ${delayMs}ms backoff`)
+    }
+    bumpGateTelemetry(result, opts, 'retry')
+    recordDegradationEvent(result, 'retry', opts && opts.phase, opts && opts.label, `transient error retry ${attempt}/${TRANSIENT_RETRY_MAX}: ${originalError}`)
+    try {
+      const out = await callAgentWithWatchdog(prompt, opts, result)
+      if (out) {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} succeeded for "${opts && opts.label}"`)
+        }
+        return out
+      }
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e)
+      const errorClass = classifyAgentError(msg)
+      if (errorClass !== 'transient') {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} stopped for "${opts && opts.label}": error reclassified as ${errorClass}`)
+        }
+        return null
+      }
+    }
+  }
+  return null
+}
+
 
 // agent() contract: returns null on user-skip or terminal API error. But a StructuredOutput
 // retry-cap throw (TelemetrySafeError) escapes that contract and propagates uncaught — killing
@@ -39,16 +92,31 @@ async function flexibleAgent(prompt, opts, result) {
     originalError = String(e && e.message ? e.message : e)
     schemaFailed = /StructuredOutput|schema|valid output/i.test(originalError)
     if (!schemaFailed) {
-      if (result && Array.isArray(result.logLines)) {
-        result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (caught): ${originalError}`)
+      const errorClass = classifyAgentError(originalError)
+      if (errorClass === 'transient') {
+        const recovered = await retryTransientError(effectivePrompt, callOpts, result, originalError)
+        if (recovered !== null) {
+          out = recovered
+        } else {
+          if (result && Array.isArray(result.logLines)) {
+            result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (transient retries exhausted): ${originalError}`)
+          }
+          log(`Agent "${opts && opts.label}" threw — transient retries exhausted, converting to null: ${originalError}`)
+          return null
+        }
+      } else {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (caught): ${originalError}`)
+        }
+        log(`Agent "${opts && opts.label}" threw — converting to null (graceful degradation): ${originalError}`)
+        return null
       }
-      log(`Agent "${opts && opts.label}" threw — converting to null (graceful degradation): ${originalError}`)
-      return null
+    } else {
+      if (result && Array.isArray(result.logLines)) {
+        result.logLines.push(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
+      }
+      log(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
     }
-    if (result && Array.isArray(result.logLines)) {
-      result.logLines.push(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
-    }
-    log(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
   }
   if (out) {
     if (typeof out === 'object') {
@@ -409,4 +477,4 @@ function reasoningSaysStop(text) {
   return false
 }
 
-export { safeAgent, flexibleAgent, normalizeAgentOutput, fallbackForAgent, escalateAgentOpts, agentCircuitOpen, recordAgentFailure, agentFailureKey, bumpGateTelemetry, renderTelemetrySummary, outputLanguageViolation, callAgentWithWatchdog, recordAgentWatchdog, hardenForModel, schemaExample, normalizeVerdict, normalizeEnum, verdictContradiction, countItems, reasoningSaysStop, recordDegradationEvent, degradationLogSummary }
+export { safeAgent, flexibleAgent, normalizeAgentOutput, fallbackForAgent, escalateAgentOpts, agentCircuitOpen, recordAgentFailure, agentFailureKey, bumpGateTelemetry, renderTelemetrySummary, outputLanguageViolation, callAgentWithWatchdog, recordAgentWatchdog, hardenForModel, schemaExample, normalizeVerdict, normalizeEnum, verdictContradiction, countItems, reasoningSaysStop, recordDegradationEvent, degradationLogSummary, classifyAgentError, retryTransientError, TRANSIENT_RETRY_MAX, TRANSIENT_BACKOFF_BASE_MS }
