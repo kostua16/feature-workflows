@@ -4389,6 +4389,44 @@ function projectEmptyProjection() {
   })
 }
 
+// Design readiness failure reasons — each maps to a specific hidden degradation.
+const DESIGN_READINESS_REASONS = Object.freeze({
+  FAIL_FORWARD_REVIEW: 'fail-forward-review',
+  FORCE_ACCEPTED_BLOCKERS: 'force-accepted-plan-with-blockers',
+  UNRESOLVED_RECONCILE: 'unresolved-reconcile-conflicts',
+  ALL_CLEAR: 'all-degradation-checks-clear',
+})
+
+// Derive truthful design readiness from design-mode result state.
+// designReady must be true ONLY when no review was fail-forwarded,
+// no plan carries force-accepted blockers, and reconcile conflicts are resolved.
+// Pure: no I/O, no side effects.
+function deriveDesignReadiness(result) {
+  if (!result || typeof result !== 'object') {
+    return { ready: false, reason: DESIGN_READINESS_REASONS.FAIL_FORWARD_REVIEW, degradation: [] }
+  }
+  var degradation = []
+  // Check fail-forward review flags (F4)
+  var forcedReviews = []
+  if (result._reviewedRequirementsForced) forcedReviews.push('Requirements')
+  if (result._reviewedArchForced) forcedReviews.push('Architecture')
+  if (result._reviewedDesignForced) forcedReviews.push('Detailed Design')
+  if (forcedReviews.length) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.FAIL_FORWARD_REVIEW, gates: forcedReviews })
+  }
+  // Check force-accepted plan with carried blockers (F5)
+  if (result.forceAccepted && result.carriedBlockers && result.carriedBlockers.length) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.FORCE_ACCEPTED_BLOCKERS, count: result.carriedBlockers.length })
+  }
+  // Check unresolved reconcile conflicts (F6)
+  if (result.reconcile && result.reconcile.consistent === false && (result.reconcile.conflicts || []).length > 0) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.UNRESOLVED_RECONCILE, conflicts: result.reconcile.conflicts.length })
+  }
+  var ready = degradation.length === 0
+  var reason = ready ? DESIGN_READINESS_REASONS.ALL_CLEAR : degradation[0].type
+  return { ready: ready, reason: reason, degradation: degradation }
+}
+
 // Verify two projections are identical. Used to enforce the invariant that
 // handoff and status report the same data.
 function projectionsMatch(a, b) {
@@ -4456,7 +4494,12 @@ and the source files it owns.`,
     return chunk.stages
   }
   // Degrade to a single implicit stage covering the whole plan (preserves single-executor behavior).
+  // DCHUNK-01: record the degradation so the design terminal can surface it as an explicit outcome.
   plogFromResult(result, 'plan-chunker: returned no stages — degrading to single implicit stage01')
+  if (result) {
+    result._chunkerDegraded = true
+    result._chunkerDegradationReason = 'plan-chunker returned no stages — single implicit stage01'
+  }
   return [{
     id: 'stage01',
     file: planDir + 'stage01.md',
@@ -5668,6 +5711,27 @@ function agentCircuitOpen(opts, result) {
   return !!(failures && failures.circuitOpen)
 }
 
+// Record a degradation event into the durable journal (DHIST-01).
+// Types: 'fail-forward' | 'retry' | 'escalation' | 'fallback'.
+// Each entry is sequentially numbered for inspection through handoff/status.
+function recordDegradationEvent(result, type, gate, label, reason) {
+  if (!result) return
+  if (!result._degradationLog) result._degradationLog = []
+  var seq = result._degradationLog.length + 1
+  result._degradationLog.push({ seq: seq, type: type, gate: gate || 'unknown', label: label || 'agent', reason: reason || '' })
+}
+
+// Summarize the degradation log for handoff/status display. Pure helper.
+function degradationLogSummary(log) {
+  if (!log || !log.length) return ''
+  var byType = {}
+  for (var i = 0; i < log.length; i++) {
+    var t = log[i].type
+    byType[t] = (byType[t] || 0) + 1
+  }
+  return Object.keys(byType).map(function (t) { return t + '=' + byType[t] }).join(', ')
+}
+
 function recordAgentFailure(result, opts, reason) {
   if (!result) return 0
   const key = agentFailureKey(opts)
@@ -5680,8 +5744,13 @@ function recordAgentFailure(result, opts, reason) {
   if (!result.degradationTelemetry) result.degradationTelemetry = { fallbacks: 0, escalations: 0, languageViolations: 0, circuitBreakers: 0 }
   result.degradationTelemetry.fallbacks += 1
   bumpGateTelemetry(result, opts, 'fallback')
+  // Journal each degradation event for durable attempt-history inspection (DHIST-01)
+  recordDegradationEvent(result, 'fallback', opts && opts.phase, opts && opts.label, reason)
   if (reason === 'non-English verdict') result.degradationTelemetry.languageViolations += 1
-  if (current.count === 2) result.degradationTelemetry.escalations += 1
+  if (current.count === 2) {
+    result.degradationTelemetry.escalations += 1
+    recordDegradationEvent(result, 'escalation', opts && opts.phase, opts && opts.label, 'model escalated after 2 failures')
+  }
   if (current.circuitOpen) result.degradationTelemetry.circuitBreakers += 1
   if (Array.isArray(result.logLines)) {
     result.logLines.push(`WARNING: agent "${opts && opts.label}" failure ${current.count}/${IDENTICAL_FAILURE_LIMIT}: ${reason}${current.circuitOpen ? ' (circuit open)' : ''}`)
@@ -6223,6 +6292,7 @@ async function reviewLoop({
       // Reviewer agent failed — fail-forward (treat as accepted) so a flaky reviewer doesn't block.
       plogFromResult(result, `${phaseLabel}: reviewer returned null — fail-forward (accepted)`)
       await appendReviewHistory(planDir, phaseLabel, iterations, null, 'fail-forward (reviewer-null)', result)
+      recordDegradationEvent(result, 'fail-forward', phaseLabel, 'critical-reviewer', 'reviewer returned null')
       return { accepted: true, iterations, lastVerdict: null, failForward: true, acceptancePath: 'fail-forward (reviewer-null)' }
     }
     lastVerdict = review
@@ -6264,6 +6334,7 @@ async function reviewLoop({
     if (!revise || !revise.artifactPath) {
       plogFromResult(result, `${phaseLabel}: reviser returned null — fail-forward (accepted)`)
       await appendReviewHistory(planDir, phaseLabel, iterations, review, 'fail-forward (reviser-null)', result)
+      recordDegradationEvent(result, 'fail-forward', phaseLabel, 'design-reviser', 'reviser returned null')
       return { accepted: true, iterations, lastVerdict: review, failForward: true, acceptancePath: 'fail-forward (reviser-null)' }
     }
     plogFromResult(result, `${phaseLabel}: revised (${(revise.changesApplied || []).length} changes)`)
@@ -6271,6 +6342,7 @@ async function reviewLoop({
   // Sub-cap exhausted without acceptance — fail-forward (non-terminal like the plan convergence gate).
   plogFromResult(result, `${phaseLabel}: sub-cap (${refineSubcap}) reached without acceptance — fail-forward`)
   await appendReviewHistory(planDir, phaseLabel, iterations, lastVerdict, 'fail-forward (sub-cap)', result)
+  recordDegradationEvent(result, 'fail-forward', phaseLabel, 'review-loop', 'sub-cap reached without acceptance')
   return { accepted: true, iterations, lastVerdict, failForward: true, acceptancePath: 'fail-forward (sub-cap)' }
 }
 

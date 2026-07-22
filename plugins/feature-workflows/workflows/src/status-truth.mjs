@@ -180,6 +180,44 @@ function projectEmptyProjection() {
   })
 }
 
+// Design readiness failure reasons — each maps to a specific hidden degradation.
+const DESIGN_READINESS_REASONS = Object.freeze({
+  FAIL_FORWARD_REVIEW: 'fail-forward-review',
+  FORCE_ACCEPTED_BLOCKERS: 'force-accepted-plan-with-blockers',
+  UNRESOLVED_RECONCILE: 'unresolved-reconcile-conflicts',
+  ALL_CLEAR: 'all-degradation-checks-clear',
+})
+
+// Derive truthful design readiness from design-mode result state.
+// designReady must be true ONLY when no review was fail-forwarded,
+// no plan carries force-accepted blockers, and reconcile conflicts are resolved.
+// Pure: no I/O, no side effects.
+function deriveDesignReadiness(result) {
+  if (!result || typeof result !== 'object') {
+    return { ready: false, reason: DESIGN_READINESS_REASONS.FAIL_FORWARD_REVIEW, degradation: [] }
+  }
+  var degradation = []
+  // Check fail-forward review flags (F4)
+  var forcedReviews = []
+  if (result._reviewedRequirementsForced) forcedReviews.push('Requirements')
+  if (result._reviewedArchForced) forcedReviews.push('Architecture')
+  if (result._reviewedDesignForced) forcedReviews.push('Detailed Design')
+  if (forcedReviews.length) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.FAIL_FORWARD_REVIEW, gates: forcedReviews })
+  }
+  // Check force-accepted plan with carried blockers (F5)
+  if (result.forceAccepted && result.carriedBlockers && result.carriedBlockers.length) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.FORCE_ACCEPTED_BLOCKERS, count: result.carriedBlockers.length })
+  }
+  // Check unresolved reconcile conflicts (F6)
+  if (result.reconcile && result.reconcile.consistent === false && (result.reconcile.conflicts || []).length > 0) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.UNRESOLVED_RECONCILE, conflicts: result.reconcile.conflicts.length })
+  }
+  var ready = degradation.length === 0
+  var reason = ready ? DESIGN_READINESS_REASONS.ALL_CLEAR : degradation[0].type
+  return { ready: ready, reason: reason, degradation: degradation }
+}
+
 // Verify two projections are identical. Used to enforce the invariant that
 // handoff and status report the same data.
 function projectionsMatch(a, b) {
@@ -205,4 +243,4 @@ function readinessSummary(projection) {
   return lines.join('\n')
 }
 
-export { READINESS_REASONS, deriveExtractReadiness, projectStatusProjection, projectionsMatch, readinessSummary, countLifecycleStates }
+export { READINESS_REASONS, deriveExtractReadiness, projectStatusProjection, projectionsMatch, readinessSummary, countLifecycleStates, DESIGN_READINESS_REASONS, deriveDesignReadiness }

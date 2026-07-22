@@ -11,7 +11,7 @@ import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectRevie
 import { extractSlice, writeSystemOverview } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
 import { runTests } from './test-run.mjs'
-import { safeAgent, flexibleAgent, renderTelemetrySummary } from './agent-core.mjs'
+import { safeAgent, flexibleAgent, renderTelemetrySummary, recordDegradationEvent, degradationLogSummary } from './agent-core.mjs'
 import { reviewLoop, enhancePrompt } from './review-loop.mjs'
 import { runQuickDecider, runGoalkeeper, appendDecisionLog, writeOpenQuestions, writeFailedLaunch, LOOPBACK_FLAG_MAP, clearGateAndDownstream, normalizeGateTarget, resetStageForRerun, applyApprovalDecision, detectOwnershipViolations, compactList } from './decisions.mjs'
 import { createBudgetLimits, createBudgetAccountant, setReserve, callsRemaining, admitSegment, spendBudget, canFinishNextGate, budgetSummary, RESERVE_TYPES } from './budget-admission.mjs'
@@ -20,7 +20,7 @@ import { isolateFailure, shouldContinueAfterFailure, segmentOutcome, eligibleInd
 import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIntent, acknowledgeSegment, resolveConvergence, shouldContinue, resumeCommand, continuationSummary, canAutoRelaunch } from './continuation.mjs'
 import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary } from './synthesis.mjs'
 import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport } from './observe-persist.mjs'
-import { deriveExtractReadiness, projectStatusProjection, readinessSummary } from './status-truth.mjs'
+import { deriveExtractReadiness, projectStatusProjection, readinessSummary, deriveDesignReadiness, DESIGN_READINESS_REASONS } from './status-truth.mjs'
 
 
 // ---- Script body -----------------------------------------------------------
@@ -578,6 +578,7 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       continuationState: null, // monotonic segment tracking + idempotency keys
       budgetAccountant: null, // characterized budget admission with non-spendable reserve
       attemptHistory: null, // per-gate/per-feature retry attempt journal
+      _degradationLog: [], // DHIST-01: durable journal of fail-forward/retry/escalation/fallback events
       // Phase 6: synthesis, persistence tracking, and truthful status projection.
       synthesisState: null, // incremental project views with selective revision invalidation
       persistenceTracker: null, // attempted-vs-durable write lifecycle tracking
@@ -2357,6 +2358,13 @@ ${JSON.stringify(review.blockers, null, 2)}`
         // giving up. A schema/JSON throw (safeAgent -> null) on the final plan-review gate must NOT
         // silently force-accept an unreviewed plan — exhaust retries, then hard-block (resumable).
         const ESCALATION_RETRIES = 5
+        // DYAGNI-01: ensure BLOCKER-severity YAGNI findings reach the escalation reviewer
+        // even when reconcile was disabled (TDD Enforce routes them into reconcile.conflicts).
+        var yagniBlockerContext = ''
+        if (result.reconcile && result.reconcile.conflicts) {
+          var yagniBlockers = result.reconcile.conflicts.filter(function (c) { return /\[YAGNI BLOCKER\]/.test(String(c)) })
+          if (yagniBlockers.length) yagniBlockerContext = `\nYAGNI BLOCKER findings (must be addressed):\n${JSON.stringify(yagniBlockers, null, 2)}\n`
+        }
         const escalatePrompt = (attempt) => `You are the FINAL escalation reviewer. Prior review rounds rejected this plan; the blockers they
 raised are below. Reclassify EACH: is it a TRUE plan defect (missing scope/spec/ordering/risk) or an
 IMPLEMENTATION-DETAIL (call-site wiring, individual yield/construction sites, mechanics that belong to
@@ -2368,7 +2376,7 @@ Definition: ${result.definitionPath}
 Task: ${task}
 
 Prior blockers:
-${JSON.stringify((reviewState && reviewState.blockers) || [], null, 2)}
+${JSON.stringify((reviewState && reviewState.blockers) || [], null, 2)}${yagniBlockerContext}
 
 Set accepted=true if no TRUE defects remain. Set forceAcceptable=true if every remaining blocker is
 implementation-detail. List trueDefects (genuine plan defects) and implNotes (implementer-detail) separately.${
@@ -2445,6 +2453,7 @@ malformed output.`
           result.carriedBlockers = (escalation.trueDefects || []).concat(escalation.implNotes || [])
           result.refineIterations = refineCount
           result._escalation = escalation
+          recordDegradationEvent(result, 'fail-forward', 'Review/Refine', 'escalation', 'force-accepted plan with ' + result.carriedBlockers.length + ' carried blocker(s)')
           plog(`Force-accepting plan — ${result.carriedBlockers.length} blocker(s) carried forward (impl-detail)`)
         } else {
           // Genuine TRUE plan defects → hard-block (resumable via --resume).
@@ -2511,12 +2520,16 @@ malformed output.`
           phase('Publish')
           plog('Design mode: publishing plan + architecture before design-stop')
           await publishDesign(result, planPath, task)
+          // DTERM-01: distinguish attempted from durably verified publish outcome.
+          result._publishVerified = !!(result.published && result.published.published)
           stateCheckpoint('Publish', 'done')
         }
         if (useKnowledgePersist && !result.persist) {
           phase('Persist')
           plog('Design mode: persisting findings before design-stop')
           await persistFindings(result)
+          // DTERM-01: distinguish attempted from durably verified persist outcome.
+          result._persistVerified = !!(result.persist && result.persist.persisted)
           plog(`Persist: persisted=${result.persist && result.persist.persisted}`)
           stateCheckpoint('Persist', 'done')
         }
@@ -2596,12 +2609,52 @@ malformed output.`
       }
 
       phase('Design')
+      // DREADY-01: truthful design readiness — designReady must reflect actual gate outcomes.
+      // Check for hidden degradation (fail-forwarded reviews, force-accepted blockers,
+      // unresolved reconcile conflicts) before advertising readiness.
+      var designReadiness = deriveDesignReadiness(result)
+      // DQUEST-01: unresolved open questions block completion unless explicitly deferred.
+      if (result.openQuestionsPath && !(result._openQuestionsDeferred || []).length) {
+        designReadiness = {
+          ready: false,
+          reason: 'unresolved-open-questions',
+          degradation: (designReadiness.degradation || []).concat([{ type: 'unresolved-open-questions', path: result.openQuestionsPath }]),
+        }
+      }
+      if (!designReadiness.ready) {
+        result.designReady = false
+        result.designReadinessBlocker = designReadiness.reason
+        result.designReadinessDegradation = designReadiness.degradation
+        var degrSummary = designReadiness.degradation.map(function (d) { return d.type }).join(', ')
+        result.handoff = {
+          from: 'design',
+          message: `Design NOT ready — degraded: ${degrSummary}. Resolve the flagged issues and re-run: /design-feature --resume ${planDir}`,
+          nextMode: 'design',
+          planDir,
+          degradationDetail: designReadiness.degradation,
+          degradationLog: result._degradationLog || [],
+        }
+        stateCheckpoint('Design', 'degraded')
+        plog(`Design mode: NOT ready — ${degrSummary}`)
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
       result.designReady = true
+      // DCHUNK-01: surface chunker degradation as an explicit acknowledged outcome.
+      var chunkerWarning = result._chunkerDegraded && !result._chunkerDegradationAcknowledged
+        ? ' WARNING: plan chunker degraded to a single stage — stage-level parallelism and resumability are lost.'
+        : ''
+      // DHIST-01: include degradation log summary in handoff for inspection.
+      var degrLogSummary = degradationLogSummary(result._degradationLog)
+      var degrLine = degrLogSummary ? ` Degradation events: ${degrLogSummary}.` : ''
       result.handoff = {
         from: 'design',
-        message: `Design ready${result.designApproved && result.designApproved.approved ? ' (user-approved)' : ''}. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}`,
+        message: `Design ready${result.designApproved && result.designApproved.approved ? ' (user-approved)' : ''}. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}.${chunkerWarning}${degrLine}`,
         nextMode: 'implement',
         planDir,
+        degradationLog: result._degradationLog || [],
+        chunkerDegraded: !!result._chunkerDegraded,
       }
       stateCheckpoint('Design', 'done')
       plog(`Design mode: designReady=true — stopping pre-execute (stages=${result.stages.length})`)
@@ -3156,6 +3209,8 @@ Do NOT include formatting nits unless they change meaning.`,
     phase('Publish')
     plog('Publishing plan + architecture to project docs')
     await publishDesign(result, planPath, task)
+    // DTERM-01: distinguish attempted from durably verified publish outcome.
+    result._publishVerified = !!(result.published && result.published.published)
     stateCheckpoint('Publish', 'done')
   }
 
@@ -3187,6 +3242,16 @@ Use a clear conventional-commit message. Return the commit hash.`,
     result.committed = !!(commit && commit.committed)
     result.commitHash = commit ? commit.commitHash : null
     plog(`Commit: committed=${result.committed}; hash=${result.commitHash || '(none)'}`)
+    // DTERM-01: a failed commit is never reported as terminal success.
+    if (!result.committed) {
+      result.blockedAt = 'commit-failed'
+      recordDegradationEvent(result, 'fail-forward', 'Commit', 'git-ops', 'commit attempt failed')
+      stateCheckpoint('Commit', 'blocked')
+      result.retryUsed = retryState.used
+      logTelemetrySummary()
+      await consolidate(slug, result, config)
+      return result
+    }
   }
 
     // Reflect the true terminal gate in the persisted state and flush once more

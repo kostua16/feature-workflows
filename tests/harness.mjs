@@ -201,6 +201,10 @@ const CANDIDATES = [
   'projectionsMatch',
   'readinessSummary',
   'countLifecycleStates',
+  'DESIGN_READINESS_REASONS',
+  'deriveDesignReadiness',
+  'recordDegradationEvent',
+  'degradationLogSummary',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

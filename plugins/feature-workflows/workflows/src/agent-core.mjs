@@ -132,6 +132,27 @@ function agentCircuitOpen(opts, result) {
   return !!(failures && failures.circuitOpen)
 }
 
+// Record a degradation event into the durable journal (DHIST-01).
+// Types: 'fail-forward' | 'retry' | 'escalation' | 'fallback'.
+// Each entry is sequentially numbered for inspection through handoff/status.
+function recordDegradationEvent(result, type, gate, label, reason) {
+  if (!result) return
+  if (!result._degradationLog) result._degradationLog = []
+  var seq = result._degradationLog.length + 1
+  result._degradationLog.push({ seq: seq, type: type, gate: gate || 'unknown', label: label || 'agent', reason: reason || '' })
+}
+
+// Summarize the degradation log for handoff/status display. Pure helper.
+function degradationLogSummary(log) {
+  if (!log || !log.length) return ''
+  var byType = {}
+  for (var i = 0; i < log.length; i++) {
+    var t = log[i].type
+    byType[t] = (byType[t] || 0) + 1
+  }
+  return Object.keys(byType).map(function (t) { return t + '=' + byType[t] }).join(', ')
+}
+
 function recordAgentFailure(result, opts, reason) {
   if (!result) return 0
   const key = agentFailureKey(opts)
@@ -144,8 +165,13 @@ function recordAgentFailure(result, opts, reason) {
   if (!result.degradationTelemetry) result.degradationTelemetry = { fallbacks: 0, escalations: 0, languageViolations: 0, circuitBreakers: 0 }
   result.degradationTelemetry.fallbacks += 1
   bumpGateTelemetry(result, opts, 'fallback')
+  // Journal each degradation event for durable attempt-history inspection (DHIST-01)
+  recordDegradationEvent(result, 'fallback', opts && opts.phase, opts && opts.label, reason)
   if (reason === 'non-English verdict') result.degradationTelemetry.languageViolations += 1
-  if (current.count === 2) result.degradationTelemetry.escalations += 1
+  if (current.count === 2) {
+    result.degradationTelemetry.escalations += 1
+    recordDegradationEvent(result, 'escalation', opts && opts.phase, opts && opts.label, 'model escalated after 2 failures')
+  }
   if (current.circuitOpen) result.degradationTelemetry.circuitBreakers += 1
   if (Array.isArray(result.logLines)) {
     result.logLines.push(`WARNING: agent "${opts && opts.label}" failure ${current.count}/${IDENTICAL_FAILURE_LIMIT}: ${reason}${current.circuitOpen ? ' (circuit open)' : ''}`)
@@ -383,4 +409,4 @@ function reasoningSaysStop(text) {
   return false
 }
 
-export { safeAgent, flexibleAgent, normalizeAgentOutput, fallbackForAgent, escalateAgentOpts, agentCircuitOpen, recordAgentFailure, agentFailureKey, bumpGateTelemetry, renderTelemetrySummary, outputLanguageViolation, callAgentWithWatchdog, recordAgentWatchdog, hardenForModel, schemaExample, normalizeVerdict, normalizeEnum, verdictContradiction, countItems, reasoningSaysStop }
+export { safeAgent, flexibleAgent, normalizeAgentOutput, fallbackForAgent, escalateAgentOpts, agentCircuitOpen, recordAgentFailure, agentFailureKey, bumpGateTelemetry, renderTelemetrySummary, outputLanguageViolation, callAgentWithWatchdog, recordAgentWatchdog, hardenForModel, schemaExample, normalizeVerdict, normalizeEnum, verdictContradiction, countItems, reasoningSaysStop, recordDegradationEvent, degradationLogSummary }
