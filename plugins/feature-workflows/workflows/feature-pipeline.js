@@ -5885,7 +5885,7 @@ function agentCircuitOpen(opts, result) {
 // Types: 'fail-forward' | 'retry' | 'escalation' | 'fallback'.
 // Each entry is sequentially numbered for inspection through handoff/status.
 function recordDegradationEvent(result, type, gate, label, reason) {
-  if (!result) return
+  if (!result || typeof result !== 'object') return
   if (!result._degradationLog) result._degradationLog = []
   var seq = result._degradationLog.length + 1
   result._degradationLog.push({ seq: seq, type: type, gate: gate || 'unknown', label: label || 'agent', reason: reason || '' })
