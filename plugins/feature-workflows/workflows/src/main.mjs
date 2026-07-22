@@ -208,6 +208,29 @@ async function main() {
     callPerGate: args && args.designCallPerGate,
     callPerRun: args && args.designCallPerRun,
   })
+  // DBUDGET-01: per-gate budget admission gate. Returns true if the caller must
+  // block (budget exhausted); false if admitted (spend recorded). The non-spendable
+  // HANDOFF reserve is protected by callsRemaining inside canAdmitDesignGate.
+  async function designBudgetGate(r, gateName) {
+    var admit = canAdmitDesignGate(designBudget, gateName, { calls: 1 })
+    if (admit.admitted) {
+      designBudget = spendDesignGate(designBudget, gateName, 1, 0)
+      return false
+    }
+    r.blockedAt = 'design-budget-exhausted'
+    r._designBudget = designBudgetSummary(designBudget)
+    r._loopBudgets = loopBudgetSummary(loopBudgets)
+    r.handoff = {
+      from: 'design',
+      message: `Design budget exhausted at gate '${gateName}' (${admit.reason}; gate remaining: ${admit.remaining.gate}, run remaining: ${admit.remaining.run}). Re-run with --resume ${planDir} or increase args.designCallPerRun.`,
+      nextMode: 'design',
+      planDir,
+    }
+    stateCheckpoint(gateName, 'budget-exhausted')
+    logTelemetrySummary()
+    await consolidate(slug, r, config)
+    return true
+  }
   const autoCommit = !!(args && args.autoCommit)
   const testTarget = (args && args.testTarget) || '' // empty => whole suite
   // IM-4: stack-agnostic test gate. --test-cmd pins an exact command; --test-framework
@@ -1563,6 +1586,7 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
     plog('resume: skip Define (definitionPath set)')
   } else {
     plog('Producing task definition')
+    if (await designBudgetGate(result, 'Define')) return result
     definition = await flexibleAgent(
       `You are the task-definition-architect agent. Turn this raw task sketch into a rigorous
 task definition and write it to ${definitionPath}.
@@ -1685,6 +1709,7 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
     } else {
       phase('Knowledge')
       plog('Consulting project knowledge')
+      if (await designBudgetGate(result, 'Knowledge')) return result
       try {
         const knowledge = await flexibleAgent(
           `You are the project-knowledge-consultant agent. Consult the project knowledge and findings
@@ -1723,6 +1748,7 @@ Return a concise brief the architecture + detailed-design agents can consume. Do
     } else {
       phase('Codebase Facts')
       plog('Gathering codebase facts via code-explorer')
+      if (await designBudgetGate(result, 'Codebase Facts')) return result
       try {
         const facts = await safeAgent(
           `You are the code-explorer agent. Explore the codebase to gather STRUCTURE FACTS for this task
@@ -1774,6 +1800,7 @@ or commit. Return the path + a concise summary of the most important facts.`,
       phase('E2E Use Cases')
       const useCasePath = planDir + 'e2e-use-cases.md'
       plog('Extracting end-to-end use cases')
+      if (await designBudgetGate(result, 'E2E Use Cases')) return result
       const useCases = await flexibleAgent(
         `You are the e2e-usecase-extractor agent. Identify and define end-to-end use cases / test
 scenarios for this task and write them to ${useCasePath}. Consume the idea doc at
@@ -1833,6 +1860,7 @@ mem:conventions first. Do NOT commit.`,
       phase('Requirements')
       const requirementsPath = planDir + 'requirements.md'
       plog('Collecting FRs + NFRs')
+      if (await designBudgetGate(result, 'Requirements')) return result
       const requirements = await safeAgent(
         `You are the requirements-collector agent. Collect and structure the functional (FRs) and
 non-functional (NFRs) requirements for this task and write them to ${requirementsPath}. Consume the
@@ -1915,6 +1943,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       } else {
         phase('Architecture')
         plog('Producing high-level architecture design')
+        if (await designBudgetGate(result, 'Architecture')) return result
         const arch = await flexibleAgent(
           `You are the arch-design-orchestrator agent. Produce a high-level architecture design for this task
 and write it to ${archPath}. Consume the idea doc at ${result.definitionPath}${requirementsContext ? ', the requirements at ' + result.requirementsPath : ''} (its NFRs are your input contract).
@@ -1982,6 +2011,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       } else {
         phase('Detailed Design')
         plog('Producing detailed design')
+        if (await designBudgetGate(result, 'Detailed Design')) return result
         const design = await flexibleAgent(
           `You are the detailed-design-architect agent. Produce an implementation-ready detailed design for this task
 and write it to ${designPath}. Consume the high-level architecture at ${result.archPath || '(none — infer from idea doc)'},
@@ -2051,6 +2081,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
     } else {
       phase('Plan')
       plog('Producing plan')
+      if (await designBudgetGate(result, 'Plan')) return result
       plan = await flexibleAgent(
         `You are the plan-architect agent. Create (or update) the implementation plan at ${planPath}
 for this task. Consume the task definition at ${result.definitionPath} as the input contract.
@@ -2100,6 +2131,7 @@ single-lane execution). If the work is not cleanly separable, emit exactly ONE l
       } else {
         phase('TDD Enforce')
         plog('Enforcing TDD + YAGNI on plan')
+        if (await designBudgetGate(result, 'TDD Enforce')) return result
         const tdd = await flexibleAgent(
           `You are the tdd-plan-enforcer agent. Harden the plan at ${planPath} IN PLACE with TDD and YAGNI discipline.
 Add TDD gates (RED: tests to write first and watch fail; GREEN: per-feature success criteria; integration;
@@ -2153,6 +2185,7 @@ mem:suggested_commands before enforcing. Do NOT commit.`,
     } else {
       phase('Reconcile')
       plog('Reconciling plan against design artifacts')
+      if (await designBudgetGate(result, 'Reconcile')) return result
       const reconcile = await flexibleAgent(
         `You are the design-plan-reconciler agent. Compare the plan at ${planPath} against the design
 artifacts: architecture at ${result.archPath || '(none)'}, detailed design at ${result.designPath || '(none)'},
@@ -2287,6 +2320,7 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
       while (!reviewState.accepted && refineCount < refineSubcap && !loopBudgetExhausted(loopBudgets, 'refine')) {
         phase('Review/Refine')
         plog(`Review iteration ${refineCount + 1} (refine loop budget ${loopBudgets.refine.used}/${loopBudgets.refine.cap})`)
+        if (await designBudgetGate(result, 'Review/Refine')) return result
         const review = await safeAgent(
           `You are the critical-reviewer agent. Review the plan at ${planPath} against the task
 definition at ${result.definitionPath}. Task:
@@ -2505,6 +2539,7 @@ malformed output.`
       if (useChunker) {
         phase('Chunk Plan')
         plog('Chunking plan into stages (design tail)')
+        if (await designBudgetGate(result, 'Chunk Plan')) return result
         const stages = await chunkPlanIntoStages({ planPath, planDir, task, result, lanes: result.lanes })
         result.stages = stages
         plog(`plan-chunker: ${stages.length} stage(s) — ${stages.map((s) => s.id).join(', ')}`)

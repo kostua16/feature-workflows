@@ -358,3 +358,74 @@ test('NYQ-WIRE: dist references designBudgetSummary function', () => {
 test('NYQ-WIRE: dist references loopBudgetSummary function', () => {
   assert.ok(distSource.includes('loopBudgetSummary'), 'dist must call loopBudgetSummary')
 })
+
+// ========== DBUDGET-01 enforcement wiring (designBudgetGate) ==========
+
+test('NYQ-ENFORCE: dist defines designBudgetGate helper function', () => {
+  assert.ok(
+    /async\s+function\s+designBudgetGate\s*\(/.test(distSource),
+    'dist must define the designBudgetGate async helper'
+  )
+})
+
+test('NYQ-ENFORCE: designBudgetGate calls canAdmitDesignGate (admission check)', () => {
+  assert.ok(
+    distSource.includes('canAdmitDesignGate(designBudget'),
+    'designBudgetGate must call canAdmitDesignGate to check per-gate/per-run admission'
+  )
+})
+
+test('NYQ-ENFORCE: designBudgetGate calls spendDesignGate (spend recording)', () => {
+  assert.ok(
+    distSource.includes('spendDesignGate(designBudget'),
+    'designBudgetGate must call spendDesignGate to record actual gate spend'
+  )
+})
+
+test('NYQ-ENFORCE: dist calls designBudgetGate before Define gate agent', () => {
+  assert.ok(
+    /designBudgetGate\(result,\s*['"]Define['"]\)/.test(distSource),
+    'dist must check design budget before Define gate'
+  )
+})
+
+test('NYQ-ENFORCE: dist calls designBudgetGate before Plan gate agent', () => {
+  assert.ok(
+    /designBudgetGate\(result,\s*['"]Plan['"]\)/.test(distSource),
+    'dist must check design budget before Plan gate'
+  )
+})
+
+test('NYQ-ENFORCE: dist calls designBudgetGate before Architecture gate agent', () => {
+  assert.ok(
+    /designBudgetGate\(result,\s*['"]Architecture['"]\)/.test(distSource),
+    'dist must check design budget before Architecture gate'
+  )
+})
+
+test('NYQ-ENFORCE: dist calls designBudgetGate before Review/Refine gate agent', () => {
+  assert.ok(
+    /designBudgetGate\(result,\s*['"]Review\/Refine['"]\)/.test(distSource),
+    'dist must check design budget before Review/Refine gate'
+  )
+})
+
+test('NYQ-ENFORCE: dist calls designBudgetGate before Reconcile gate agent', () => {
+  assert.ok(
+    /designBudgetGate\(result,\s*['"]Reconcile['"]\)/.test(distSource),
+    'dist must check design budget before Reconcile gate'
+  )
+})
+
+test('NYQ-ENFORCE: dist blocks with design-budget-exhausted on denial', () => {
+  assert.ok(
+    distSource.includes("design-budget-exhausted"),
+    'designBudgetGate must set blockedAt to design-budget-exhausted on denial'
+  )
+})
+
+test('NYQ-ENFORCE: designBudgetGate is called at 12+ design gates', () => {
+  const matches = distSource.match(/designBudgetGate\(result,\s*['"][^'"]+['"]\)/g)
+  assert.ok(matches && matches.length >= 12,
+    `dist must call designBudgetGate at >= 12 design gates (found ${matches ? matches.length : 0})`)
+})
