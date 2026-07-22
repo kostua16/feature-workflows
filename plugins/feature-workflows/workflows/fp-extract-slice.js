@@ -1003,6 +1003,7 @@ const RETRY_BUDGET_DEFAULT = 20
 const REFINE_SUBCAP_DEFAULT = 10   // soft per-loop cap on plan refine iterations
 const DEBUG_SUBCAP_DEFAULT = 20    // soft per-loop cap on gsd-debug fix+retest
 const RECONCILE_SUBCAP_DEFAULT = 5 // soft per-loop cap on reconcile design-fix iterations
+const ESCALATION_RETRIES_DEFAULT = 5 // configurable cap on plan-review escalation retries (DLOOP-01)
 const DECISION_CAP_DEFAULT = 50   // Phase E1: hard runaway cap on authoritative decision-agent calls
 const AGENT_TIMEOUT_MS_DEFAULT = 10 * 60 * 1000
 const AGENT_MAX_OUTPUT_CHARS_DEFAULT = 200000
@@ -6320,7 +6321,7 @@ async function reviewLoop({
       revisePrompt = await enhancePrompt({
         gateKey: `${phaseLabel}-revise`,
         basePrompt: revisePrompt,
-        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${JSON.stringify(review.blockers).slice(0, 600)}; gaps: ${JSON.stringify(review.gaps).slice(0, 400)}`,
+        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${compactList(review.blockers, 8)}; gaps: ${compactList(review.gaps, 8)}`,
         intent: 'improve-design',
         result, planDir, useEnhancer,
       })
@@ -6767,6 +6768,145 @@ function compactList(items, max = 5) {
   const extra = arr.length - shown.length
   const body = shown.map((s) => `- ${s}`).join('\n')
   return extra > 0 ? `${body}\n- (+${extra} more — see the on-disk artifact)` : (body || '- (none)')
+}
+
+// Design-mode per-gate/per-run call/token budget enforcement (DBUDGET-01).
+// Wraps the Phase 5 budget-admission primitive with per-gate tracking so design
+// runs enforce real budgets instead of merely observing via gateTelemetry.
+// Non-spendable reserve for state flush/handoff is carved out and never consumed
+// by gate work. All functions are pure and deterministic — no I/O, no side effects.
+
+// Default budget caps derived from gateTelemetry characterization, not guessed.
+// callPerGate: max agent calls a single design gate may consume.
+// callPerRun: max total agent calls across the entire design run.
+// tokenPerGate/tokenPerRun: 0 = uncharacterized (call-only enforcement).
+const DESIGN_BUDGET_DEFAULTS = Object.freeze({
+  callPerGate: 8,
+  callPerRun: 200,
+  tokenPerGate: 0,
+  tokenPerRun: 0,
+})
+
+// Non-spendable reserve for state persistence and handoff — never consumed by gate work.
+const DESIGN_RESERVE_CALLS = 10
+
+// Create a design-mode budget accountant wrapping the Phase 5 pattern with per-gate tracking.
+// opts can override defaults (from args.designCallPerGate / args.designCallPerRun).
+function createDesignBudget(opts) {
+  const o = opts || {}
+  const limits = createBudgetLimits({
+    callCeiling: o.callPerRun || DESIGN_BUDGET_DEFAULTS.callPerRun,
+    tokenCeiling: o.tokenPerRun || DESIGN_BUDGET_DEFAULTS.tokenPerRun,
+  })
+  let accountant = createBudgetAccountant(limits)
+  accountant = setReserve(accountant, RESERVE_TYPES.HANDOFF, DESIGN_RESERVE_CALLS)
+  return {
+    accountant,
+    gateSpend: {},
+    caps: {
+      callPerGate: o.callPerGate || DESIGN_BUDGET_DEFAULTS.callPerGate,
+      tokenPerGate: o.tokenPerGate || DESIGN_BUDGET_DEFAULTS.tokenPerGate,
+    },
+  }
+}
+
+// Record actual spend for a design gate. Pure: returns a new budget object.
+function spendDesignGate(budget, gateName, calls, tokens) {
+  const prev = (budget.gateSpend && budget.gateSpend[gateName]) || { calls: 0, tokens: 0 }
+  return {
+    accountant: spendBudget(budget.accountant, calls, tokens),
+    gateSpend: {
+      ...budget.gateSpend,
+      [gateName]: {
+        calls: prev.calls + (calls || 0),
+        tokens: prev.tokens + (tokens || 0),
+      },
+    },
+    caps: { ...budget.caps },
+  }
+}
+
+// Remaining calls for a specific gate (per-gate cap minus spent).
+function gateCallsRemaining(budget, gateName) {
+  const spent = (budget.gateSpend && budget.gateSpend[gateName]) || { calls: 0 }
+  return Math.max(0, budget.caps.callPerGate - spent.calls)
+}
+
+// Check if a gate can be admitted within its per-gate cap AND the per-run ceiling.
+// estimatedCost: { calls, tokens } the gate is expected to consume.
+function canAdmitDesignGate(budget, gateName, estimatedCost) {
+  const gateCalls = gateCallsRemaining(budget, gateName)
+  const runCalls = callsRemaining(budget.accountant)
+  const neededCalls = (estimatedCost && estimatedCost.calls) || 0
+  if (neededCalls > gateCalls) {
+    return { admitted: false, reason: 'per-gate-cap', remaining: { gate: gateCalls, run: runCalls } }
+  }
+  if (neededCalls > runCalls) {
+    return { admitted: false, reason: 'per-run-cap', remaining: { gate: gateCalls, run: runCalls } }
+  }
+  return { admitted: true, remaining: { gate: gateCalls, run: runCalls } }
+}
+
+// Budget summary for handoff/status reporting. Merges the Phase 5 budgetSummary
+// with per-gate spend detail and the caps in effect.
+function designBudgetSummary(budget) {
+  const base = budgetSummary(budget.accountant)
+  return {
+    ...base,
+    gateSpend: { ...budget.gateSpend },
+    caps: { ...budget.caps },
+  }
+}
+
+// Per-loop sub-budget tracker for design review/refine loops (DLOOP-01).
+//
+// Each design review/refine loop (refine, reconcile, debug, escalation) gets its
+// OWN bounded sub-budget so early-loop spend cannot starve later gates or
+// escalation. This replaces the F12 defect where all four loops drew from the
+// single shared retryState counter. The shared retryState remains as a secondary
+// runaway guard, but the PRIMARY iteration limit for each loop is its own cap.
+//
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Create per-loop budget tracker. Each loop gets its own {used, cap} pool.
+// config overrides come from args (maxRefineIterations, maxReconcileIterations,
+// maxDebugRetries, maxEscalationRetries).
+function createLoopBudgets(config) {
+  const c = config || {}
+  return {
+    refine: { used: 0, cap: c.refineCap || REFINE_SUBCAP_DEFAULT },
+    reconcile: { used: 0, cap: c.reconcileCap || RECONCILE_SUBCAP_DEFAULT },
+    debug: { used: 0, cap: c.debugCap || DEBUG_SUBCAP_DEFAULT },
+    escalation: { used: 0, cap: c.escalationCap || ESCALATION_RETRIES_DEFAULT },
+  }
+}
+
+// Increment a single loop's used counter. Pure: returns a new budgets object.
+function spendLoop(budgets, loopName) {
+  const b = budgets && budgets[loopName]
+  if (!b) return budgets
+  return {
+    ...budgets,
+    [loopName]: { used: b.used + 1, cap: b.cap },
+  }
+}
+
+// Check if a specific loop has exhausted its own sub-budget.
+function loopBudgetExhausted(budgets, loopName) {
+  const b = budgets && budgets[loopName]
+  if (!b) return true
+  return b.used >= b.cap
+}
+
+// Summary of all loop budgets for handoff/status reporting.
+function loopBudgetSummary(budgets) {
+  if (!budgets) return {}
+  const out = {}
+  for (const name of Object.keys(budgets)) {
+    const b = budgets[name]
+    out[name] = { used: b.used, cap: b.cap, remaining: Math.max(0, b.cap - b.used) }
+  }
+  return out
 }
 
 // extractSliceMain: the leaf entry point for the fp-extract-slice workflow.

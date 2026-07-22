@@ -1,7 +1,7 @@
 import { FILE_ACK, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT } from './schemas.mjs'
 import { nsAgent, budgetExhausted, spendRetry, gm } from './config.mjs'
 import { safeAgent, recordDegradationEvent } from './agent-core.mjs'
-import { runQuickDecider, verifyAppendGrowth } from './decisions.mjs'
+import { runQuickDecider, verifyAppendGrowth, compactList } from './decisions.mjs'
 
 
 // Append a review verdict to <planDir>/review-history.md (Phase C2 persistence). Non-blocking.
@@ -127,7 +127,7 @@ async function reviewLoop({
       revisePrompt = await enhancePrompt({
         gateKey: `${phaseLabel}-revise`,
         basePrompt: revisePrompt,
-        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${JSON.stringify(review.blockers).slice(0, 600)}; gaps: ${JSON.stringify(review.gaps).slice(0, 400)}`,
+        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${compactList(review.blockers, 8)}; gaps: ${compactList(review.gaps, 8)}`,
         intent: 'improve-design',
         result, planDir, useEnhancer,
       })

@@ -205,6 +205,19 @@ const CANDIDATES = [
   'deriveDesignReadiness',
   'recordDegradationEvent',
   'degradationLogSummary',
+  // Phase 10 — design-mode bounded budgets and prompt context
+  'DESIGN_BUDGET_DEFAULTS',
+  'DESIGN_RESERVE_CALLS',
+  'createDesignBudget',
+  'spendDesignGate',
+  'gateCallsRemaining',
+  'canAdmitDesignGate',
+  'designBudgetSummary',
+  'createLoopBudgets',
+  'spendLoop',
+  'loopBudgetExhausted',
+  'loopBudgetSummary',
+  'ESCALATION_RETRIES_DEFAULT',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

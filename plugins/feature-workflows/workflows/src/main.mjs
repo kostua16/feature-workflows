@@ -1,6 +1,6 @@
 import { ENGINE_VERSION } from './engine-version.mjs'
 import { DEFINE_VERDICT, TRANSLATOR_VERDICT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, RECONCILE_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT } from './schemas.mjs'
-import { RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECONCILE_SUBCAP_DEFAULT, DECISION_CAP_DEFAULT, resolveProfile, resolveConfigFlag, profileDefault, resolveUseTestWriter, retryState, budgetExhausted, spendRetry, hydrateBudget, decisionState, decisionBudgetExhausted, gm, resolveMode, gateModeActive } from './config.mjs'
+import { RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECONCILE_SUBCAP_DEFAULT, ESCALATION_RETRIES_DEFAULT, DECISION_CAP_DEFAULT, resolveProfile, resolveConfigFlag, profileDefault, resolveUseTestWriter, retryState, budgetExhausted, spendRetry, hydrateBudget, decisionState, decisionBudgetExhausted, gm, resolveMode, gateModeActive } from './config.mjs'
 import { taskSlug, categorizeSlug, jiraIdFromTask, detectNonEnglish } from './text-utils.mjs'
 import { consolidate, writeChunkedFile, validatePipelineState, renderStatusReport, flushPipelineState, flushPipelineStateWithSnapshot, loadPipelineState, loadPipelineStateWithRecovery, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew } from './state.mjs'
 import { computeContentDigest } from './revision.mjs'
@@ -21,6 +21,8 @@ import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIn
 import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary } from './synthesis.mjs'
 import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport } from './observe-persist.mjs'
 import { deriveExtractReadiness, projectStatusProjection, readinessSummary, deriveDesignReadiness, DESIGN_READINESS_REASONS } from './status-truth.mjs'
+import { createDesignBudget, spendDesignGate, gateCallsRemaining, canAdmitDesignGate, designBudgetSummary, DESIGN_BUDGET_DEFAULTS } from './design-budget.mjs'
+import { createLoopBudgets, spendLoop, loopBudgetExhausted, loopBudgetSummary } from './design-loops.mjs'
 
 
 // ---- Script body -----------------------------------------------------------
@@ -190,7 +192,22 @@ async function main() {
   const refineSubcap = (args && args.maxRefineIterations) || REFINE_SUBCAP_DEFAULT
   const debugSubcap = (args && args.maxDebugRetries) || DEBUG_SUBCAP_DEFAULT
   const reconcileSubcap = (args && args.maxReconcileIterations) || RECONCILE_SUBCAP_DEFAULT
+  const escalationCap = (args && args.maxEscalationRetries) || ESCALATION_RETRIES_DEFAULT
   const decisionCap = (args && args.decisionCap) || DECISION_CAP_DEFAULT
+  // DLOOP-01: per-loop sub-budgets so early-loop spend cannot starve later loops.
+  // The shared retryState remains as a secondary runaway guard.
+  let loopBudgets = createLoopBudgets({
+    refineCap: refineSubcap,
+    reconcileCap: reconcileSubcap,
+    debugCap: debugSubcap,
+    escalationCap: escalationCap,
+  })
+  // DBUDGET-01: per-gate/per-run call/token budget enforcement with non-spendable
+  // reserve for state flush/handoff (wraps the Phase 5 budget-admission pattern).
+  let designBudget = createDesignBudget({
+    callPerGate: args && args.designCallPerGate,
+    callPerRun: args && args.designCallPerRun,
+  })
   const autoCommit = !!(args && args.autoCommit)
   const testTarget = (args && args.testTarget) || '' // empty => whole suite
   // IM-4: stack-agnostic test gate. --test-cmd pins an exact command; --test-framework
@@ -2125,7 +2142,7 @@ mem:suggested_commands before enforcing. Do NOT commit.`,
     if (result.reconcile) {
       plog('resume: skip Reconcile (reconcile set)')
       reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-        ? `Reconcile conflicts to re-check: ${JSON.stringify(result.reconcile.conflicts)}\n`
+        ? `Reconcile conflicts to re-check: ${compactList(result.reconcile.conflicts, 8)}\n`
         : ''
     } else if (!useReconcile) {
       stateCheckpoint('Reconcile', 'skipped')
@@ -2149,7 +2166,7 @@ ${task}`,
       // self-reported flag (which could be true over live conflicts). Conflict count is truth.
       result.reconcile.consistent = (result.reconcile.conflicts || []).length === 0
       reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-        ? `Reconcile conflicts (address in review): ${JSON.stringify(result.reconcile.conflicts)}\n`
+        ? `Reconcile conflicts (address in review): ${compactList(result.reconcile.conflicts, 8)}\n`
         : ''
       plog(`Reconcile: consistent=${result.reconcile.consistent}; conflicts=${(result.reconcile.conflicts || []).length}; designAtFault=${!!result.reconcile.designAtFault}`)
 
@@ -2161,7 +2178,7 @@ ${task}`,
       // either limit the (still-conflicting) design is carried forward into review.
       let reconcileIterations = 0
       while (result.reconcile.designAtFault && (result.reconcile.designFixes || []).length
-             && reconcileIterations < reconcileSubcap && !budgetExhausted(retryBudget)) {
+             && reconcileIterations < reconcileSubcap && !loopBudgetExhausted(loopBudgets, 'reconcile')) {
         // Phase E2: once already looping (reconcileIterations >= 1), ask quick-decider whether
         // another design-fix cycle is worth it before spending budget. 'stop' carries the
         // still-conflicting design forward into review (reconcile never hard-blocks). null -> stop.
@@ -2173,7 +2190,7 @@ ${task}`,
               iterations: reconcileIterations,
               subcap: reconcileSubcap,
               retryBudget,
-              lastFailure: `Reconcile design-fix loop still flags the DESIGN at fault after ${reconcileIterations} fix iteration(s). Remaining design defects: ${JSON.stringify(result.reconcile.designFixes || []).slice(0, 800)}`,
+              lastFailure: `Reconcile design-fix loop still flags the DESIGN at fault after ${reconcileIterations} fix iteration(s). Remaining design defects: ${compactList(result.reconcile.designFixes || [], 8)}`,
             },
           })
           if (decide === 'stop') {
@@ -2181,9 +2198,9 @@ ${task}`,
             break
           }
         }
-        spendRetry(1)
+        loopBudgets = spendLoop(loopBudgets, 'reconcile')
         reconcileIterations += 1
-        plog(`Reconcile: design at fault — fixing architecture (${result.reconcile.designFixes.length} defect(s); fix ${reconcileIterations}/${reconcileSubcap}, retries used ${retryState.used}/${retryBudget})`)
+        plog(`Reconcile: design at fault — fixing architecture (${result.reconcile.designFixes.length} defect(s); fix ${reconcileIterations}/${reconcileSubcap}, loop budget ${loopBudgets.reconcile.used}/${loopBudgets.reconcile.cap})`)
         phase('Architecture')
         let archFixPrompt = `You are the arch-design-orchestrator agent. The design-plan-reconciler found the DESIGN
 (not the plan) is the source of conflict. Fix the architecture design at ${result.archPath || archPath}
@@ -2202,7 +2219,7 @@ Do NOT commit.`
           archFixPrompt = await enhancePrompt({
             gateKey: 'reconcile-archfix',
             basePrompt: archFixPrompt,
-            failureContext: `Reconcile design-fix iteration ${reconcileIterations}: prior architecture fix did not resolve conflicts. Remaining design defects: ${JSON.stringify(result.reconcile.designFixes).slice(0, 800)}`,
+            failureContext: `Reconcile design-fix iteration ${reconcileIterations}: prior architecture fix did not resolve conflicts. Remaining design defects: ${compactList(result.reconcile.designFixes, 8)}`,
             intent: 'improve-design',
             result, planDir, useEnhancer,
           })
@@ -2237,14 +2254,14 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
         // F7: re-derive consistent from conflict count after the design-fix re-reconcile.
         result.reconcile.consistent = (result.reconcile.conflicts || []).length === 0
         reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-          ? `Reconcile conflicts (address in review): ${JSON.stringify(result.reconcile.conflicts)}\n`
+          ? `Reconcile conflicts (address in review): ${compactList(result.reconcile.conflicts, 8)}\n`
           : ''
         plog(`Reconcile: re-check consistent=${result.reconcile.consistent}; designAtFault=${!!result.reconcile.designAtFault}`)
         if (result.reconcile.consistent) break
       }
       if (result.reconcile.designAtFault) {
-        const reason = budgetExhausted(retryBudget)
-          ? `retry budget exhausted (${retryState.used}/${retryBudget})`
+        const reason = loopBudgetExhausted(loopBudgets, 'reconcile')
+          ? `reconcile loop budget exhausted (${loopBudgets.reconcile.used}/${loopBudgets.reconcile.cap})`
           : `reconcile sub-cap reached (${reconcileIterations}/${reconcileSubcap})`
         plog(`Reconcile: design-fix loop stopped — ${reason}; carrying conflict forward`)
       }
@@ -2263,9 +2280,9 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
     } else {
       let reviewState = { accepted: false }
       let refineCount = 0
-      while (!reviewState.accepted && refineCount < refineSubcap && !budgetExhausted(retryBudget)) {
+      while (!reviewState.accepted && refineCount < refineSubcap && !loopBudgetExhausted(loopBudgets, 'refine')) {
         phase('Review/Refine')
-        plog(`Review iteration ${refineCount + 1} (retries used ${retryState.used}/${retryBudget})`)
+        plog(`Review iteration ${refineCount + 1} (refine loop budget ${loopBudgets.refine.used}/${loopBudgets.refine.cap})`)
         const review = await safeAgent(
           `You are the critical-reviewer agent. Review the plan at ${planPath} against the task
 definition at ${result.definitionPath}. Task:
@@ -2281,7 +2298,7 @@ for being implementable.
 Return accepted=true iff there are NO blocker-severity findings. List blockers otherwise.`,
           { label: 'critical-reviewer(plan)', phase: 'Review/Refine', schema: REVIEW_VERDICT, model: gm('review') }, result
         )
-        spendRetry(1)
+        loopBudgets = spendLoop(loopBudgets, 'refine')
         if (!review) {
           // Reviewer agent failure is a retryable condition, not terminal.
           refineCount += 1
@@ -2306,7 +2323,7 @@ Return accepted=true iff there are NO blocker-severity findings. List blockers o
               iterations: refineCount,
               subcap: refineSubcap,
               retryBudget,
-              lastFailure: `Plan review rejected after ${refineCount} refine iteration(s). Outstanding blockers: ${JSON.stringify(review.blockers || []).slice(0, 800)}`,
+              lastFailure: `Plan review rejected after ${refineCount} refine iteration(s). Outstanding blockers: ${compactList(review.blockers || [], 8)}`,
             },
           })
           if (decide === 'stop') {
@@ -2319,12 +2336,12 @@ Return accepted=true iff there are NO blocker-severity findings. List blockers o
         let refinePrompt = `You are the plan-refiner agent. Address the following review findings on the plan at ${planPath}.
 Do not reduce scope of the pass gates.
 Findings:
-${JSON.stringify(review.blockers, null, 2)}`
+${compactList(review.blockers, 8)}`
         if (refineCount > 0) {
           refinePrompt = await enhancePrompt({
             gateKey: 'plan-refine',
             basePrompt: refinePrompt,
-            failureContext: `Prior refine iteration still rejected; review blockers not fully addressed. Review blockers: ${JSON.stringify(review.blockers).slice(0, 800)}`,
+            failureContext: `Prior refine iteration still rejected; review blockers not fully addressed. Review blockers: ${compactList(review.blockers, 8)}`,
             intent: 'improve-design',
             result, planDir, useEnhancer,
           })
@@ -2345,7 +2362,7 @@ ${JSON.stringify(review.blockers, null, 2)}`
       // defects hard-block (resumable via --resume). Real residual issues surface
       // at Test + Code-Review.
       if (!reviewState.accepted) {
-        if (budgetExhausted(retryBudget)) {
+        if (loopBudgetExhausted(loopBudgets, 'escalation')) {
           result.blockedAt = 'review'
           result.retryUsed = retryState.used
           stateCheckpoint('Review/Refine', 'blocked')
@@ -2354,16 +2371,16 @@ ${JSON.stringify(review.blockers, null, 2)}`
         }
         phase('Review/Refine')
         plog('Refine sub-cap reached — escalating to final reviewer')
-        // Escalation agent: retry up to ESCALATION_RETRIES times with a hardened prompt before
+        // Escalation agent: retry up to escalationCap times with a hardened prompt before
         // giving up. A schema/JSON throw (safeAgent -> null) on the final plan-review gate must NOT
         // silently force-accept an unreviewed plan — exhaust retries, then hard-block (resumable).
-        const ESCALATION_RETRIES = 5
+        // DLOOP-01: escalationCap is configurable via args.maxEscalationRetries (was hardcoded 5).
         // DYAGNI-01: ensure BLOCKER-severity YAGNI findings reach the escalation reviewer
         // even when reconcile was disabled (TDD Enforce routes them into reconcile.conflicts).
         var yagniBlockerContext = ''
         if (result.reconcile && result.reconcile.conflicts) {
           var yagniBlockers = result.reconcile.conflicts.filter(function (c) { return /\[YAGNI BLOCKER\]/.test(String(c)) })
-          if (yagniBlockers.length) yagniBlockerContext = `\nYAGNI BLOCKER findings (must be addressed):\n${JSON.stringify(yagniBlockers, null, 2)}\n`
+          if (yagniBlockers.length) yagniBlockerContext = `\nYAGNI BLOCKER findings (must be addressed):\n${compactList(yagniBlockers, 8)}\n`
         }
         const escalatePrompt = (attempt) => `You are the FINAL escalation reviewer. Prior review rounds rejected this plan; the blockers they
 raised are below. Reclassify EACH: is it a TRUE plan defect (missing scope/spec/ordering/risk) or an
@@ -2376,21 +2393,21 @@ Definition: ${result.definitionPath}
 Task: ${task}
 
 Prior blockers:
-${JSON.stringify((reviewState && reviewState.blockers) || [], null, 2)}${yagniBlockerContext}
+${compactList((reviewState && reviewState.blockers) || [], 8)}${yagniBlockerContext}
 
 Set accepted=true if no TRUE defects remain. Set forceAcceptable=true if every remaining blocker is
 implementation-detail. List trueDefects (genuine plan defects) and implNotes (implementer-detail) separately.${
           attempt > 1
             ? `
 
-IMPORTANT (retry ${attempt}/${ESCALATION_RETRIES}): A prior response failed JSON/schema validation.
+IMPORTANT (retry ${attempt}/${escalationCap}): A prior response failed JSON/schema validation.
 Respond with STRICT valid JSON ONLY — no markdown, no code fences, no commentary. Keep every array and
 object well-formed and within the schema. If unsure, return accepted=false with empty arrays rather than
 malformed output.`
             : ''
         }`
         let escalation = null
-        for (let attempt = 1; attempt <= ESCALATION_RETRIES; attempt++) {
+        for (let attempt = 1; attempt <= escalationCap; attempt++) {
           // Phase E2: on schema-recovery retries (attempt > 1, prior escalation returned null),
           // ask quick-decider whether more JSON-format retries are worth it. 'stop' bails to the
           // hard-block path below (escalation stays null). null -> stop.
@@ -2400,7 +2417,7 @@ malformed output.`
               opts: {
                 loopName: 'escalation',
                 iterations: attempt - 1,
-                subcap: ESCALATION_RETRIES,
+                subcap: escalationCap,
                 retryBudget,
                 lastFailure: `Escalation reviewer returned malformed JSON / null on ${attempt - 1} prior attempt(s) (schema-recovery loop).`,
               },
@@ -2417,7 +2434,7 @@ malformed output.`
             attemptPrompt = await enhancePrompt({
               gateKey: 'escalation',
               basePrompt: attemptPrompt,
-              failureContext: `Escalation agent returned malformed JSON / null on prior attempt (attempt ${attempt}/${ESCALATION_RETRIES}). Need strict valid JSON conforming to ESCALATION_REVIEW schema.`,
+              failureContext: `Escalation agent returned malformed JSON / null on prior attempt (attempt ${attempt}/${escalationCap}). Need strict valid JSON conforming to ESCALATION_REVIEW schema.`,
               intent: 'tighten-format',
               result, planDir, useEnhancer,
             })
@@ -2426,9 +2443,9 @@ malformed output.`
             attemptPrompt,
             { label: 'critical-reviewer(escalation)', phase: 'Review/Refine', schema: ESCALATION_REVIEW, model: gm('reviewEscalation') }, result
           )
-          spendRetry(1)
+          loopBudgets = spendLoop(loopBudgets, 'escalation')
           if (escalation != null) break
-          plog(`Escalation agent failed (attempt ${attempt}/${ESCALATION_RETRIES}) — retrying with hardened prompt`)
+          plog(`Escalation agent failed (attempt ${attempt}/${escalationCap}) — retrying with hardened prompt`)
         }
         if (escalation == null) {
           // All retries exhausted: hard-block rather than force-accept an unreviewed plan.
@@ -2439,7 +2456,7 @@ malformed output.`
           result.refineIterations = refineCount
           result._escalation = escalation
           stateCheckpoint('Review/Refine', 'blocked')
-          plog(`Escalation failed after ${ESCALATION_RETRIES} retries — hard-block (resumable via --resume)`)
+          plog(`Escalation failed after ${escalationCap} retries — hard-block (resumable via --resume)`)
           await consolidate(slug, result, config)
           return result
         } else if (escalation.accepted === true) {
@@ -2589,6 +2606,8 @@ malformed output.`
       // No budget is spent on approval round-trips.
       if (useApproval && !(result.designApproved && result.designApproved.approved)) {
         phase('Design')
+        result._designBudget = designBudgetSummary(designBudget)
+        result._loopBudgets = loopBudgetSummary(loopBudgets)
         result.designReady = true // the artifacts ARE ready; only the human sign-off is pending
         result.approvalPending = true
         result.blockedAt = 'awaiting-approval'
@@ -2641,6 +2660,9 @@ malformed output.`
         return result
       }
       result.designReady = true
+      // DBUDGET-01 / DLOOP-01: record budget summaries for handoff/status inspection.
+      result._designBudget = designBudgetSummary(designBudget)
+      result._loopBudgets = loopBudgetSummary(loopBudgets)
       // DCHUNK-01: surface chunker degradation as an explicit acknowledged outcome.
       var chunkerWarning = result._chunkerDegraded && !result._chunkerDegradationAcknowledged
         ? ' WARNING: plan chunker degraded to a single stage — stage-level parallelism and resumability are lost.'
