@@ -80,9 +80,13 @@ function canAdmitDesignGate(budget, gateName, estimatedCost) {
 // with per-gate spend detail and the caps in effect.
 function designBudgetSummary(budget) {
   const base = budgetSummary(budget.accountant)
+  const gateSpendCopy = {}
+  for (const name of Object.keys(budget.gateSpend)) {
+    gateSpendCopy[name] = { ...budget.gateSpend[name] }
+  }
   return {
     ...base,
-    gateSpend: { ...budget.gateSpend },
+    gateSpend: gateSpendCopy,
     caps: { ...budget.caps },
   }
 }
