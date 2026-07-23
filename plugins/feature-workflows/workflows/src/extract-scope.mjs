@@ -1,4 +1,4 @@
-import { FILE_ACK, SCOPE_VERDICT, AUDIT_VERDICT, ARTIFACT_CHECK, PENDING_RECORD, LOCATOR_ENTRY } from './schemas.mjs'
+import { FILE_ACK, SCOPE_VERDICT, AUDIT_VERDICT, ARTIFACT_CHECK, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD } from './schemas.mjs'
 import { nsAgent, gm } from './config.mjs'
 import { categorizeSlug } from './text-utils.mjs'
 import { classifyAndRecordIssue } from './stages-issues.mjs'
@@ -244,6 +244,95 @@ function resolveLocatorEntry(locator, pendingId) {
   return null
 }
 
+// ---- Deterministic identity + hashing (Phase 13 / D1.1) --------------------
+
+// normalizeToPosix: convert a path to repo-relative POSIX form.
+// Replaces backslashes, strips leading ./ and /. PURE.
+function normalizeToPosix(path) {
+  var p = String(path || '').replace(/\\/g, '/')
+  // strip leading ./ repeatedly (e.g. ././src -> src)
+  while (p.startsWith('./')) p = p.slice(2)
+  // strip a single leading /
+  if (p.startsWith('/')) p = p.slice(1)
+  return p
+}
+
+// validateHashes: fail-closed validation of per-file contentSha256 + scopeDigest.
+// Returns { valid: true } only when every hash is 64-lowercase-hex and the arrays
+// are well-formed; otherwise { valid: false, reason }. PURE.
+var HEX64 = /^[0-9a-f]{64}$/
+function validateHashes(fileHashes, scopeDigest) {
+  if (!Array.isArray(fileHashes) || fileHashes.length === 0) {
+    return { valid: false, reason: 'fileHashes is empty or not an array' }
+  }
+  for (var i = 0; i < fileHashes.length; i++) {
+    var fh = fileHashes[i]
+    if (!fh || typeof fh !== 'object') {
+      return { valid: false, reason: 'fileHashes[' + i + '] is not an object' }
+    }
+    if (typeof fh.path !== 'string' || !fh.path) {
+      return { valid: false, reason: 'fileHashes[' + i + '].path missing' }
+    }
+    if (typeof fh.contentSha256 !== 'string' || !HEX64.test(fh.contentSha256)) {
+      return { valid: false, reason: 'fileHashes[' + i + '].contentSha256 is not 64-lowercase-hex' }
+    }
+  }
+  if (typeof scopeDigest !== 'string' || !HEX64.test(scopeDigest)) {
+    return { valid: false, reason: 'scopeDigest is not 64-lowercase-hex' }
+  }
+  return { valid: true }
+}
+
+// deriveFeatureFolder: deterministic folder derivation from file hashes + scopeDigest.
+// No agent calls, no LLM. Returns { area, primarySlug, scopeId16, featureId, planDir, anchorPath }.
+// PURE.
+function deriveFeatureFolder(arg) {
+  var fileHashes = arg && arg.fileHashes
+  var scopeDigest = arg && arg.scopeDigest
+  var entryPoints = (arg && arg.entryPoints) || []
+  var entrySet = new Set(entryPoints.map(normalizeToPosix))
+  // Normalize all paths to POSIX for deterministic sorting.
+  var allPaths = (fileHashes || []).map(function (fh) {
+    return normalizeToPosix(fh.path)
+  })
+  // Exclude entry points from anchor candidates; fallback to full set if all are entries.
+  var candidates = allPaths.filter(function (p) { return !entrySet.has(p) })
+  if (!candidates.length) candidates = allPaths.slice()
+  candidates.sort()
+  var anchorPath = candidates[0] || ''
+  var segments = anchorPath.split('/').filter(Boolean)
+  var area = segments.length >= 2 ? segments[0] + '/' + segments[1] : 'uncategorized'
+  var basename = segments.length > 0 ? segments[segments.length - 1] : 'feature'
+  var primarySlug = categorizeSlug(basename)
+  var scopeId16 = String(scopeDigest || '').slice(0, 16)
+  var featureId = primarySlug + '-' + scopeId16
+  var planDir = 'docs/extract/' + area + '/' + featureId + '/'
+  return { area: area, primarySlug: primarySlug, scopeId16: scopeId16, featureId: featureId, planDir: planDir, anchorPath: anchorPath }
+}
+
+// hashSources: agent-mediated SHA-256 computation. The engine NEVER computes SHA-256.
+// The agent reads each file, computes per-file contentSha256 using Node's crypto,
+// then frames sorted [path, hash] pairs as JSON and SHA-256s that to produce scopeDigest.
+async function hashSources(arg) {
+  var files = arg && arg.files
+  var result = arg && arg.result
+  if (!files || !files.length) return null
+  var fileList = files.map(normalizeToPosix).join('\n')
+  return safeAgent(
+    'You are a hash-sources agent. For each file path listed below, READ the file content and\n' +
+    'compute its SHA-256 hash using Node.js crypto (available to you via shell or scripts).\n' +
+    'Then compute a combined scopeDigest:\n' +
+    '1. Sort all (path, contentSha256) pairs by path ascending (lexicographic).\n' +
+    '2. Frame as a JSON array of [path, contentSha256] pairs: e.g. [["src/a.ts","abc..."],["src/b.ts","def..."]]\n' +
+    '3. Compute SHA-256 of JSON.stringify(that array) — this is scopeDigest.\n\n' +
+    'All hashes must be 64 lowercase hex characters. Return the per-file hashes and scopeDigest.\n\n' +
+    'Files to hash:\n' + fileList + '\n\n' +
+    'Do NOT modify any files. Do NOT commit.',
+    { label: 'hash-sources', phase: 'Hash Sources', schema: HASH_SOURCES_VERDICT, model: gm('todo') },
+    result
+  )
+}
+
 // resolveScopePreflight: resolve the extraction scope WITHOUT writing any files.
 // Wraps the code-explorer agent call — captures the verdict in-memory for the
 // pending checkpoint. Returns { pendingId, task, verdict, state:'PENDING', createdAt }
@@ -276,12 +365,47 @@ async function resolveScopePreflight(arg) {
     result
   )
   if (!verdict || !verdict.files || !verdict.files.length) return null
+
+  // Phase 13: hash sources + validate + derive deterministic folder.
+  // The engine NEVER computes SHA-256 — hashSources delegates to an agent.
+  var hashResult = await hashSources({ files: verdict.files, result: result })
+  if (!hashResult || !hashResult.files || !hashResult.scopeDigest) {
+    // Blocked: can't hash — return null so the caller writes a blocked handoff.
+    return null
+  }
+  var validation = validateHashes(hashResult.files, hashResult.scopeDigest)
+  if (!validation.valid) {
+    // Fail-closed: return a blocked preflight with the hash error reason.
+    return {
+      pendingId: pendingId,
+      task: String(task || ''),
+      verdict: verdict,
+      state: 'PENDING',
+      createdAt: String(timestamp || ''),
+      hashError: validation.reason,
+    }
+  }
+  // Derive the deterministic folder from validated hashes.
+  var entryPoints = (verdict.entryPoints || []).map(normalizeToPosix)
+  var folder = deriveFeatureFolder({
+    fileHashes: hashResult.files,
+    scopeDigest: hashResult.scopeDigest,
+    entryPoints: entryPoints,
+  })
   return {
     pendingId: pendingId,
     task: String(task || ''),
     verdict: verdict,
     state: 'PENDING',
     createdAt: String(timestamp || ''),
+    fileHashes: hashResult.files,
+    scopeDigest: hashResult.scopeDigest,
+    featureId: folder.featureId,
+    derivedPlanDir: folder.planDir,
+    area: folder.area,
+    scopeId16: folder.scopeId16,
+    primarySlug: folder.primarySlug,
+    anchorPath: folder.anchorPath,
   }
 }
 
@@ -374,18 +498,28 @@ async function writeScopeManifestFromVerdict(scopeManifestPath, verdict, result)
 
 // writeIdentityStub: write the D0 .identity.json placeholder. Ownership digest
 // is null — Phase 13 fills it in with the real deterministic hash.
-async function writeIdentityStub(identityPath, planDir, timestamp, result) {
+async function writeIdentity(arg) {
+  var identityPath = arg.identityPath
+  var featureId = arg.featureId
+  var planDir = arg.planDir
+  var scopeDigest = arg.scopeDigest
+  var area = arg.area
+  var scopeId16 = arg.scopeId16
+  var createdAt = String(arg.createdAt || '')
+  var result = arg.result
   var identity = {
-    featureId: planDir.split('/').filter(Boolean).pop() || '',
+    featureId: featureId,
     planDir: planDir,
-    ownershipScopeDigest: null,
-    createdAt: String(timestamp || ''),
+    ownershipScopeDigest: scopeDigest,
+    area: area,
+    scopeId16: scopeId16,
+    createdAt: createdAt,
   }
   return safeAgent(
     'You are a file-writer agent. Write the following JSON to ' + identityPath + ' using\n' +
     'temp-then-rename. Create the directory if it does not exist.\n\n' +
     'Return ok=true and path=' + identityPath + '.\n\nJSON:\n' + JSON.stringify(identity, null, 2),
-    { label: 'file-writer(identity-stub)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    { label: 'file-writer(identity)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
     result
   )
 }
@@ -402,6 +536,7 @@ async function promotePendingRecord(arg) {
   var result = arg && arg.result
   var config = arg && arg.config
   var timestamp = arg && arg.timestamp
+  var identityFields = arg && arg.identityFields
   var identityPath = planDir + '.identity.json'
   var scopeManifestPath = planDir + 'scope-manifest.md'
 
@@ -417,7 +552,17 @@ async function promotePendingRecord(arg) {
   if (!isExisting) {
     // NEW feature — create scope-manifest.md + .identity.json (root-last: state after)
     await writeScopeManifestFromVerdict(scopeManifestPath, record.verdict, result)
-    await writeIdentityStub(identityPath, planDir, timestamp, result)
+    // Write real identity with the actual ownershipScopeDigest (not null stub).
+    await writeIdentity({
+      identityPath: identityPath,
+      featureId: (identityFields && identityFields.featureId) || (planDir.split('/').filter(Boolean).pop() || planDir),
+      planDir: planDir,
+      scopeDigest: (identityFields && identityFields.scopeDigest) || '',
+      area: (identityFields && identityFields.area) || 'uncategorized',
+      scopeId16: (identityFields && identityFields.scopeId16) || '',
+      createdAt: String(timestamp || ''),
+      result: result,
+    })
     // Root-last: pipeline-state.json only after identity + manifest exist
     await flushPipelineState(planDir, result, config)
   } else {
@@ -439,7 +584,7 @@ async function promotePendingRecord(arg) {
   // Append permanent compact locator entry (retained indefinitely)
   await appendLocatorEntry(PENDING_LOCATOR_PATH, {
     pendingId: record.pendingId,
-    featureId: planDir.split('/').filter(Boolean).pop() || planDir,
+    featureId: (identityFields && identityFields.featureId) || (planDir.split('/').filter(Boolean).pop() || planDir),
     planDir: planDir,
     promotedAt: String(timestamp || ''),
   }, result)
@@ -450,4 +595,4 @@ async function promotePendingRecord(arg) {
   return { promoted: true, record: promotedRecord, isNew: !isExisting }
 }
 
-export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH }
+export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, normalizeToPosix, validateHashes, deriveFeatureFolder, hashSources, writeIdentity }

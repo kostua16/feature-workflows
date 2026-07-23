@@ -227,11 +227,12 @@ test('source: promotePendingRecord handles NEW-feature branch (flushPipelineStat
   )
   // NEW branch checks for existing pipeline-state.json and creates identity if absent
   assert.match(fnBody, /isExisting/)
-  assert.match(fnBody, /writeIdentityStub/)
+  // Phase 13: writeIdentity replaces writeIdentityStub
+  assert.match(fnBody, /writeIdentity\(/)
   // Root-last: flushPipelineState after identity + manifest
   const flushIdx = fnBody.indexOf('flushPipelineState')
-  const identityIdx = fnBody.indexOf('writeIdentityStub')
-  assert.ok(flushIdx > identityIdx, 'flushPipelineState called after writeIdentityStub (root-last)')
+  const identityIdx = fnBody.indexOf('writeIdentity(')
+  assert.ok(flushIdx > identityIdx, 'flushPipelineState called after writeIdentity (root-last)')
 })
 
 test('source: promotePendingRecord does NOT overwrite identity on EXISTING branch', () => {
@@ -241,8 +242,8 @@ test('source: promotePendingRecord does NOT overwrite identity on EXISTING branc
   const updateIdx = source.indexOf('Update pending record to PROMOTED', existingIdx)
   assert.ok(updateIdx > existingIdx, 'Update pending record marker found after EXISTING')
   const existingSection = source.slice(existingIdx, updateIdx)
-  // The EXISTING branch should NOT call writeIdentityStub
-  assert.doesNotMatch(existingSection, /writeIdentityStub/)
+  // The EXISTING branch should NOT call writeIdentity
+  assert.doesNotMatch(existingSection, /writeIdentity\(/)
 })
 
 test('source: promotePendingRecord appends locator entry', () => {
@@ -307,7 +308,7 @@ test('source: preflight awaiting-confirm return does NOT call consolidate', () =
 
 test('source: preflight return writes pending record', () => {
   const preflightStart = source.indexOf('Fresh run — preflight')
-  const section = source.slice(preflightStart, preflightStart + 2000)
+  const section = source.slice(preflightStart, preflightStart + 3500)
   assert.match(section, /writePendingRecord/)
 })
 

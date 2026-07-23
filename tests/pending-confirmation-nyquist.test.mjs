@@ -454,29 +454,30 @@ test('NYQUIST: resolveLocator read phase is Pending Confirm', () => {
 })
 
 // ============================================================
-// Source assertions: writeIdentityStub / writeScopeManifestFromVerdict
+// Source assertions: writeIdentity / writeScopeManifestFromVerdict
+// (Phase 13: writeIdentityStub renamed to writeIdentity with real digest)
 // ============================================================
 
-test('NYQUIST: writeIdentityStub sets ownershipScopeDigest to null', () => {
+test('NYQUIST: writeIdentity sets ownershipScopeDigest from scopeDigest (not null)', () => {
   const fnBody = source.slice(
-    source.indexOf('function writeIdentityStub'),
+    source.indexOf('function writeIdentity'),
     source.indexOf('function promotePendingRecord')
   )
-  assert.match(fnBody, /ownershipScopeDigest:\s*null/)
+  assert.match(fnBody, /ownershipScopeDigest:\s*scopeDigest/)
 })
 
-test('NYQUIST: writeIdentityStub derives featureId from planDir basename', () => {
+test('NYQUIST: writeIdentity accepts featureId and scopeDigest as arg fields', () => {
   const fnBody = source.slice(
-    source.indexOf('function writeIdentityStub'),
+    source.indexOf('function writeIdentity'),
     source.indexOf('function promotePendingRecord')
   )
-  // featureId is the last segment of planDir
-  assert.match(fnBody, /planDir\.split.*filter.*pop/)
+  assert.match(fnBody, /arg\.featureId/)
+  assert.match(fnBody, /arg\.scopeDigest/)
 })
 
-test('NYQUIST: writeIdentityStub phase is Promote', () => {
+test('NYQUIST: writeIdentity phase is Promote', () => {
   const fnBody = source.slice(
-    source.indexOf('function writeIdentityStub'),
+    source.indexOf('function writeIdentity'),
     source.indexOf('function promotePendingRecord')
   )
   assert.match(fnBody, /phase:\s*'Promote'/)
@@ -485,7 +486,7 @@ test('NYQUIST: writeIdentityStub phase is Promote', () => {
 test('NYQUIST: writeScopeManifestFromVerdict formats markdown with files list', () => {
   const fnBody = source.slice(
     source.indexOf('function writeScopeManifestFromVerdict'),
-    source.indexOf('function writeIdentityStub')
+    source.indexOf('function writeIdentity')
   )
   assert.match(fnBody, /Scope Manifest/)
   assert.match(fnBody, /Files in scope/)
@@ -494,7 +495,7 @@ test('NYQUIST: writeScopeManifestFromVerdict formats markdown with files list', 
 test('NYQUIST: writeScopeManifestFromVerdict phase is Promote', () => {
   const fnBody = source.slice(
     source.indexOf('function writeScopeManifestFromVerdict'),
-    source.indexOf('function writeIdentityStub')
+    source.indexOf('function writeIdentity')
   )
   assert.match(fnBody, /phase:\s*'Promote'/)
 })
@@ -502,7 +503,7 @@ test('NYQUIST: writeScopeManifestFromVerdict phase is Promote', () => {
 test('NYQUIST: writeScopeManifestFromVerdict includes summary when present', () => {
   const fnBody = source.slice(
     source.indexOf('function writeScopeManifestFromVerdict'),
-    source.indexOf('function writeIdentityStub')
+    source.indexOf('function writeIdentity')
   )
   assert.match(fnBody, /summary/)
 })
@@ -525,10 +526,10 @@ test('NYQUIST: promotePendingRecord NEW branch writes scope-manifest BEFORE iden
     source.indexOf('export { seedExtractQueue')
   )
   const manifestIdx = fnBody.indexOf('writeScopeManifestFromVerdict')
-  const identityIdx = fnBody.indexOf('writeIdentityStub')
+  const identityIdx = fnBody.indexOf('writeIdentity(')
   assert.ok(manifestIdx > 0 && identityIdx > 0)
   assert.ok(manifestIdx < identityIdx,
-    'scope-manifest written before identity stub')
+    'scope-manifest written before identity')
 })
 
 test('NYQUIST: promotePendingRecord NEW branch calls flushPipelineState (root-last)', () => {

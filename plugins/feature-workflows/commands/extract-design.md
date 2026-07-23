@@ -58,9 +58,9 @@ Parse `$ARGUMENTS` into:
   entry points (API routes, CLI commands), or any mix. Passed verbatim to the scope resolver.
 - `--resume <planDir>`: → `resume: <planDir>` (hydrate persisted state; `task` optional — resolved
   from state). A bare `plan.md` path also accepted (`/plan.md` suffix stripped).
-- `--plan=PATH`: → `planPath` (**OPTIONAL — do NOT pass a default**). When absent, pass
-  `planPath: ""` so the workflow derives the dynamic planDir `docs/{category}/{sub}/extract/{leaf}/`
-  via the feature-categorizer. Ignored on `--resume`.
+- `--plan=PATH`: → `planPath` (**OPTIONAL — do NOT pass a default**). When absent, the workflow
+  derives a **deterministic** planDir `docs/extract/<area>/<featureId>/` from file hashes (Phase 13).
+  The feature-categorizer is NOT invoked for extract mode. Ignored on `--resume`.
 - `--profile=full|standard|light`: → `profile` (`standard` drops the fidelity review; `light` also
   drops reverse requirements + the audit. Default `full`. The core extraction gates — code facts,
   e2e use cases, detailed design, architecture — are profile-independent in extract mode: the
@@ -85,7 +85,7 @@ Parse `$ARGUMENTS` into:
 - `--no-enhancer`: → `useEnhancer: false`
 - `--no-quick-decider`: → `useQuickDecider: false`
 - `--no-translator`: → `useTranslator: false`
-- `--no-categorizer`: → `useCategorizer: false` (planDir falls back to `docs/uncategorized/extract/<leaf>/`)
+- `--no-categorizer`: → `useCategorizer: false` (no effect in extract mode — categorizer is always bypassed; folder is deterministic from hashes)
 - `--no-publish`: → `usePublish: false`
 - `--no-persist`: → `useKnowledgePersist: false`
 - `--decision-cap=N`: → `decisionCap` (default 50)
@@ -158,6 +158,21 @@ After promotion, `--resume <planDir>` resumes the extraction flow. Before promot
 fails (no pipeline-state.json exists — use `--confirm` instead).
 
 **Concurrent same-feature invocations are unsupported.**
+
+## Deterministic folder derivation (Phase 13)
+
+Extract folders are **deterministic** — derived from file content hashes, not an LLM categorizer:
+
+- `docs/extract/<area>/<featureId>/` where:
+  - `<area>` = first 2 path segments of the lex-smallest non-entry-point file (e.g. `src/auth`)
+  - `<featureId>` = `<primarySlug>-<scopeId16>` (slug of anchor filename + first 16 hex of scope digest)
+  - Fallback: fewer than 2 segments → `uncategorized`
+- The same resolved scope always produces the same folder (across runs, worktrees, clones).
+- Per-file `contentSha256` (64-hex) and combined `scopeDigest` (64-hex) are computed by the
+  hash-sources agent (the engine sandbox cannot import crypto). Hashes are validated before
+  identity selection — missing/malformed hashes **block** folder creation (fail-closed).
+- `.identity.json` stores the real `ownershipScopeDigest` (full 64-hex, immutable at creation).
+- Use `--feature=<featureId>` to override identity selection when hash validation blocks.
 
 When the workflow returns its final result JSON, report it concisely:
 - Always print `result.planDir` first. If `result._categorization` is set, show `category/subCategory`.

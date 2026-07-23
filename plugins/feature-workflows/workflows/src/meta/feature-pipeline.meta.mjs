@@ -42,6 +42,7 @@ export const meta = {
     { title: 'Decide' },
     { title: 'Checkpoint' },
     { title: 'Pending Confirm' },
+    { title: 'Hash Sources' },
     { title: 'Promote' },
   ],
 }

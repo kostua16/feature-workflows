@@ -237,6 +237,14 @@ const CANDIDATES = [
   'PREFLIGHT_VERDICT',
   'PENDING_RECORD',
   'LOCATOR_ENTRY',
+  // Phase 13 — deterministic identity + hashing (D1.1)
+  'normalizeToPosix',
+  'validateHashes',
+  'deriveFeatureFolder',
+  'hashSources',
+  'writeIdentity',
+  'HASH_SOURCES_VERDICT',
+  'IDENTITY_RECORD',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

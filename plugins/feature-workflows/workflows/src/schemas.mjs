@@ -988,6 +988,22 @@ const PREFLIGHT_VERDICT = {
     createdAt: { type: 'string', description: 'ISO-like timestamp from args.timestamp' },
     promotedAt: { type: 'string' },
     planDir: { type: 'string' },
+    fileHashes: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash from the hash-sources agent',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+    featureId: { type: 'string', description: 'Deterministic feature id: <primarySlug>-<scopeId16>' },
+    derivedPlanDir: { type: 'string', description: 'Deterministic docs/extract/<area>/<featureId>/ path' },
   },
 }
 
@@ -1006,6 +1022,63 @@ const PENDING_RECORD = {
     promotedAt: { type: 'string' },
     planDir: { type: 'string' },
     expiredAt: { type: 'string', description: 'Set when the bulky payload is TTL-expired' },
+    fileHashes: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash from the hash-sources agent',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+    featureId: { type: 'string', description: 'Deterministic feature id: <primarySlug>-<scopeId16>' },
+    derivedPlanDir: { type: 'string', description: 'Deterministic docs/extract/<area>/<featureId>/ path' },
+  },
+}
+
+// HASH_SOURCES_VERDICT: the hash-sources agent reads each file, computes per-file
+// SHA-256 (64-hex), then frames sorted [path, contentSha256] pairs as JSON and
+// SHA-256s that to produce scopeDigest. Agent-mediated — the engine never hashes.
+const HASH_SOURCES_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['files', 'scopeDigest'],
+  properties: {
+    files: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+  },
+}
+
+// IDENTITY_RECORD: shape of <planDir>/.identity.json. The ownershipScopeDigest is the
+// immutable full 64-hex SHA-256 scope digest, fixed at creation (never overwritten).
+const IDENTITY_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['featureId', 'planDir', 'ownershipScopeDigest', 'area', 'createdAt'],
+  properties: {
+    featureId: { type: 'string', description: 'Deterministic feature id' },
+    planDir: { type: 'string', description: 'Repo-relative POSIX folder path' },
+    ownershipScopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 scope digest (immutable at creation)' },
+    area: { type: 'string', description: 'First-2-segment area, fixed at creation' },
+    scopeId16: { type: 'string', description: '16-hex display/folder id' },
+    createdAt: { type: 'string' },
   },
 }
 
@@ -1024,4 +1097,4 @@ const LOCATOR_ENTRY = {
   },
 }
 
-export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT, PREFLIGHT_VERDICT, PENDING_RECORD, LOCATOR_ENTRY }
+export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT, PREFLIGHT_VERDICT, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD }

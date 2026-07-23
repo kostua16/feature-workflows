@@ -7,7 +7,7 @@ import { computeContentDigest } from './revision.mjs'
 import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
-import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH } from './extract-scope.mjs'
+import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix } from './extract-scope.mjs'
 import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectReviewDocs, buildReviewReport, runReviewLenses, mergeReviewFindings, verifyReviewFindings, recordReviewIssues } from './review-mode.mjs'
 import { extractSlice, writeSystemOverview } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
@@ -494,11 +494,19 @@ async function main() {
   let planPath
   if (explicitPlanPath) {
     planPath = explicitPlanPath
-  } else if (gateModeActive('design', mode) || isExtractMode) {
-    // Fresh run with no explicit --plan → derive dynamically. Extract runs share the
-    // categorizer but land under a mode-specific path segment (extract/ instead of feature/)
-    // so as-is extraction docsets are distinguishable from forward feature designs.
-    const kindSeg = isExtractMode ? 'extract' : 'feature'
+  } else if (isExtractMode && confirmRecord && confirmRecord.derivedPlanDir) {
+    // Extract --confirm: use the deterministic planDir from the pending record (Phase 13).
+    planPath = confirmRecord.derivedPlanDir + 'plan.md'
+    log('Extract --confirm: using deterministic folder ' + confirmRecord.derivedPlanDir)
+  } else if (isExtractMode) {
+    // Extract fresh run: categorizer bypassed — the preflight derives the deterministic
+    // folder from file hashes (Phase 13). Use a temporary placeholder; the user never
+    // sees it because the preflight returns awaiting-scope-confirm with the real path.
+    planPath = 'docs/extract/.pending/plan.md'
+    log('Extract fresh run — categorizer bypassed; folder derived after preflight')
+  } else if (gateModeActive('design', mode)) {
+    // Fresh run with no explicit --plan → derive dynamically.
+    const kindSeg = 'feature'
     const leafId = jiraIdFromTask(task) || ((args && args.timestamp) ? args.timestamp : slug)
     if (useCategorizer) {
       phase('Categorize')
@@ -538,7 +546,7 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
   }
   const definitionPath = (args && args.definitionPath) ||
     planPath.replace(/plan\.md$/, 'idea.md')
-  const planDir = planPath.replace(/plan\.md$/, '')
+  let planDir = planPath.replace(/plan\.md$/, '')
   const archPath = planDir + 'architecture.md'
   const designPath = planDir + 'detailed-design.md'
 
@@ -1156,6 +1164,8 @@ ${task}`,
       // and appends the permanent locator entry. Crash-idempotent on replay.
       if (confirmRecord && !result.scopeManifestPath) {
         phase('Promote')
+        // Override planDir with the deterministic folder from the pending record.
+        if (confirmRecord.derivedPlanDir) planDir = confirmRecord.derivedPlanDir
         plog('Promoting pending record ' + confirmRecord.pendingId + ' -> ' + planDir)
         const promo = await promotePendingRecord({
           pendingDir: PENDING_DIR,
@@ -1164,6 +1174,12 @@ ${task}`,
           result,
           config,
           timestamp: args && args.timestamp,
+          identityFields: {
+            scopeDigest: confirmRecord.scopeDigest,
+            area: confirmRecord.area,
+            scopeId16: confirmRecord.scopeId16,
+            featureId: confirmRecord.featureId,
+          },
         })
         result.extractScope = confirmRecord.verdict
         result.scopeManifestPath = planDir + 'scope-manifest.md'
@@ -1199,6 +1215,23 @@ ${task}`,
           await consolidate(slug, result, config)
           return result
         }
+        // Hash validation failure — block identity selection (fail-closed).
+        if (preflight.hashError) {
+          result.blockedAt = 'extract-hash-error'
+          result.handoff = {
+            from: 'extract',
+            message: `Scope hash validation failed: ${preflight.hashError}. Re-run /extract-design or use --feature=<featureId> to override.`,
+            nextMode: 'extract',
+            planDir,
+            hashError: preflight.hashError,
+          }
+          plog('Preflight: hash validation failed — ' + preflight.hashError)
+          stateCheckpoint('Pending Confirm', 'blocked')
+          await consolidate(slug, result, config)
+          return result
+        }
+        // Override planDir with the deterministic derived folder (Phase 13).
+        if (preflight.derivedPlanDir) planDir = preflight.derivedPlanDir
         // Write pending record — the ONLY durable state before promotion.
         // pipeline-state.json is intentionally NOT written (RED gate: --resume
         // cannot resume a not-yet-promoted checkpoint).
