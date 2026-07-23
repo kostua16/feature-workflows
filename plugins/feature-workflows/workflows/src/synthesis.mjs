@@ -251,4 +251,19 @@ function synthesisSummary(state) {
   }
 }
 
-export { VIEW_TYPES, createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary, deriveCoverageIndex, deriveDependencyMap, deriveCrossCutting, deriveSystemOverview }
+// Mark synthesis views as stale for a specific slice so the next
+// synthesizeProjectViews call rebuilds affected views. Complements
+// invalidateStaleViews (revision-delta based) with a slice-targeted variant.
+// PURE: no agent calls, no I/O, no side effects on the input.
+function markStaleForSlice(synthesisState, sliceId) {
+  if (!synthesisState) {
+    return { synthesized: false, staleSlices: [sliceId], views: {}, viewRevisions: {}, featureDigests: {} }
+  }
+  if (!synthesisState.synthesized) return synthesisState
+  var newState = Object.assign({}, synthesisState)
+  newState.staleSlices = (synthesisState.staleSlices || []).concat([sliceId])
+  newState.staleViews = ['systemOverview', 'dependencyMap', 'crossCutting', 'coverageIndex']
+  return newState
+}
+
+export { VIEW_TYPES, createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary, deriveCoverageIndex, deriveDependencyMap, deriveCrossCutting, deriveSystemOverview, markStaleForSlice }

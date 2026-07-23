@@ -181,4 +181,56 @@ function persistenceReport(tracker) {
   return report
 }
 
-export { PERSISTENCE_STATES, PERSIST_UNIT_TYPES, createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, isDurablyVerified, persistenceReport }
+// Invalidate persistence evidence for a slice: enumerate affected durable keys,
+// supersede or remove them, and reset the gate-predicate guards so publish/persist
+// re-run on the next pass. Respects OBSERVE-01 no-demote — a DURABLY_VERIFIED write
+// is never set back to ATTEMPTED; instead a supersede-history event is appended.
+// PURE: no agent calls, no I/O, no non-deterministic primitives.
+function invalidatePersistenceEvidence(state, sliceId) {
+  if (!state || typeof state !== 'object') return state
+  if (!sliceId) return state
+
+  state._invalidations = state._invalidations || []
+
+  var tracker = state.persistenceTracker
+  if (tracker && tracker.writes) {
+    var affectedKeys = []
+    for (var key of Object.keys(tracker.writes)) {
+      if (key.indexOf(sliceId) !== -1) {
+        affectedKeys.push(key)
+      }
+    }
+
+    var newWrites = Object.assign({}, tracker.writes)
+    for (var i = 0; i < affectedKeys.length; i++) {
+      var k = affectedKeys[i]
+      var w = tracker.writes[k]
+      if (w && w.state === PERSISTENCE_STATES.DURABLY_VERIFIED) {
+        state._invalidations.push({
+          sliceId: sliceId,
+          key: k,
+          action: 'superseded',
+          reason: 'invalidation-chain',
+        })
+      } else {
+        delete newWrites[k]
+        state._invalidations.push({
+          sliceId: sliceId,
+          key: k,
+          action: 'removed',
+          reason: 'invalidation-chain',
+        })
+      }
+    }
+    state.persistenceTracker = { writes: newWrites, history: tracker.history }
+  }
+
+  state._publishVerified = false
+  state._persistVerified = false
+  state.published = null
+  state.persist = null
+
+  return state
+}
+
+export { PERSISTENCE_STATES, PERSIST_UNIT_TYPES, createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, isDurablyVerified, persistenceReport, invalidatePersistenceEvidence }

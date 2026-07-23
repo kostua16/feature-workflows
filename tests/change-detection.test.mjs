@@ -500,9 +500,9 @@ test('source: runChangeDetection is async', () => {
 })
 
 test('source: runChangeDetection does NOT call invalidateSliceChain', () => {
-  const fnBody = source.slice(
-    source.indexOf('function runChangeDetection'),
-    source.indexOf('\nexport { seedExtractQueue')
+  const fnBody = srcModule.slice(
+    srcModule.indexOf('function runChangeDetection'),
+    srcModule.indexOf('\nexport { seedExtractQueue')
   )
   assert.ok(!/invalidateSliceChain/.test(fnBody), 'invalidation is Phase 17 scope')
 })

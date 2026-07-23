@@ -48,5 +48,6 @@ export const meta = {
     { title: 'Registry Recovery' },
     { title: 'Reconcile Slices' },
     { title: 'Change Detection' },
+    { title: 'Invalidation' },
   ],
 }

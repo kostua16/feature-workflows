@@ -7,6 +7,8 @@ import { writeOpenQuestions } from './decisions.mjs'
 import { main } from './main.mjs'
 import { flushPipelineState } from './state.mjs'
 import { applyLifecycleEvent, LIFECYCLE_STATES } from './lifecycle.mjs'
+import { invalidatePersistenceEvidence } from './observe-persist.mjs'
+import { markStaleForSlice } from './synthesis.mjs'
 
 
 // Per-gate durable checkpoint: persist slice state after each material gate so an
@@ -297,4 +299,38 @@ Return overviewPath set to ${overviewPath}.`,
   }
 }
 
-export { extractSlice, writeSystemOverview, checkpointSlice }
+// Invalidate the full extraction chain for a slice: reset the queue entry to
+// pending, clear all 6 artifact-path guards (so gates re-run from scratch),
+// wipe caches and review flags, supersede persistence evidence, and mark parent
+// aggregates stale for rebuild. PURE (operates on state/queueEntry objects) —
+// calls invalidatePersistenceEvidence and markStaleForSlice.
+function invalidateSliceChain(state, sliceId, queueEntry) {
+  queueEntry.status = 'pending'
+  queueEntry.artifacts = {}
+  queueEntry._gateCheckpoints = {}
+
+  queueEntry.factsPath = null
+  queueEntry.useCasePath = null
+  queueEntry.designPath = null
+  queueEntry.archPath = null
+  queueEntry.requirementsPath = null
+  queueEntry.auditPath = null
+
+  queueEntry._facts = undefined
+  queueEntry._e2e = undefined
+  queueEntry._design = undefined
+  queueEntry._arch = undefined
+  queueEntry._requirements = undefined
+
+  queueEntry._reviewedDesign = false
+  queueEntry._reviewedArch = false
+
+  invalidatePersistenceEvidence(state, sliceId)
+
+  state.synthesisState = markStaleForSlice(state.synthesisState, sliceId)
+  state.overviewPath = null
+  state._sourceDigest = null
+  state.extractReady = false
+}
+
+export { extractSlice, writeSystemOverview, checkpointSlice, invalidateSliceChain }

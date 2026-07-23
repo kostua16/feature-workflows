@@ -20,10 +20,11 @@ import { createRetryPolicy, createAttemptHistory, recordAttempt, isTerminalFailu
 import { isolateFailure, shouldContinueAfterFailure, segmentOutcome, eligibleIndependents } from './failure-isolation.mjs'
 import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIntent, acknowledgeSegment, resolveConvergence, shouldContinue, resumeCommand, continuationSummary, canAutoRelaunch } from './continuation.mjs'
 import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary } from './synthesis.mjs'
-import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport } from './observe-persist.mjs'
+import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport, invalidatePersistenceEvidence } from './observe-persist.mjs'
 import { deriveExtractReadiness, projectStatusProjection, readinessSummary, deriveDesignReadiness, DESIGN_READINESS_REASONS } from './status-truth.mjs'
 import { createDesignBudget, spendDesignGate, gateCallsRemaining, canAdmitDesignGate, designBudgetSummary, DESIGN_BUDGET_DEFAULTS } from './design-budget.mjs'
 import { createLoopBudgets, spendLoop, loopBudgetExhausted, loopBudgetSummary } from './design-loops.mjs'
+import { applyLifecycleEvent } from './lifecycle.mjs'
 
 
 // ---- Script body -----------------------------------------------------------
@@ -3654,4 +3655,18 @@ Use a clear conventional-commit message. Return the commit hash.`,
 }
 
 
-export { main }
+// Parent-path handler for a removed slice (emptied by membership loss).
+// Distinct from invalidateSliceChain (which resets for re-extraction):
+// the removed slice is terminal — lifecycle set to excluded, evidence
+// superseded, coverage denominator drops, parent publish/persist re-run.
+// Slice-local history (artifact paths) is preserved, NOT cleared.
+// PURE (operates on state/queueEntry objects) — calls invalidatePersistenceEvidence
+// and applyLifecycleEvent.
+function onSliceRemoved(state, sliceId, queueEntry) {
+  invalidatePersistenceEvidence(state, sliceId)
+
+  var next = applyLifecycleEvent(queueEntry, { type: 'exclude', payload: { rationale: 'slice-removed-empty' } })
+  Object.assign(queueEntry, next)
+}
+
+export { main, onSliceRemoved }

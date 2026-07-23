@@ -57,6 +57,7 @@ export const meta = {
     { title: 'Registry Recovery' },
     { title: 'Reconcile Slices' },
     { title: 'Change Detection' },
+    { title: 'Invalidation' },
   ],
 }
 
@@ -1337,6 +1338,18 @@ const SLICE_DIGEST_RESULT = {
         },
       },
     },
+  },
+}
+
+const INVALIDATION_EVENT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['sliceId', 'key', 'action'],
+  properties: {
+    sliceId: { type: 'string', description: 'Slice whose evidence was invalidated' },
+    key: { type: 'string', description: 'Durable key that was versioned or removed' },
+    action: { type: 'string', enum: ['versioned', 'removed', 'superseded'], description: 'How the key was invalidated (no-demote: never demoted)' },
+    reason: { type: 'string', description: 'Why the evidence was invalidated' },
   },
 }
 
@@ -4486,6 +4499,21 @@ function synthesisSummary(state) {
   }
 }
 
+// Mark synthesis views as stale for a specific slice so the next
+// synthesizeProjectViews call rebuilds affected views. Complements
+// invalidateStaleViews (revision-delta based) with a slice-targeted variant.
+// PURE: no agent calls, no I/O, no side effects on the input.
+function markStaleForSlice(synthesisState, sliceId) {
+  if (!synthesisState) {
+    return { synthesized: false, staleSlices: [sliceId], views: {}, viewRevisions: {}, featureDigests: {} }
+  }
+  if (!synthesisState.synthesized) return synthesisState
+  var newState = Object.assign({}, synthesisState)
+  newState.staleSlices = (synthesisState.staleSlices || []).concat([sliceId])
+  newState.staleViews = ['systemOverview', 'dependencyMap', 'crossCutting', 'coverageIndex']
+  return newState
+}
+
 // Attempted-vs-durable persistence tracking: distinguish writes that were
 // attempted from writes that are durably verified. Retry-safe: retrying a
 // failed write cannot produce duplicate index, synthesis, or continuation
@@ -4667,6 +4695,58 @@ function persistenceReport(tracker) {
   }
 
   return report
+}
+
+// Invalidate persistence evidence for a slice: enumerate affected durable keys,
+// supersede or remove them, and reset the gate-predicate guards so publish/persist
+// re-run on the next pass. Respects OBSERVE-01 no-demote — a DURABLY_VERIFIED write
+// is never set back to ATTEMPTED; instead a supersede-history event is appended.
+// PURE: no agent calls, no I/O, no non-deterministic primitives.
+function invalidatePersistenceEvidence(state, sliceId) {
+  if (!state || typeof state !== 'object') return state
+  if (!sliceId) return state
+
+  state._invalidations = state._invalidations || []
+
+  var tracker = state.persistenceTracker
+  if (tracker && tracker.writes) {
+    var affectedKeys = []
+    for (var key of Object.keys(tracker.writes)) {
+      if (key.indexOf(sliceId) !== -1) {
+        affectedKeys.push(key)
+      }
+    }
+
+    var newWrites = Object.assign({}, tracker.writes)
+    for (var i = 0; i < affectedKeys.length; i++) {
+      var k = affectedKeys[i]
+      var w = tracker.writes[k]
+      if (w && w.state === PERSISTENCE_STATES.DURABLY_VERIFIED) {
+        state._invalidations.push({
+          sliceId: sliceId,
+          key: k,
+          action: 'superseded',
+          reason: 'invalidation-chain',
+        })
+      } else {
+        delete newWrites[k]
+        state._invalidations.push({
+          sliceId: sliceId,
+          key: k,
+          action: 'removed',
+          reason: 'invalidation-chain',
+        })
+      }
+    }
+    state.persistenceTracker = { writes: newWrites, history: tracker.history }
+  }
+
+  state._publishVerified = false
+  state._persistVerified = false
+  state.published = null
+  state.persist = null
+
+  return state
 }
 
 // Truthful readiness derivation and status projection: the command handoff
@@ -7317,6 +7397,40 @@ Return overviewPath set to ${overviewPath}.`,
   } catch (e) {
     plogFromResult(result, 'System Overview: failed (non-blocking) — ' + String(e))
   }
+}
+
+// Invalidate the full extraction chain for a slice: reset the queue entry to
+// pending, clear all 6 artifact-path guards (so gates re-run from scratch),
+// wipe caches and review flags, supersede persistence evidence, and mark parent
+// aggregates stale for rebuild. PURE (operates on state/queueEntry objects) —
+// calls invalidatePersistenceEvidence and markStaleForSlice.
+function invalidateSliceChain(state, sliceId, queueEntry) {
+  queueEntry.status = 'pending'
+  queueEntry.artifacts = {}
+  queueEntry._gateCheckpoints = {}
+
+  queueEntry.factsPath = null
+  queueEntry.useCasePath = null
+  queueEntry.designPath = null
+  queueEntry.archPath = null
+  queueEntry.requirementsPath = null
+  queueEntry.auditPath = null
+
+  queueEntry._facts = undefined
+  queueEntry._e2e = undefined
+  queueEntry._design = undefined
+  queueEntry._arch = undefined
+  queueEntry._requirements = undefined
+
+  queueEntry._reviewedDesign = false
+  queueEntry._reviewedArch = false
+
+  invalidatePersistenceEvidence(state, sliceId)
+
+  state.synthesisState = markStaleForSlice(state.synthesisState, sliceId)
+  state.overviewPath = null
+  state._sourceDigest = null
+  state.extractReady = false
 }
 
 // Gate 5.5: knowledge-persist (adopted agent). NON-BLOCKING: gathers the
@@ -12496,6 +12610,21 @@ Use a clear conventional-commit message. Return the commit hash.`,
     }
     return result
   }
+}
+
+
+// Parent-path handler for a removed slice (emptied by membership loss).
+// Distinct from invalidateSliceChain (which resets for re-extraction):
+// the removed slice is terminal — lifecycle set to excluded, evidence
+// superseded, coverage denominator drops, parent publish/persist re-run.
+// Slice-local history (artifact paths) is preserved, NOT cleared.
+// PURE (operates on state/queueEntry objects) — calls invalidatePersistenceEvidence
+// and applyLifecycleEvent.
+function onSliceRemoved(state, sliceId, queueEntry) {
+  invalidatePersistenceEvidence(state, sliceId)
+
+  var next = applyLifecycleEvent(queueEntry, { type: 'exclude', payload: { rationale: 'slice-removed-empty' } })
+  Object.assign(queueEntry, next)
 }
 
 const final = await main()

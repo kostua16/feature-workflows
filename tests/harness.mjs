@@ -275,6 +275,12 @@ const CANDIDATES = [
   'runChangeDetection',
   'SLICE_DIGEST',
   'SLICE_DIGEST_RESULT',
+  // Phase 17 — invalidation chain & removal path
+  'invalidatePersistenceEvidence',
+  'invalidateSliceChain',
+  'markStaleForSlice',
+  'onSliceRemoved',
+  'INVALIDATION_EVENT',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)
