@@ -4710,9 +4710,12 @@ function invalidatePersistenceEvidence(state, sliceId) {
 
   var tracker = state.persistenceTracker
   if (tracker && tracker.writes) {
+    // Delimiter-aware match prevents substring collisions: invalidating
+    // slice-1 must not affect slice-10's keys. Keys follow type:sliceId:component.
+    var needle = ':' + sliceId + ':'
     var affectedKeys = []
     for (var key of Object.keys(tracker.writes)) {
-      if (key.indexOf(sliceId) !== -1) {
+      if (key.indexOf(needle) !== -1) {
         affectedKeys.push(key)
       }
     }

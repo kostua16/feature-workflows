@@ -381,3 +381,242 @@ test('GAP7: no Math.random or Date.now in any Phase 17 function', () => {
     assert.equal(body.match(/Math\.random|Date\.now/), null, 'no Math.random or Date.now')
   }
 })
+
+// ---- GAP-8: Key isolation — substring collision prevention (DEFECT FIX) ----
+
+test('GAP8: invalidating slice-1 does NOT affect slice-10 ATTEMPTED writes', () => {
+  let t = createPersistenceTracker()
+  t = recordAttemptedWrite(t, 'feature:slice-1:shard', 'feature-shard')
+  t = recordAttemptedWrite(t, 'feature:slice-10:shard', 'feature-shard')
+  const state = { persistenceTracker: t }
+  invalidatePersistenceEvidence(state, 'slice-1')
+  assert.equal(state.persistenceTracker.writes['feature:slice-1:shard'], undefined,
+    'slice-1 write removed')
+  assert.ok(state.persistenceTracker.writes['feature:slice-10:shard'],
+    'slice-10 write preserved — no substring collision')
+})
+
+test('GAP8: invalidating slice-1 does NOT supersede slice-10 DURABLY_VERIFIED writes', () => {
+  let t = createPersistenceTracker()
+  t = recordAttemptedWrite(t, 'feature:slice-1:shard', 'feature-shard')
+  t = recordAttemptedWrite(t, 'feature:slice-10:shard', 'feature-shard')
+  t = verifyDurableWrite(t, 'feature:slice-10:shard')
+  const state = { persistenceTracker: t }
+  invalidatePersistenceEvidence(state, 'slice-1')
+  assert.equal(
+    state.persistenceTracker.writes['feature:slice-10:shard'].state,
+    PERSISTENCE_STATES.DURABLY_VERIFIED,
+    'slice-10 DURABLY_VERIFIED untouched'
+  )
+  const falseEvents = state._invalidations.filter((e) => e.key.includes('slice-10'))
+  assert.equal(falseEvents.length, 0, 'no false supersede event for slice-10')
+})
+
+test('GAP8: unrelated slice writes fully preserved after invalidation', () => {
+  let t = createPersistenceTracker()
+  t = recordAttemptedWrite(t, 'feature:alpha:shard', 'feature-shard')
+  t = recordAttemptedWrite(t, 'synthesis:alpha:view', 'synthesis-view')
+  t = recordAttemptedWrite(t, 'index:alpha:entry', 'project-index')
+  t = recordAttemptedWrite(t, 'feature:beta:shard', 'feature-shard')
+  t = verifyDurableWrite(t, 'feature:beta:shard')
+  const state = { persistenceTracker: t }
+  invalidatePersistenceEvidence(state, 'alpha')
+  assert.equal(state.persistenceTracker.writes['feature:beta:shard'].state,
+    PERSISTENCE_STATES.DURABLY_VERIFIED, 'beta write fully preserved')
+  assert.equal(state._invalidations.filter((e) => e.key.includes('beta')).length, 0,
+    'no events for beta')
+  assert.equal(state._invalidations.filter((e) => e.sliceId === 'alpha').length, 3,
+    'all 3 alpha keys invalidated')
+})
+
+// ---- GAP-9: Synthesis state behavioral after invalidateSliceChain ----
+
+test('GAP9: invalidateSliceChain updates synthesis staleSlices with invalidated sliceId', () => {
+  const state = {
+    persistenceTracker: null,
+    synthesisState: { synthesized: true, views: {}, staleSlices: ['old'] },
+    overviewPath: '/o', _sourceDigest: 'd', extractReady: true,
+  }
+  const qe = { status: 'done', artifacts: {}, _gateCheckpoints: {} }
+  invalidateSliceChain(state, 'slice-x', qe)
+  assert.ok(state.synthesisState.staleSlices.includes('slice-x'),
+    'staleSlices contains the invalidated sliceId')
+  assert.ok(state.synthesisState.staleSlices.includes('old'),
+    'existing staleSlices preserved')
+})
+
+test('GAP9: invalidateSliceChain marks all 4 synthesis view types stale', () => {
+  const state = {
+    persistenceTracker: null,
+    synthesisState: { synthesized: true, views: {} },
+    overviewPath: '/o', _sourceDigest: 'd', extractReady: true,
+  }
+  const qe = { status: 'done', artifacts: {}, _gateCheckpoints: {} }
+  invalidateSliceChain(state, 'slice-y', qe)
+  assert.deepEqual(state.synthesisState.staleViews.sort(),
+    ['coverageIndex', 'crossCutting', 'dependencyMap', 'systemOverview'])
+})
+
+test('GAP9: invalidateSliceChain with unsynthesized state does not add staleSlices', () => {
+  const state = {
+    persistenceTracker: null,
+    synthesisState: { synthesized: false, views: {} },
+    overviewPath: '/o', _sourceDigest: 'd', extractReady: true,
+  }
+  const qe = { status: 'done', artifacts: {}, _gateCheckpoints: {} }
+  invalidateSliceChain(state, 'slice-z', qe)
+  assert.equal(state.synthesisState.staleSlices, undefined,
+    'unsynthesized state not marked stale (nothing to rebuild)')
+})
+
+// ---- GAP-10: Lifecycle/status distinction behavioral ----
+
+test('GAP10: invalidateSliceChain does NOT set lifecycle to excluded', () => {
+  const state = {
+    persistenceTracker: null,
+    synthesisState: { synthesized: false },
+    overviewPath: null, _sourceDigest: null, extractReady: false,
+  }
+  const qe = { status: 'done', artifacts: {}, _gateCheckpoints: {}, lifecycle: 'runnable' }
+  invalidateSliceChain(state, 's1', qe)
+  assert.notEqual(qe.lifecycle, 'excluded',
+    'invalidateSliceChain must NOT exclude — slice will be re-extracted')
+  assert.equal(qe.lifecycle, 'runnable', 'lifecycle unchanged')
+})
+
+test('GAP10: onSliceRemoved does NOT set status to pending', () => {
+  const state = { persistenceTracker: null }
+  const qe = { lifecycle: 'runnable', status: 'done', factsPath: '/f' }
+  onSliceRemoved(state, 's1', qe)
+  assert.notEqual(qe.status, 'pending',
+    'onSliceRemoved must NOT set pending — slice is terminal')
+  assert.equal(qe.status, 'done', 'status unchanged')
+})
+
+// ---- GAP-11: All caches cleared by invalidateSliceChain ----
+
+test('GAP11: invalidateSliceChain clears _e2e, _design, _arch, _requirements caches', () => {
+  const state = {
+    persistenceTracker: null,
+    synthesisState: { synthesized: false },
+    overviewPath: null, _sourceDigest: null, extractReady: false,
+  }
+  const qe = {
+    status: 'done', artifacts: { x: 1 }, _gateCheckpoints: { g: 1 },
+    _facts: { a: 1 }, _e2e: { b: 2 }, _design: { c: 3 },
+    _arch: { d: 4 }, _requirements: { e: 5 },
+  }
+  invalidateSliceChain(state, 's1', qe)
+  assert.equal(qe._facts, undefined, '_facts cleared')
+  assert.equal(qe._e2e, undefined, '_e2e cleared')
+  assert.equal(qe._design, undefined, '_design cleared')
+  assert.equal(qe._arch, undefined, '_arch cleared')
+  assert.equal(qe._requirements, undefined, '_requirements cleared')
+})
+
+// ---- GAP-12: No-demote with continuation-ack unit type ----
+
+test('GAP12: DURABLY_VERIFIED continuation-ack write → superseded, state stays verified', () => {
+  let t = createPersistenceTracker()
+  t = recordAttemptedWrite(t, 'continuation:s1:ack', PERSIST_UNIT_TYPES.CONTINUATION_ACK)
+  t = verifyDurableWrite(t, 'continuation:s1:ack')
+  const state = { persistenceTracker: t }
+  invalidatePersistenceEvidence(state, 's1')
+  assert.equal(
+    state.persistenceTracker.writes['continuation:s1:ack'].state,
+    PERSISTENCE_STATES.DURABLY_VERIFIED,
+    'continuation-ack not demoted'
+  )
+  assert.ok(
+    state._invalidations.some((e) => e.key === 'continuation:s1:ack' && e.action === 'superseded'),
+    'continuation-ack supersede event appended'
+  )
+})
+
+// ---- GAP-13: Re-invalidation sequence (append-only with new verified writes) ----
+
+test('GAP13: re-invalidation after new durable write — both events in history', () => {
+  let t = createPersistenceTracker()
+  t = recordAttemptedWrite(t, 'feature:s1:original', 'feature-shard')
+  t = verifyDurableWrite(t, 'feature:s1:original')
+  const state = { persistenceTracker: t }
+  invalidatePersistenceEvidence(state, 's1')
+  const firstCount = state._invalidations.length
+
+  // Simulate republication: a new durable write appears for the same slice
+  let t2 = state.persistenceTracker
+  t2 = recordAttemptedWrite(t2, 'feature:s1:updated', 'feature-shard')
+  t2 = verifyDurableWrite(t2, 'feature:s1:updated')
+  state.persistenceTracker = t2
+  invalidatePersistenceEvidence(state, 's1')
+
+  assert.ok(state._invalidations.length > firstCount,
+    'second invalidation appended new events')
+  assert.ok(
+    state._invalidations.some((e) => e.key === 'feature:s1:updated' && e.action === 'superseded'),
+    'newly verified write was superseded on re-invalidation'
+  )
+  // Original event still in history (append-only audit trail)
+  assert.ok(
+    state._invalidations.some((e) => e.key === 'feature:s1:original'),
+    'original invalidation event preserved in history'
+  )
+})
+
+// ---- GAP-14: Crash-resume completeness after invalidation ----
+
+test('GAP14: after invalidateSliceChain, synthesis state triggers rebuild on resume', () => {
+  const state = {
+    persistenceTracker: null,
+    synthesisState: { synthesized: true, views: { systemOverview: { data: 'old' } } },
+    overviewPath: '/old-overview.md',
+    _sourceDigest: 'old-digest',
+    extractReady: true,
+  }
+  const qe = {
+    status: 'done', artifacts: { factsPath: '/a' },
+    _gateCheckpoints: { 'extract-facts': { seq: 1 } },
+    factsPath: '/f', designPath: '/d',
+  }
+  invalidateSliceChain(state, 's1', qe)
+
+  // Simulate crash-resume: state is re-loaded from persisted pipeline-state.json
+  // All guards must be reset so gates re-run from the beginning
+  assert.equal(qe.status, 'pending', 'queue entry pending — will re-extract')
+  assert.equal(qe.factsPath, null, 'artifact guard cleared')
+  assert.equal(qe.designPath, null, 'artifact guard cleared')
+  assert.equal(state.extractReady, false, 'not ready — blocks handoff')
+  assert.equal(state.overviewPath, null, 'overview regenerated')
+  assert.equal(state._sourceDigest, null, 'digest cleared for re-computation')
+  assert.ok(state.synthesisState.staleViews && state.synthesisState.staleViews.length === 4,
+    'all synthesis views stale — triggers rebuild')
+  assert.equal(state.published, null, 'publish predicate cleared')
+  assert.equal(state.persist, null, 'persist predicate cleared')
+  assert.equal(state._publishVerified, false, 'publish boolean cleared')
+  assert.equal(state._persistVerified, false, 'persist boolean cleared')
+})
+
+test('GAP14: after onSliceRemoved, crash-resume does NOT re-extract the removed slice', () => {
+  const state = {
+    persistenceTracker: null,
+    published: { published: true },
+    persist: { persisted: true },
+    _publishVerified: true,
+    _persistVerified: true,
+  }
+  const qe = {
+    lifecycle: 'runnable',
+    status: 'done',
+    factsPath: '/docs/facts.md',
+    designPath: '/docs/design.md',
+  }
+  onSliceRemoved(state, 's1', qe)
+
+  // Simulate crash-resume: removed slice must stay terminal
+  assert.equal(qe.lifecycle, 'excluded', 'lifecycle stays excluded')
+  assert.notEqual(qe.status, 'pending', 'NOT pending — terminal')
+  assert.equal(qe.factsPath, '/docs/facts.md', 'artifact paths preserved as history')
+  assert.equal(qe.designPath, '/docs/design.md', 'artifact paths preserved as history')
+  assert.equal(state.published, null, 'parent publish reruns')
+  assert.equal(state.persist, null, 'parent persist reruns')
+})
