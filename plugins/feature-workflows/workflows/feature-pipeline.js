@@ -55,6 +55,7 @@ export const meta = {
     { title: 'Promote' },
     { title: 'Registry Lookup' },
     { title: 'Registry Recovery' },
+    { title: 'Reconcile Slices' },
   ],
 }
 
@@ -1196,6 +1197,100 @@ const REGISTRY_FILE = {
       type: 'object',
       description: 'Map of featureId to REGISTRY_ENTRY',
       additionalProperties: REGISTRY_ENTRY,
+    },
+  },
+}
+
+// RECONCILE_FILE: a file with its content fingerprint (shared input/output shape for reconcile).
+const RECONCILE_FILE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path', 'contentSha256'],
+  properties: {
+    path: { type: 'string', description: 'Repo-relative POSIX path' },
+    contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+  },
+}
+
+// RECONCILE_DELTA: change record returned by reconcileSlices.
+const RECONCILE_DELTA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['added', 'removed', 'moved', 'newSlices', 'removedSlices', 'overlaps'],
+  properties: {
+    added: {
+      type: 'array',
+      description: 'Files assigned to an existing non-removed slice via prefix score',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that received the file' },
+        },
+      },
+    },
+    removed: {
+      type: 'array',
+      description: 'Files dropped from their owner (old path no longer in current set)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that lost the file' },
+        },
+      },
+    },
+    moved: {
+      type: 'array',
+      description: 'Files whose path changed but contentSha256 uniquely matches a gone old path',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['oldPath', 'newPath', 'contentSha256', 'sliceId'],
+        properties: {
+          oldPath: { type: 'string' },
+          newPath: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Original owner (unchanged)' },
+        },
+      },
+    },
+    newSlices: {
+      type: 'array',
+      description: 'New slices created from zero-score clusters',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sliceId', 'files'],
+        properties: {
+          sliceId: { type: 'string' },
+          files: { type: 'array', items: RECONCILE_FILE },
+        },
+      },
+    },
+    removedSlices: {
+      type: 'array',
+      description: 'Slices emptied by membership loss (terminal for re-extraction)',
+      items: { type: 'string' },
+    },
+    overlaps: {
+      type: 'array',
+      description: 'Overlap conflicts resolved by lex-smallest sliceId',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'winnerSliceId', 'loserSliceId'],
+        properties: {
+          path: { type: 'string' },
+          winnerSliceId: { type: 'string' },
+          loserSliceId: { type: 'string' },
+        },
+      },
     },
   },
 }
@@ -6022,6 +6117,343 @@ async function recoverRegistry(arg) {
   // Write recovered registry atomically.
   await writeRegistry(registryPath, updatedRegistry, result)
   return { recovered: recovered, failed: failed, registry: updatedRegistry }
+}
+
+// ---- Slice ownership reconciliation (D2.1) ----------------------------------
+
+// Split a POSIX path into directory segments (drop the filename).
+// "src/auth/login.ts" -> ["src", "auth"]. "README.md" -> []. PURE.
+function directorySegments(filePath) {
+  var parts = String(filePath || '').split('/')
+  if (parts.length > 0) parts.pop()
+  return parts.filter(Boolean)
+}
+
+// First 2 segments of the full path joined by /.
+// "src/auth/login.ts" -> "src/auth". "README.md" -> null. PURE.
+function twoSegDir(filePath) {
+  var segs = String(filePath || '').split('/').filter(Boolean)
+  if (segs.length < 2) return null
+  return segs[0] + '/' + segs[1]
+}
+
+// computePrefixScore: max over sliceFiles of common-leading-directory-segment count
+// between filePath's directory and each sliceFile's directory. PURE.
+function computePrefixScore(filePath, sliceFiles) {
+  var fileDir = directorySegments(filePath)
+  var best = 0
+  var arr = sliceFiles || []
+  for (var i = 0; i < arr.length; i++) {
+    var sfDir = directorySegments(arr[i].path)
+    var common = 0
+    var len = Math.min(fileDir.length, sfDir.length)
+    for (var j = 0; j < len; j++) {
+      if (fileDir[j] === sfDir[j]) common++
+      else break
+    }
+    if (common > best) best = common
+  }
+  return best
+}
+
+// clusterByTwoSegDir: cluster files by first-2-segment directory via union-find.
+// Same 2-seg dir -> same cluster. null dir or unique dir -> singleton. PURE.
+function clusterByTwoSegDir(files) {
+  var n = (files || []).length
+  if (n === 0) return []
+  var parent = []
+  for (var p = 0; p < n; p++) parent.push(p)
+  function ufFind(x) {
+    while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x] }
+    return x
+  }
+  function ufUnion(a, b) {
+    var ra = ufFind(a), rb = ufFind(b)
+    if (ra !== rb) parent[ra] = rb
+  }
+  var dirs = []
+  for (var d = 0; d < n; d++) dirs.push(twoSegDir(files[d].path))
+  for (var i = 0; i < n; i++) {
+    for (var j = i + 1; j < n; j++) {
+      if (dirs[i] !== null && dirs[i] === dirs[j]) ufUnion(i, j)
+    }
+  }
+  var groups = {}
+  for (var k = 0; k < n; k++) {
+    var r = ufFind(k)
+    if (!groups[r]) groups[r] = []
+    groups[r].push(files[k])
+  }
+  return Object.values(groups)
+}
+
+// deriveClusterSliceId: "slice-<lexSmallest(cluster hashes).slice(0,12)>".
+// Collision (base id already in existingIds) -> append deterministic "-<n>". PURE.
+function deriveClusterSliceId(cluster, existingIds) {
+  var hashes = (cluster || []).map(function (f) { return f.contentSha256 }).sort()
+  var base = 'slice-' + hashes[0].slice(0, 12)
+  if (!existingIds.has(base)) return base
+  var n = 1
+  while (existingIds.has(base + '-' + n)) n++
+  return base + '-' + n
+}
+
+// detectMoves: classify new-path current files as moves or adds.
+// Move = unique contentSha256 match whose old path is gone. Ambiguous (>=2 old paths)
+// or old-path-still-exists -> add. Returns { moves, adds }. PURE.
+function detectMoves(currentFiles, oldPathMap, oldHashMap, currentPathSet) {
+  var moves = []
+  var adds = []
+  var arr = currentFiles || []
+  for (var i = 0; i < arr.length; i++) {
+    var cf = arr[i]
+    if (oldPathMap.has(cf.path)) continue
+    var oldPaths = oldHashMap.get(cf.contentSha256)
+    if (oldPaths && oldPaths.length === 1) {
+      var oldPath = oldPaths[0]
+      if (!currentPathSet.has(oldPath)) {
+        moves.push({
+          newPath: cf.path, oldPath: oldPath,
+          contentSha256: cf.contentSha256,
+          sliceId: oldPathMap.get(oldPath).sliceId,
+        })
+      } else {
+        adds.push(cf)
+      }
+    } else {
+      adds.push(cf)
+    }
+  }
+  return { moves: moves, adds: adds }
+}
+
+// validatePartition: assert every current file is owned by exactly one non-removed
+// output slice. Throws on violation. PURE.
+function validatePartition(slices, currentFiles) {
+  var ownerCount = new Map()
+  var sArr = slices || []
+  for (var i = 0; i < sArr.length; i++) {
+    var s = sArr[i]
+    if (s.status === 'removed') continue
+    var fArr = s.files || []
+    for (var j = 0; j < fArr.length; j++) {
+      var p = fArr[j].path
+      ownerCount.set(p, (ownerCount.get(p) || 0) + 1)
+    }
+  }
+  var cArr = currentFiles || []
+  for (var k = 0; k < cArr.length; k++) {
+    var count = ownerCount.get(cArr[k].path) || 0
+    if (count === 0) throw new Error('Partition violation: ' + cArr[k].path + ' has no owner')
+    if (count > 1) throw new Error('Partition violation: ' + cArr[k].path + ' has ' + count + ' owners')
+  }
+}
+
+// reconcileSlices: PURE ownership reconciliation. No agent calls, no LLM, no I/O.
+// Determines the current slice assignment for every current file and returns the
+// reconciled slices + a change delta. Permutation-invariant (all output sorted).
+function reconcileSlices(persistedSlices, currentFiles) {
+  var pSlices = persistedSlices || []
+  var current = currentFiles || []
+  var delta = { added: [], removed: [], moved: [], newSlices: [], removedSlices: [], overlaps: [] }
+
+  // 1. Build lookup structures from persisted state
+  var oldPathMap = new Map()
+  var oldHashMap = new Map()
+  var currentPathSet = new Set()
+  var nonRemovedSlices = []
+
+  for (var si = 0; si < pSlices.length; si++) {
+    var sl = pSlices[si]
+    if (sl.status !== 'removed') nonRemovedSlices.push(sl)
+    var slFiles = sl.files || []
+    for (var fi = 0; fi < slFiles.length; fi++) {
+      var pf = slFiles[fi]
+      oldPathMap.set(pf.path, { sliceId: sl.sliceId, contentSha256: pf.contentSha256 })
+      if (!oldHashMap.has(pf.contentSha256)) oldHashMap.set(pf.contentSha256, [])
+      oldHashMap.get(pf.contentSha256).push(pf.path)
+    }
+  }
+  for (var ci = 0; ci < current.length; ci++) currentPathSet.add(current[ci].path)
+
+  // 2. Classify current files — detect moves/adds for new-path files
+  var moveResult = detectMoves(current, oldPathMap, oldHashMap, currentPathSet)
+  var moves = moveResult.moves
+  var adds = moveResult.adds
+  var movedOldPaths = new Set(moves.map(function (m) { return m.oldPath }))
+
+  // Track modified paths (same path, different hash)
+  var modifiedPaths = new Set()
+  for (var mi = 0; mi < current.length; mi++) {
+    var cf2 = current[mi]
+    if (oldPathMap.has(cf2.path) && oldPathMap.get(cf2.path).contentSha256 !== cf2.contentSha256) {
+      modifiedPaths.add(cf2.path)
+    }
+  }
+
+  // 3. Assign added files to non-removed slices by prefix score (tie -> lex-smallest sliceId)
+  var sortedNonRemoved = nonRemovedSlices.slice().sort(function (a, b) {
+    return a.sliceId < b.sliceId ? -1 : a.sliceId > b.sliceId ? 1 : 0
+  })
+  var zeroScoreFiles = []
+  var addAssignments = new Map()
+
+  for (var ai = 0; ai < adds.length; ai++) {
+    var add = adds[ai]
+    var bestSliceId = null
+    var bestScore = 0
+    for (var nsi = 0; nsi < sortedNonRemoved.length; nsi++) {
+      var score = computePrefixScore(add.path, sortedNonRemoved[nsi].files)
+      if (score > bestScore) {
+        bestScore = score
+        bestSliceId = sortedNonRemoved[nsi].sliceId
+      }
+    }
+    if (bestScore > 0) {
+      addAssignments.set(add.path, bestSliceId)
+    } else {
+      zeroScoreFiles.push(add)
+    }
+  }
+
+  // 4. Cluster zero-score files into new slices
+  var clusters = clusterByTwoSegDir(zeroScoreFiles)
+  var existingIds = new Set()
+  for (var ei = 0; ei < pSlices.length; ei++) existingIds.add(pSlices[ei].sliceId)
+  var newSliceMap = new Map()
+  var newSliceOrder = []
+  for (var cli = 0; cli < clusters.length; cli++) {
+    var cluster = clusters[cli]
+    var newId = deriveClusterSliceId(cluster, existingIds)
+    existingIds.add(newId)
+    newSliceMap.set(newId, cluster)
+    newSliceOrder.push(newId)
+  }
+
+  // 5. Build owner map: path -> sliceId for every current file
+  var ownerByPath = new Map()
+  var currentFileByPath = new Map()
+  for (var cfi = 0; cfi < current.length; cfi++) {
+    var cf3 = current[cfi]
+    currentFileByPath.set(cf3.path, cf3)
+    if (oldPathMap.has(cf3.path)) ownerByPath.set(cf3.path, oldPathMap.get(cf3.path).sliceId)
+  }
+  for (var mvi = 0; mvi < moves.length; mvi++) ownerByPath.set(moves[mvi].newPath, moves[mvi].sliceId)
+  addAssignments.forEach(function (sliceId, path) { ownerByPath.set(path, sliceId) })
+  newSliceMap.forEach(function (cluster, sliceId) {
+    for (var cli2 = 0; cli2 < cluster.length; cli2++) ownerByPath.set(cluster[cli2].path, sliceId)
+  })
+
+  // 6. Build per-slice file lists
+  var filesBySlice = new Map()
+  ownerByPath.forEach(function (sliceId, path) {
+    if (!filesBySlice.has(sliceId)) filesBySlice.set(sliceId, [])
+    var cf4 = currentFileByPath.get(path)
+    filesBySlice.get(sliceId).push({ path: cf4.path, contentSha256: cf4.contentSha256 })
+  })
+
+  // 7. Build output slices + delta
+  var outputSlices = []
+  for (var oi = 0; oi < pSlices.length; oi++) {
+    var orig = pSlices[oi]
+    if (orig.status === 'removed') {
+      outputSlices.push({ sliceId: orig.sliceId, files: [], status: 'removed', planDir: orig.planDir || '' })
+      continue
+    }
+    var owned = filesBySlice.get(orig.sliceId) || []
+    owned.sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+    var hasChanges = false
+
+    var origFiles = orig.files || []
+    for (var ri = 0; ri < origFiles.length; ri++) {
+      if (!currentPathSet.has(origFiles[ri].path) && !movedOldPaths.has(origFiles[ri].path)) {
+        hasChanges = true
+        delta.removed.push({ path: origFiles[ri].path, sliceId: orig.sliceId })
+      }
+    }
+    for (var ofi = 0; ofi < owned.length; ofi++) {
+      if (modifiedPaths.has(owned[ofi].path)) hasChanges = true
+      if (addAssignments.has(owned[ofi].path)) {
+        hasChanges = true
+        delta.added.push({ path: owned[ofi].path, contentSha256: owned[ofi].contentSha256, sliceId: orig.sliceId })
+      }
+    }
+    for (var mvi2 = 0; mvi2 < moves.length; mvi2++) {
+      if (moves[mvi2].sliceId === orig.sliceId) {
+        hasChanges = true
+        delta.moved.push({
+          oldPath: moves[mvi2].oldPath, newPath: moves[mvi2].newPath,
+          contentSha256: moves[mvi2].contentSha256, sliceId: orig.sliceId,
+        })
+      }
+    }
+    var status
+    if (owned.length === 0) {
+      status = 'removed'
+      delta.removedSlices.push(orig.sliceId)
+    } else if (hasChanges) {
+      status = 'pending'
+    } else {
+      status = orig.status || 'current'
+    }
+    outputSlices.push({ sliceId: orig.sliceId, files: owned, status: status, planDir: orig.planDir || '' })
+  }
+
+  // Add new slices from zero-score clusters
+  for (var nsi2 = 0; nsi2 < newSliceOrder.length; nsi2++) {
+    var nsId = newSliceOrder[nsi2]
+    var nsFiles = newSliceMap.get(nsId).slice().sort(function (a, b) {
+      return a.path < b.path ? -1 : a.path > b.path ? 1 : 0
+    })
+    outputSlices.push({ sliceId: nsId, files: nsFiles, status: 'pending', planDir: '' })
+    delta.newSlices.push({ sliceId: nsId, files: nsFiles })
+    for (var nfi = 0; nfi < nsFiles.length; nfi++) {
+      delta.added.push({ path: nsFiles[nfi].path, contentSha256: nsFiles[nfi].contentSha256, sliceId: nsId })
+    }
+  }
+
+  // 8. Resolve overlaps — lex-smallest sliceId wins
+  var pathOwners = new Map()
+  for (var osi = 0; osi < outputSlices.length; osi++) {
+    if (outputSlices[osi].status === 'removed') continue
+    var outFiles = outputSlices[osi].files || []
+    for (var ofi2 = 0; ofi2 < outFiles.length; ofi2++) {
+      var p2 = outFiles[ofi2].path
+      if (!pathOwners.has(p2)) pathOwners.set(p2, [])
+      pathOwners.get(p2).push(outputSlices[osi].sliceId)
+    }
+  }
+  pathOwners.forEach(function (owners, path) {
+    if (owners.length > 1) {
+      owners.sort()
+      var winner = owners[0]
+      for (var li = 1; li < owners.length; li++) {
+        delta.overlaps.push({ path: path, winnerSliceId: winner, loserSliceId: owners[li] })
+      }
+      for (var osi2 = 0; osi2 < outputSlices.length; osi2++) {
+        if (owners.indexOf(outputSlices[osi2].sliceId) > 0) {
+          outputSlices[osi2].files = outputSlices[osi2].files.filter(function (f) { return f.path !== path })
+        }
+      }
+    }
+  })
+
+  // 9. Validate partition invariant
+  validatePartition(outputSlices, current)
+
+  // 10. Sort all output for permutation invariance
+  delta.added.sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+  delta.removed.sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+  delta.moved.sort(function (a, b) { return a.newPath < b.newPath ? -1 : a.newPath > b.newPath ? 1 : 0 })
+  delta.newSlices.sort(function (a, b) { return a.sliceId < b.sliceId ? -1 : a.sliceId > b.sliceId ? 1 : 0 })
+  delta.removedSlices.sort()
+  delta.overlaps.sort(function (a, b) {
+    if (a.path !== b.path) return a.path < b.path ? -1 : 1
+    return a.loserSliceId < b.loserSliceId ? -1 : 1
+  })
+  outputSlices.sort(function (a, b) { return a.sliceId < b.sliceId ? -1 : a.sliceId > b.sliceId ? 1 : 0 })
+
+  return { slices: outputSlices, delta: delta }
 }
 
 // ---- Review mode (standalone design-docset audit) ---------------------------

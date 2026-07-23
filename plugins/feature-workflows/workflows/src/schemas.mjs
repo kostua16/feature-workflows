@@ -1142,4 +1142,98 @@ const REGISTRY_FILE = {
   },
 }
 
-export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT, PREFLIGHT_VERDICT, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD, REGISTRY_ENTRY, REGISTRY_FILE }
+// RECONCILE_FILE: a file with its content fingerprint (shared input/output shape for reconcile).
+const RECONCILE_FILE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path', 'contentSha256'],
+  properties: {
+    path: { type: 'string', description: 'Repo-relative POSIX path' },
+    contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+  },
+}
+
+// RECONCILE_DELTA: change record returned by reconcileSlices.
+const RECONCILE_DELTA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['added', 'removed', 'moved', 'newSlices', 'removedSlices', 'overlaps'],
+  properties: {
+    added: {
+      type: 'array',
+      description: 'Files assigned to an existing non-removed slice via prefix score',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that received the file' },
+        },
+      },
+    },
+    removed: {
+      type: 'array',
+      description: 'Files dropped from their owner (old path no longer in current set)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that lost the file' },
+        },
+      },
+    },
+    moved: {
+      type: 'array',
+      description: 'Files whose path changed but contentSha256 uniquely matches a gone old path',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['oldPath', 'newPath', 'contentSha256', 'sliceId'],
+        properties: {
+          oldPath: { type: 'string' },
+          newPath: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Original owner (unchanged)' },
+        },
+      },
+    },
+    newSlices: {
+      type: 'array',
+      description: 'New slices created from zero-score clusters',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sliceId', 'files'],
+        properties: {
+          sliceId: { type: 'string' },
+          files: { type: 'array', items: RECONCILE_FILE },
+        },
+      },
+    },
+    removedSlices: {
+      type: 'array',
+      description: 'Slices emptied by membership loss (terminal for re-extraction)',
+      items: { type: 'string' },
+    },
+    overlaps: {
+      type: 'array',
+      description: 'Overlap conflicts resolved by lex-smallest sliceId',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'winnerSliceId', 'loserSliceId'],
+        properties: {
+          path: { type: 'string' },
+          winnerSliceId: { type: 'string' },
+          loserSliceId: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT, PREFLIGHT_VERDICT, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD, REGISTRY_ENTRY, REGISTRY_FILE, RECONCILE_FILE, RECONCILE_DELTA }

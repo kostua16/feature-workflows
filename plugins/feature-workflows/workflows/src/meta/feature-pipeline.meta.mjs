@@ -46,5 +46,6 @@ export const meta = {
     { title: 'Promote' },
     { title: 'Registry Lookup' },
     { title: 'Registry Recovery' },
+    { title: 'Reconcile Slices' },
   ],
 }

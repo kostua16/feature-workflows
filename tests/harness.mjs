@@ -256,6 +256,15 @@ const CANDIDATES = [
   'REGISTRY_PATH',
   'REGISTRY_ENTRY',
   'REGISTRY_FILE',
+  // Phase 15 — slice ownership reconciliation (D2.1)
+  'computePrefixScore',
+  'clusterByTwoSegDir',
+  'deriveClusterSliceId',
+  'detectMoves',
+  'validatePartition',
+  'reconcileSlices',
+  'RECONCILE_FILE',
+  'RECONCILE_DELTA',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)
