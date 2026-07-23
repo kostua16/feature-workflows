@@ -1,10 +1,11 @@
 ---
 phase: 14
 slug: feature-identity-registry-lookup-integrity
-status: pending
+status: complete
 nyquist_compliant: true
-wave_0_complete: false
+wave_0_complete: true
 created: 2026-07-23
+validated: 2026-07-24
 ---
 
 # Phase 14 — Validation Strategy
@@ -136,11 +137,33 @@ All phase behaviors have automated verification.
 
 ## Validation Sign-Off
 
-- [ ] All tasks have automated verify
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 16s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have automated verify
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 16s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending implementation
+**Approval:** validated 2026-07-24
+
+## Nyquist Validation Audit (2026-07-24)
+
+**Post-completion audit** filled 50 characterization tests in
+`tests/phase14-nyquist-validation.test.mjs`, closing these gaps:
+
+| Gap | Dimension | Tests Added |
+|-----|-----------|-------------|
+| GAP-1: findFeature boundary robustness (malformed inputs, threshold edges) | D1 — Boundary | 12 |
+| GAP-2: upsertRegistryEntry robustness (null/undefined registry, immutability) | D7 — Cross-cutting | 5 |
+| GAP-3: Agent-mediated behavioral tests (readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision via mock globalThis.agent) | D1-D6 — all | 11 |
+| GAP-4: Schema deep validation (optionality, type checks, cross-references) | D2 — Schema | 10 |
+| GAP-5: Integration wiring (recoverRegistry ordering, root-last field preservation, collision no-promotion) | D5-D6 — Atomicity + Integration | 8 |
+| Integration: findFeature + upsertRegistryEntry combined flow | D7 — Cross-cutting | 2 |
+| Agent-mediated edge case: missing featureId in collision identity | D3 — Collision | 1 |
+| Pure-function edge: findFeature with null arg, null registryFeatures | D1 — Boundary | 1 |
+
+**No defects found.** Implementation matches plan specification.
+**No source changes** — all gaps were test-coverage only.
+
+Test totals: 1878 baseline + 50 characterization = **1928 pass / 0 fail**.
+Build drift: **clean** (no source changes).
