@@ -29,7 +29,7 @@ Build/drift, version lockstep, six-mode compatibility (design/implement/tune/ext
 - [ ] **Phase 16: Change Detection** — fail-closed full-digest comparison.
 - [ ] **Phase 17: Invalidation Chain & Removal Path** — full chain incl. publish/persist evidence + removal parent path.
 - [ ] **Phase 18: Upsert Entrypoints & v1.5 Migration** — auto-update default + flags + `--adopt`.
-- [ ] **Phase 19: Compatibility & Proof** — regression + E2E characterization + adopt dogfood.
+- [x] **Phase 19: Compatibility & Proof** — regression + E2E characterization + adopt dogfood.
 
 ### Phase Details
 
@@ -146,7 +146,7 @@ Build/drift, version lockstep, six-mode compatibility (design/implement/tune/ext
 | 16. Change Detection | v1.6.0 | 0/1 | Not started | — |
 | 17. Invalidation Chain & Removal | v1.6.0 | 0/1 | Not started | — |
 | 18. Upsert & Migration | v1.6.0 | 0/1 | Not started | — |
-| 19. Compatibility & Proof | v1.6.0 | 0/1 | Not started | — |
+| 19. Compatibility & Proof | v1.6.0 | 1/1 | Complete | 2026-07-24 |
 
 ## Deferred to Future Milestones
 
