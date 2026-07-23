@@ -204,6 +204,39 @@ Examples:
 /extract-design --confirm a1b2c3d4e5f60718
 ```
 
+## Feature-identity registry
+
+Each extracted feature is registered in `docs/extract/.registry.json` — a single JSON index of all
+extracted features. Each feature folder also has a `.identity.json` sidecar holding the immutable
+ownership identity (`ownershipScopeDigest` — the full 64-hex SHA-256 scope digest, fixed at creation).
+
+**Rename-resilient lookup:** when you re-run `/extract-design` on code that has been renamed or
+reorganized, the registry finds the existing feature by content hash matching (not just file paths).
+A current file matches a registry feature if its path OR `contentSha256` appears in the feature's
+file set. This means a full rename of every file still resolves to the same feature folder.
+
+**Defensible threshold:** ambiguous or weak matches are blocked (not silently mismerged). A match is
+"strong" only if the anchor file matches OR a majority of files match. Weak-only matches (e.g. two
+features sharing only a `package.json`/`tsconfig.json`) are blocked. Use `--feature=<featureId>` to
+select a specific feature or `--new` to create a new folder.
+
+**Collision guard:** on new-feature folder creation, if the derived `planDir` already exists with a
+different `ownershipScopeDigest`, the upsert is aborted — it will not overwrite another feature's
+folder. Same digest is idempotent (safe re-run).
+
+**Startup recovery:** on each run, any registry entries left in `status: 'extracting'` (from an
+interrupted run) are reconciled from current `pipeline-state.json`. Entries with complete extraction
+evidence are promoted to `current`; entries with missing or incomplete evidence are marked `stale`
+(fail-closed). Immutable ownership fields are always sourced from `.identity.json` sidecars, never
+from the potentially-stale registry.
+
+**Atomic writes:** all registry and sidecar writes use temp-then-rename to prevent torn JSON on crash.
+The root-last readiness commit sets `status` to `current` only after extraction + publish + persist
+are durable.
+
+**Concurrency:** concurrent same-feature invocations are explicitly UNSUPPORTED (may corrupt state).
+Run one extract/update at a time per feature.
+
 ## Editing the workflow script
 
 The canonical engine source lives in the plugin at `plugins/feature-workflows/workflows/feature-pipeline.js`

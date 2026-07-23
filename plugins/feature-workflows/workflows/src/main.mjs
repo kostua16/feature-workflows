@@ -7,7 +7,7 @@ import { computeContentDigest } from './revision.mjs'
 import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
-import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix } from './extract-scope.mjs'
+import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH } from './extract-scope.mjs'
 import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectReviewDocs, buildReviewReport, runReviewLenses, mergeReviewFindings, verifyReviewFindings, recordReviewIssues } from './review-mode.mjs'
 import { extractSlice, writeSystemOverview } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
@@ -1158,11 +1158,22 @@ ${task}`,
     // output is a /tune-feature- and /design-feature-compatible baseline. Runs AFTER
     // Translate (free-text scope input benefits from translation), never enters E4.
     if (isExtractMode) {
+      // Startup registry recovery: reconcile 'extracting' entries from current
+      // pipeline-state + sidecars before any extraction work. Entries with
+      // incomplete evidence are marked 'stale' (fail-closed).
+      phase('Registry Recovery')
+      var recoveryResult = await recoverRegistry({ registryPath: REGISTRY_PATH, result: result })
+      if (recoveryResult && recoveryResult.failed > 0) {
+        plog('Registry Recovery: ' + recoveryResult.recovered + ' recovered, ' + recoveryResult.failed + ' failed (marked stale)')
+      }
+      stateCheckpoint('Registry Recovery', 'done')
+
       // --confirm promotion: if entering via --confirm <pendingId>, promote the
       // pending record before Gate X0. Promotion creates the folder, writes
       // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
       // and appends the permanent locator entry. Crash-idempotent on replay.
       if (confirmRecord && !result.scopeManifestPath) {
+        phase('Promote')
         phase('Promote')
         // Override planDir with the deterministic folder from the pending record.
         if (confirmRecord.derivedPlanDir) planDir = confirmRecord.derivedPlanDir
@@ -1188,6 +1199,32 @@ ${task}`,
           await writeOpenQuestions(planDir, confirmRecord.verdict.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
         }
         plog('Promoted ' + confirmRecord.pendingId + ' -> ' + planDir + ' (' + (promo.isNew ? 'NEW' : 'EXISTING') + ')')
+
+        // Registry upsert after promotion: write the registry entry with initial
+        // status 'extracting'. Root-last readiness commit (status→'current') happens
+        // after extraction+publish+persist are durable.
+        if (promo.isNew && confirmRecord.featureId) {
+          phase('Registry Lookup')
+          var existingReg = await readRegistry(REGISTRY_PATH, result)
+          if (!existingReg) existingReg = { features: {} }
+          var registryEntry = {
+            featureId: confirmRecord.featureId,
+            planDir: planDir,
+            ownershipScopeDigest: confirmRecord.scopeDigest,
+            scopeId16: confirmRecord.scopeId16 || '',
+            files: (confirmRecord.fileHashes || []).map(function (fh) {
+              return { path: fh.path, contentSha256: fh.contentSha256 }
+            }),
+            anchorPath: confirmRecord.anchorPath || '',
+            status: 'extracting',
+            updatedAt: String((args && args.timestamp) || ''),
+          }
+          var updatedReg = upsertRegistryEntry(existingReg, registryEntry)
+          await writeRegistry(REGISTRY_PATH, updatedReg, result)
+          plog('Registry: upserted entry for ' + confirmRecord.featureId + ' (status=extracting)')
+          stateCheckpoint('Registry Lookup', 'done')
+        }
+
         stateCheckpoint('Promote', 'done')
       }
 
@@ -1232,6 +1269,82 @@ ${task}`,
         }
         // Override planDir with the deterministic derived folder (Phase 13).
         if (preflight.derivedPlanDir) planDir = preflight.derivedPlanDir
+
+        // Feature-identity registry lookup: determine if this scope reuses an
+        // existing feature folder (rename-resilient via content hash matching),
+        // creates a new one, or is ambiguous/blocked.
+        phase('Registry Lookup')
+        var registry = await readRegistry(REGISTRY_PATH, result)
+        if (!registry) registry = { features: {} }
+        var registryFeatures = Object.keys(registry.features).map(function (fid) {
+          return registry.features[fid]
+        })
+        var findResult = findFeature({
+          currentFiles: preflight.fileHashes || [],
+          currentAnchor: preflight.anchorPath || '',
+          registryFeatures: registryFeatures,
+        })
+        preflight.findFeatureDecision = findResult.decision
+        preflight.findFeatureFeatureId = findResult.featureId || null
+        preflight.findFeatureMatchCount = findResult.matchCount || 0
+        plog('Registry Lookup: findFeature decision=' + findResult.decision +
+          (findResult.featureId ? ' featureId=' + findResult.featureId : '') +
+          (findResult.reason ? ' reason=' + findResult.reason : ''))
+
+        if (findResult.decision === 'reuse') {
+          // Sticky folder: override planDir to the reused feature's folder.
+          var reusedEntry = registry.features[findResult.featureId]
+          if (reusedEntry && reusedEntry.planDir) {
+            planDir = reusedEntry.planDir
+            preflight.derivedPlanDir = planDir
+            plog('Registry Lookup: reusing existing folder ' + planDir + ' for ' + findResult.featureId)
+          }
+        } else if (findResult.decision === 'blocked') {
+          // Ambiguous or weak-only match — block with guidance.
+          result.blockedAt = 'registry-lookup-ambiguous'
+          result.handoff = {
+            from: 'extract',
+            message: 'Feature identity is ambiguous (' + (findResult.reason || 'unknown') +
+              '). Use --feature=<featureId> to select a specific feature, or --new to create a new folder.',
+            nextMode: 'extract',
+            planDir: planDir,
+            findFeatureReason: findResult.reason || 'unknown',
+            candidates: findResult.candidates || [],
+            weakMatches: findResult.weakMatches || [],
+          }
+          plog('Registry Lookup: blocked — ' + (findResult.reason || 'unknown'))
+          stateCheckpoint('Registry Lookup', 'blocked')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // For 'new' decision: collision guard before promotion.
+        if (findResult.decision === 'new') {
+          var collision = await checkFolderCollision({
+            planDir: planDir,
+            requesterDigest: preflight.scopeDigest,
+            result: result,
+          })
+          if (collision && collision.collision) {
+            result.blockedAt = 'registry-collision'
+            result.handoff = {
+              from: 'extract',
+              message: 'Folder ' + planDir + ' is owned by feature ' + collision.existingFeatureId +
+                '. Use --feature=' + collision.existingFeatureId + ' to update it, or --new to create a distinct folder.',
+              nextMode: 'extract',
+              planDir: planDir,
+              collisionWith: collision.existingFeatureId,
+            }
+            plog('Registry Lookup: collision with ' + collision.existingFeatureId + ' at ' + planDir)
+            stateCheckpoint('Registry Lookup', 'collision')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'done')
+
         // Write pending record — the ONLY durable state before promotion.
         // pipeline-state.json is intentionally NOT written (RED gate: --resume
         // cannot resume a not-yet-promoted checkpoint).
@@ -1724,6 +1837,34 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       }
       stateCheckpoint('Extract', 'done')
       plog(`Extract: extractReady=${readiness.ready} (${readiness.reason}) — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+
+      // Root-last readiness commit: after extraction + publish + persist are durable,
+      // update the registry entry status from 'extracting' to 'current'. This is the
+      // final registry write — the root of the readiness tree.
+      if (readiness.ready) {
+        phase('Registry Lookup')
+        var readyReg = await readRegistry(REGISTRY_PATH, result)
+        if (readyReg && readyReg.features) {
+          // Find the registry entry for this feature (by planDir match).
+          var readyFeatureId = null
+          var readyFeatures = Object.keys(readyReg.features)
+          for (var rfi = 0; rfi < readyFeatures.length; rfi++) {
+            if (readyReg.features[readyFeatures[rfi]].planDir === planDir) {
+              readyFeatureId = readyFeatures[rfi]
+              break
+            }
+          }
+          if (readyFeatureId) {
+            var readyEntry = readyReg.features[readyFeatureId]
+            readyEntry.status = 'current'
+            readyEntry.updatedAt = String((args && args.timestamp) || '')
+            var rootLastReg = upsertRegistryEntry(readyReg, readyEntry)
+            await writeRegistry(REGISTRY_PATH, rootLastReg, result)
+            plog('Registry: root-last readiness commit — ' + readyFeatureId + ' status→current')
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'root-last-done')
+      }
 
       // Phase 6: track the durable consolidate write through the persistence tracker.
       result.persistenceTracker = recordAttemptedWrite(

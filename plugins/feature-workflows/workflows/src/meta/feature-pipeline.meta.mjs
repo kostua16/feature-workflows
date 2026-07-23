@@ -44,5 +44,7 @@ export const meta = {
     { title: 'Pending Confirm' },
     { title: 'Hash Sources' },
     { title: 'Promote' },
+    { title: 'Registry Lookup' },
+    { title: 'Registry Recovery' },
   ],
 }

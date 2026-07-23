@@ -245,6 +245,17 @@ const CANDIDATES = [
   'writeIdentity',
   'HASH_SOURCES_VERDICT',
   'IDENTITY_RECORD',
+  // Phase 14 — feature-identity registry, lookup & integrity (D1.2-D1.4)
+  'findFeature',
+  'upsertRegistryEntry',
+  'readRegistry',
+  'writeRegistry',
+  'readIdentitySidecar',
+  'checkFolderCollision',
+  'recoverRegistry',
+  'REGISTRY_PATH',
+  'REGISTRY_ENTRY',
+  'REGISTRY_FILE',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

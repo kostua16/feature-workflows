@@ -308,13 +308,13 @@ test('source: preflight awaiting-confirm return does NOT call consolidate', () =
 
 test('source: preflight return writes pending record', () => {
   const preflightStart = source.indexOf('Fresh run — preflight')
-  const section = source.slice(preflightStart, preflightStart + 3500)
+  const section = source.slice(preflightStart, preflightStart + 7000)
   assert.match(section, /writePendingRecord/)
 })
 
 test('source: preflight return includes pendingId in handoff', () => {
   const preflightStart = source.indexOf('Fresh run — preflight')
-  const section = source.slice(preflightStart, preflightStart + 3000)
+  const section = source.slice(preflightStart, preflightStart + 6000)
   assert.match(section, /pendingId/)
   assert.match(section, /awaiting-scope-confirm/)
 })

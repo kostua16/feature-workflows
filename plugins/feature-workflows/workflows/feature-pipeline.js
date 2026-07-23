@@ -53,6 +53,8 @@ export const meta = {
     { title: 'Pending Confirm' },
     { title: 'Hash Sources' },
     { title: 'Promote' },
+    { title: 'Registry Lookup' },
+    { title: 'Registry Recovery' },
   ],
 }
 
@@ -1150,6 +1152,51 @@ const LOCATOR_ENTRY = {
     featureId: { type: 'string' },
     planDir: { type: 'string' },
     promotedAt: { type: 'string' },
+  },
+}
+
+// REGISTRY_ENTRY: a single feature's entry in docs/extract/.registry.json.
+// The files array carries current per-file hashes (mutable — rebuilt from
+// pipeline-state on recovery). Immutable ownership fields come from .identity.json.
+const REGISTRY_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['featureId', 'planDir', 'ownershipScopeDigest', 'scopeId16', 'files', 'status', 'updatedAt'],
+  properties: {
+    featureId: { type: 'string', description: 'Deterministic feature id' },
+    planDir: { type: 'string', description: 'Repo-relative POSIX folder path' },
+    ownershipScopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 scope digest (immutable, mirrors .identity.json)' },
+    scopeId16: { type: 'string', description: '16-hex display/folder id' },
+    files: {
+      type: 'array',
+      description: 'Current file set with content hashes',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string' },
+          contentSha256: { type: 'string' },
+        },
+      },
+    },
+    anchorPath: { type: 'string', description: 'Anchor file path (lex-smallest, immutable ownership evidence)' },
+    status: { type: 'string', enum: ['extracting', 'current', 'stale'], description: 'Registry lifecycle status' },
+    updatedAt: { type: 'string', description: 'ISO timestamp of last registry update' },
+  },
+}
+
+// REGISTRY_FILE: the top-level registry shape — a map of featureId to REGISTRY_ENTRY.
+const REGISTRY_FILE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['features'],
+  properties: {
+    features: {
+      type: 'object',
+      description: 'Map of featureId to REGISTRY_ENTRY',
+      additionalProperties: REGISTRY_ENTRY,
+    },
   },
 }
 
@@ -5604,6 +5651,379 @@ async function promotePendingRecord(arg) {
   return { promoted: true, record: promotedRecord, isNew: !isExisting }
 }
 
+// ---- Feature-identity registry (Phase 14 / D1.2-D1.4) -----------------------
+
+// Registry path — the single JSON index of all extracted features.
+const REGISTRY_PATH = 'docs/extract/.registry.json'
+
+// File-reader result schemas for registry + sidecar reads (local — not exported).
+var REGISTRY_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['registry'],
+  properties: {
+    registry: { type: ['object', 'null'], description: 'Parsed registry object, or null if the file does not exist or is corrupt' },
+  },
+}
+
+var IDENTITY_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['identity'],
+  properties: {
+    identity: { type: ['object', 'null'], description: 'Parsed identity record, or null if the file does not exist' },
+  },
+}
+
+var PIPELINE_STATE_FOR_RECOVERY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['state'],
+  properties: {
+    state: { type: ['object', 'null'], description: 'Parsed pipeline-state.json, or null if missing' },
+  },
+}
+
+// findFeature: rename-resilient feature lookup. PURE — no agent calls, no I/O.
+// Determines whether a current scope reuses an existing feature folder, creates a
+// new one, or is ambiguous/blocked. A file matches by path OR contentSha256
+// (survives full rename). Strong = anchor match OR majority of min(counts).
+function findFeature(arg) {
+  var currentFiles = (arg && arg.currentFiles) || []
+  var currentAnchor = (arg && arg.currentAnchor) || ''
+  var registryFeatures = (arg && arg.registryFeatures) || []
+
+  // Empty input — nothing to match against.
+  if (!currentFiles.length) {
+    return { decision: 'blocked', reason: 'empty-current-files' }
+  }
+
+  // Build current path and hash lookup sets.
+  var currentPathSet = new Set()
+  var currentHashSet = new Set()
+  for (var i = 0; i < currentFiles.length; i++) {
+    var cf = currentFiles[i]
+    if (cf && cf.path) currentPathSet.add(cf.path)
+    if (cf && cf.contentSha256) currentHashSet.add(cf.contentSha256)
+  }
+
+  var strongCandidates = []
+  var weakMatches = []
+
+  for (var j = 0; j < registryFeatures.length; j++) {
+    var feat = registryFeatures[j]
+    if (!feat || !feat.files) continue
+
+    var featPathSet = new Set()
+    var featHashSet = new Set()
+    for (var k = 0; k < feat.files.length; k++) {
+      var ff = feat.files[k]
+      if (ff && ff.path) featPathSet.add(ff.path)
+      if (ff && ff.contentSha256) featHashSet.add(ff.contentSha256)
+    }
+
+    // Count current files matching by path OR hash (dedup: a file matching both counts once).
+    var totalMatches = 0
+    for (var m = 0; m < currentFiles.length; m++) {
+      var cur = currentFiles[m]
+      var matchByPath = cur && cur.path && featPathSet.has(cur.path)
+      var matchByHash = cur && cur.contentSha256 && featHashSet.has(cur.contentSha256)
+      if (matchByPath || matchByHash) totalMatches++
+    }
+
+    var anchorMatch = currentAnchor && feat.anchorPath && currentAnchor === feat.anchorPath
+    var minCount = Math.min(currentFiles.length, feat.files.length)
+    var majority = Math.floor(minCount / 2) + 1
+    var isStrong = anchorMatch || totalMatches >= majority
+
+    if (isStrong) {
+      strongCandidates.push({
+        featureId: feat.featureId,
+        matchCount: totalMatches,
+        anchorMatch: !!anchorMatch,
+      })
+    } else if (totalMatches > 0) {
+      weakMatches.push({ featureId: feat.featureId, matchCount: totalMatches })
+    }
+  }
+
+  // Decision logic:
+  // Zero strong → new (if no weak) or blocked weak-only (if some overlap).
+  // One strong → reuse (trivially strictly-highest).
+  // Two+ strong → find strictly-highest; tie at top → blocked ambiguous.
+  if (!strongCandidates.length) {
+    if (weakMatches.length) {
+      return { decision: 'blocked', reason: 'weak-only-match', weakMatches: weakMatches }
+    }
+    return { decision: 'new' }
+  }
+
+  if (strongCandidates.length === 1) {
+    return {
+      decision: 'reuse',
+      featureId: strongCandidates[0].featureId,
+      matchCount: strongCandidates[0].matchCount,
+    }
+  }
+
+  // Two+ strong candidates — find the strictly-highest match count.
+  strongCandidates.sort(function (a, b) { return b.matchCount - a.matchCount })
+  var topCount = strongCandidates[0].matchCount
+  var tied = strongCandidates.filter(function (c) { return c.matchCount === topCount })
+
+  if (tied.length === 1) {
+    return {
+      decision: 'reuse',
+      featureId: tied[0].featureId,
+      matchCount: tied[0].matchCount,
+    }
+  }
+
+  return {
+    decision: 'blocked',
+    reason: 'ambiguous-match',
+    candidates: tied.map(function (c) { return { featureId: c.featureId, matchCount: c.matchCount } }),
+  }
+}
+
+// upsertRegistryEntry: insert or replace a feature entry in the registry. PURE —
+// does NOT mutate the input registry; returns a shallow copy with the entry set.
+function upsertRegistryEntry(registry, entry) {
+  var base = registry && registry.features ? registry : { features: {} }
+  var updated = { features: Object.assign({}, base.features) }
+  updated.features[entry.featureId] = entry
+  return updated
+}
+
+// readRegistry: load the registry JSON via a file-reader agent.
+// Returns { features: {} } if the file does not exist; null if corrupt JSON.
+async function readRegistry(registryPath, result) {
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + registryPath + ' and return its full JSON content parsed\\n' +
+    'as an object in the "registry" field. If the file does not exist, return registry=null.\\n' +
+    'If the file exists but contains invalid JSON, return registry=null.',
+    { label: 'file-reader(registry)', phase: 'Registry Lookup', agentType: nsAgent('file-writer'), schema: REGISTRY_READ_RESULT, model: gm('todo') },
+    result
+  )
+  if (!loaded || loaded.registry === null || loaded.registry === undefined) {
+    // Distinguish "file not found" from "corrupt" — safeAgent returns the parsed
+    // object. null registry means either not-found or corrupt; caller treats both
+    // as "no valid registry" and falls through to empty or recovery.
+    return null
+  }
+  return loaded.registry
+}
+
+// writeRegistry: atomically persist the registry JSON via temp-then-rename.
+async function writeRegistry(registryPath, registry, result) {
+  var json = JSON.stringify(registry, null, 2)
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + registryPath + ' using a\\n' +
+    'temp-then-rename pattern (write to a .tmp file first, then rename to the target).\\n' +
+    'Create the directory if it does not exist.\\n\\n' +
+    'Return ok=true and path=' + registryPath + '.\\n\\nJSON:\\n' + json,
+    { label: 'file-writer(registry)', phase: 'Registry Lookup', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// readIdentitySidecar: load <planDir>/.identity.json via a file-reader agent.
+// Returns the identity object or null if the file does not exist.
+async function readIdentitySidecar(identityPath, result) {
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + identityPath + ' and return its full JSON content\\n' +
+    'parsed as an object in the "identity" field. If the file does not exist, return identity=null.',
+    { label: 'file-reader(identity-sidecar)', phase: 'Registry Lookup', agentType: nsAgent('file-writer'), schema: IDENTITY_READ_RESULT, model: gm('todo') },
+    result
+  )
+  if (!loaded) return null
+  return loaded.identity
+}
+
+// checkFolderCollision: guard against overwriting another feature's folder on
+// NEW-feature creation. Compares the requester's full ownershipScopeDigest
+// against the existing .identity.json at the target planDir.
+async function checkFolderCollision(arg) {
+  var planDir = arg && arg.planDir
+  var requesterDigest = arg && arg.requesterDigest
+  var result = arg && arg.result
+  var identityPath = planDir + '.identity.json'
+
+  var identity = await readIdentitySidecar(identityPath, result)
+  if (!identity) {
+    // No existing identity — safe to create.
+    return { collision: false }
+  }
+
+  // Compare FULL 64-hex ownership digest (not truncated featureId).
+  if (identity.ownershipScopeDigest === requesterDigest) {
+    return { collision: false, idempotent: true }
+  }
+
+  return {
+    collision: true,
+    existingFeatureId: identity.featureId || '(unknown)',
+  }
+}
+
+// recoverRegistry: startup recovery — reconcile 'extracting' entries from
+// current pipeline-state + sidecars. Immutable ownership fields always come from
+// .identity.json sidecars (never from the potentially-stale registry). Mutable
+// fields (files, status) are rebuilt from current pipeline-state. Fail-closed
+// if evidence is missing.
+async function recoverRegistry(arg) {
+  var registryPath = arg && arg.registryPath
+  var result = arg && arg.result
+
+  var registry = await readRegistry(registryPath, result)
+
+  // Corrupt or missing registry — try to rebuild from sidecars.
+  if (!registry) {
+    // Scan for .identity.json sidecars under docs/extract/ to rebuild.
+    var scanResult = await safeAgent(
+      'You are a file-reader agent. Search for all .identity.json files under docs/extract/\\n' +
+      '(excluding docs/extract/.pending/ and docs/extract/slices/). For each found, read and\\n' +
+      'return its JSON content. Return an array of identity objects in the "identities" field.\\n' +
+      'If none found, return identities=[].',
+      { label: 'file-reader(registry-rebuild)', phase: 'Registry Recovery', agentType: nsAgent('file-writer'), schema: { type: 'object', additionalProperties: false, required: ['identities'], properties: { identities: { type: 'array', items: { type: 'object' } } } }, model: gm('todo') },
+      result
+    )
+    var identities = (scanResult && scanResult.identities) || []
+    if (!identities.length) {
+      // No sidecars — nothing to rebuild; return empty registry.
+      return { recovered: 0, failed: 0, registry: { features: {} }, failClosed: true }
+    }
+    // Rebuild registry from sidecar identities. Mutable fields are unknown
+    // without pipeline-state — mark all as 'stale' (fail-closed).
+    var rebuilt = { features: {} }
+    for (var ri = 0; ri < identities.length; ri++) {
+      var id = identities[ri]
+      if (!id || !id.featureId) continue
+      rebuilt.features[id.featureId] = {
+        featureId: id.featureId,
+        planDir: id.planDir,
+        ownershipScopeDigest: id.ownershipScopeDigest,
+        scopeId16: id.scopeId16 || '',
+        files: [],
+        anchorPath: '',
+        status: 'stale',
+        updatedAt: '',
+        recoveryError: 'corrupt-registry-rebuild',
+      }
+    }
+    await writeRegistry(registryPath, rebuilt, result)
+    return { recovered: 0, failed: identities.length, registry: rebuilt }
+  }
+
+  // Registry exists — reconcile each 'extracting' entry.
+  var features = (registry && registry.features) || {}
+  var featureIds = Object.keys(features)
+  if (!featureIds.length) {
+    return { recovered: 0, failed: 0, registry: registry }
+  }
+
+  var recovered = 0
+  var failed = 0
+  var updatedRegistry = { features: Object.assign({}, features) }
+
+  for (var fi = 0; fi < featureIds.length; fi++) {
+    var fid = featureIds[fi]
+    var entry = features[fid]
+    if (!entry) continue
+
+    // Verify .identity.json still exists (immutable ownership source).
+    var identityPath = entry.planDir + '.identity.json'
+    var identity = await readIdentitySidecar(identityPath, result)
+
+    if (!identity) {
+      // Missing identity — fail-closed: mark stale.
+      updatedRegistry.features[fid] = Object.assign({}, entry, {
+        status: 'stale',
+        recoveryError: 'missing-identity',
+      })
+      failed++
+      continue
+    }
+
+    // Always source immutable fields from the sidecar (not the stale registry).
+    entry.featureId = identity.featureId
+    entry.planDir = identity.planDir
+    entry.ownershipScopeDigest = identity.ownershipScopeDigest
+    entry.scopeId16 = identity.scopeId16 || entry.scopeId16
+
+    if (entry.status !== 'extracting') {
+      // Non-extracting entries keep their status; immutable fields refreshed.
+      updatedRegistry.features[fid] = entry
+      continue
+    }
+
+    // Extracting entry — rebuild mutable fields from current pipeline-state.
+    var statePath = entry.planDir + 'pipeline-state.json'
+    var stateResult = await safeAgent(
+      'You are a file-reader agent. Read ' + statePath + ' and return its JSON content\\n' +
+      'parsed as an object in the "state" field. If the file does not exist, return state=null.',
+      { label: 'file-reader(recovery-state)', phase: 'Registry Recovery', agentType: nsAgent('file-writer'), schema: PIPELINE_STATE_FOR_RECOVERY, model: gm('todo') },
+      result
+    )
+    var pipelineState = (stateResult && stateResult.state) || null
+
+    if (!pipelineState) {
+      // Missing pipeline-state — fail-closed: mark stale.
+      updatedRegistry.features[fid] = Object.assign({}, entry, {
+        status: 'stale',
+        recoveryError: 'missing-pipeline-state',
+      })
+      failed++
+      continue
+    }
+
+    // Check for durable extraction evidence (gate checkpoints or extractReady).
+    var hasEvidence = (pipelineState.result && (
+      (pipelineState.result._gateCheckpoints && Object.keys(pipelineState.result._gateCheckpoints).length > 0) ||
+      pipelineState.result.extractReady === true
+    ))
+
+    if (!hasEvidence) {
+      // Incomplete extraction — fail-closed: mark stale.
+      updatedRegistry.features[fid] = Object.assign({}, entry, {
+        status: 'stale',
+        recoveryError: 'incomplete-pipeline-state',
+      })
+      failed++
+      continue
+    }
+
+    // Rebuild mutable files from pipeline-state if available.
+    var rebuiltFiles = []
+    if (pipelineState.result && pipelineState.result._sourceDigest && pipelineState.result._sourceDigest.files) {
+      rebuiltFiles = pipelineState.result._sourceDigest.files
+    } else if (pipelineState.result && pipelineState.result.extractScope && pipelineState.result.extractScope.files) {
+      // Fallback: derive file list from the scope verdict (paths only — no hashes).
+      var scopeFiles = pipelineState.result.extractScope.files || []
+      rebuiltFiles = scopeFiles.map(function (p) {
+        return { path: normalizeToPosix(p), contentSha256: '' }
+      })
+    }
+
+    updatedRegistry.features[fid] = Object.assign({}, entry, {
+      files: rebuiltFiles,
+      status: pipelineState.result.extractReady ? 'current' : 'stale',
+      recoveryError: pipelineState.result.extractReady ? undefined : 'extraction-incomplete',
+    })
+
+    if (pipelineState.result.extractReady) {
+      recovered++
+    } else {
+      failed++
+    }
+  }
+
+  // Write recovered registry atomically.
+  await writeRegistry(registryPath, updatedRegistry, result)
+  return { recovered: recovered, failed: failed, registry: updatedRegistry }
+}
+
 // ---- Review mode (standalone design-docset audit) ---------------------------
 // Review is the INSPECT flow: it reads an existing planDir docset (forward-designed,
 // extracted, or tuned), fans out one reviewer per review dimension (lens), dedups the
@@ -8841,11 +9261,22 @@ ${task}`,
     // output is a /tune-feature- and /design-feature-compatible baseline. Runs AFTER
     // Translate (free-text scope input benefits from translation), never enters E4.
     if (isExtractMode) {
+      // Startup registry recovery: reconcile 'extracting' entries from current
+      // pipeline-state + sidecars before any extraction work. Entries with
+      // incomplete evidence are marked 'stale' (fail-closed).
+      phase('Registry Recovery')
+      var recoveryResult = await recoverRegistry({ registryPath: REGISTRY_PATH, result: result })
+      if (recoveryResult && recoveryResult.failed > 0) {
+        plog('Registry Recovery: ' + recoveryResult.recovered + ' recovered, ' + recoveryResult.failed + ' failed (marked stale)')
+      }
+      stateCheckpoint('Registry Recovery', 'done')
+
       // --confirm promotion: if entering via --confirm <pendingId>, promote the
       // pending record before Gate X0. Promotion creates the folder, writes
       // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
       // and appends the permanent locator entry. Crash-idempotent on replay.
       if (confirmRecord && !result.scopeManifestPath) {
+        phase('Promote')
         phase('Promote')
         // Override planDir with the deterministic folder from the pending record.
         if (confirmRecord.derivedPlanDir) planDir = confirmRecord.derivedPlanDir
@@ -8871,6 +9302,32 @@ ${task}`,
           await writeOpenQuestions(planDir, confirmRecord.verdict.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
         }
         plog('Promoted ' + confirmRecord.pendingId + ' -> ' + planDir + ' (' + (promo.isNew ? 'NEW' : 'EXISTING') + ')')
+
+        // Registry upsert after promotion: write the registry entry with initial
+        // status 'extracting'. Root-last readiness commit (status→'current') happens
+        // after extraction+publish+persist are durable.
+        if (promo.isNew && confirmRecord.featureId) {
+          phase('Registry Lookup')
+          var existingReg = await readRegistry(REGISTRY_PATH, result)
+          if (!existingReg) existingReg = { features: {} }
+          var registryEntry = {
+            featureId: confirmRecord.featureId,
+            planDir: planDir,
+            ownershipScopeDigest: confirmRecord.scopeDigest,
+            scopeId16: confirmRecord.scopeId16 || '',
+            files: (confirmRecord.fileHashes || []).map(function (fh) {
+              return { path: fh.path, contentSha256: fh.contentSha256 }
+            }),
+            anchorPath: confirmRecord.anchorPath || '',
+            status: 'extracting',
+            updatedAt: String((args && args.timestamp) || ''),
+          }
+          var updatedReg = upsertRegistryEntry(existingReg, registryEntry)
+          await writeRegistry(REGISTRY_PATH, updatedReg, result)
+          plog('Registry: upserted entry for ' + confirmRecord.featureId + ' (status=extracting)')
+          stateCheckpoint('Registry Lookup', 'done')
+        }
+
         stateCheckpoint('Promote', 'done')
       }
 
@@ -8915,6 +9372,82 @@ ${task}`,
         }
         // Override planDir with the deterministic derived folder (Phase 13).
         if (preflight.derivedPlanDir) planDir = preflight.derivedPlanDir
+
+        // Feature-identity registry lookup: determine if this scope reuses an
+        // existing feature folder (rename-resilient via content hash matching),
+        // creates a new one, or is ambiguous/blocked.
+        phase('Registry Lookup')
+        var registry = await readRegistry(REGISTRY_PATH, result)
+        if (!registry) registry = { features: {} }
+        var registryFeatures = Object.keys(registry.features).map(function (fid) {
+          return registry.features[fid]
+        })
+        var findResult = findFeature({
+          currentFiles: preflight.fileHashes || [],
+          currentAnchor: preflight.anchorPath || '',
+          registryFeatures: registryFeatures,
+        })
+        preflight.findFeatureDecision = findResult.decision
+        preflight.findFeatureFeatureId = findResult.featureId || null
+        preflight.findFeatureMatchCount = findResult.matchCount || 0
+        plog('Registry Lookup: findFeature decision=' + findResult.decision +
+          (findResult.featureId ? ' featureId=' + findResult.featureId : '') +
+          (findResult.reason ? ' reason=' + findResult.reason : ''))
+
+        if (findResult.decision === 'reuse') {
+          // Sticky folder: override planDir to the reused feature's folder.
+          var reusedEntry = registry.features[findResult.featureId]
+          if (reusedEntry && reusedEntry.planDir) {
+            planDir = reusedEntry.planDir
+            preflight.derivedPlanDir = planDir
+            plog('Registry Lookup: reusing existing folder ' + planDir + ' for ' + findResult.featureId)
+          }
+        } else if (findResult.decision === 'blocked') {
+          // Ambiguous or weak-only match — block with guidance.
+          result.blockedAt = 'registry-lookup-ambiguous'
+          result.handoff = {
+            from: 'extract',
+            message: 'Feature identity is ambiguous (' + (findResult.reason || 'unknown') +
+              '). Use --feature=<featureId> to select a specific feature, or --new to create a new folder.',
+            nextMode: 'extract',
+            planDir: planDir,
+            findFeatureReason: findResult.reason || 'unknown',
+            candidates: findResult.candidates || [],
+            weakMatches: findResult.weakMatches || [],
+          }
+          plog('Registry Lookup: blocked — ' + (findResult.reason || 'unknown'))
+          stateCheckpoint('Registry Lookup', 'blocked')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // For 'new' decision: collision guard before promotion.
+        if (findResult.decision === 'new') {
+          var collision = await checkFolderCollision({
+            planDir: planDir,
+            requesterDigest: preflight.scopeDigest,
+            result: result,
+          })
+          if (collision && collision.collision) {
+            result.blockedAt = 'registry-collision'
+            result.handoff = {
+              from: 'extract',
+              message: 'Folder ' + planDir + ' is owned by feature ' + collision.existingFeatureId +
+                '. Use --feature=' + collision.existingFeatureId + ' to update it, or --new to create a distinct folder.',
+              nextMode: 'extract',
+              planDir: planDir,
+              collisionWith: collision.existingFeatureId,
+            }
+            plog('Registry Lookup: collision with ' + collision.existingFeatureId + ' at ' + planDir)
+            stateCheckpoint('Registry Lookup', 'collision')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'done')
+
         // Write pending record — the ONLY durable state before promotion.
         // pipeline-state.json is intentionally NOT written (RED gate: --resume
         // cannot resume a not-yet-promoted checkpoint).
@@ -9407,6 +9940,34 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       }
       stateCheckpoint('Extract', 'done')
       plog(`Extract: extractReady=${readiness.ready} (${readiness.reason}) — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+
+      // Root-last readiness commit: after extraction + publish + persist are durable,
+      // update the registry entry status from 'extracting' to 'current'. This is the
+      // final registry write — the root of the readiness tree.
+      if (readiness.ready) {
+        phase('Registry Lookup')
+        var readyReg = await readRegistry(REGISTRY_PATH, result)
+        if (readyReg && readyReg.features) {
+          // Find the registry entry for this feature (by planDir match).
+          var readyFeatureId = null
+          var readyFeatures = Object.keys(readyReg.features)
+          for (var rfi = 0; rfi < readyFeatures.length; rfi++) {
+            if (readyReg.features[readyFeatures[rfi]].planDir === planDir) {
+              readyFeatureId = readyFeatures[rfi]
+              break
+            }
+          }
+          if (readyFeatureId) {
+            var readyEntry = readyReg.features[readyFeatureId]
+            readyEntry.status = 'current'
+            readyEntry.updatedAt = String((args && args.timestamp) || '')
+            var rootLastReg = upsertRegistryEntry(readyReg, readyEntry)
+            await writeRegistry(REGISTRY_PATH, rootLastReg, result)
+            plog('Registry: root-last readiness commit — ' + readyFeatureId + ' status→current')
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'root-last-done')
+      }
 
       // Phase 6: track the durable consolidate write through the persistence tracker.
       result.persistenceTracker = recordAttemptedWrite(
