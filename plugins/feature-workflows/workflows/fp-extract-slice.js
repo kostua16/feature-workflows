@@ -987,6 +987,60 @@ const OVERVIEW_VERDICT = {
   },
 }
 
+// --- Pending-confirmation protocol schemas (extract D0) -------------------
+
+// PREFLIGHT_VERDICT: returned by resolveScopePreflight — wraps a SCOPE_VERDICT with
+// the pending-confirmation lifecycle fields. The pendingId is engine-generated
+// (deterministic djb2 of task+timestamp); the agent resolves the scope but does NOT
+// write any files. State transitions: PENDING → PROMOTED (on --confirm).
+const PREFLIGHT_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string', description: 'Deterministic 16-hex confirmation id' },
+    task: { type: 'string' },
+    verdict: { type: 'object', description: 'Full SCOPE_VERDICT from the preflight resolution' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED'] },
+    createdAt: { type: 'string', description: 'ISO-like timestamp from args.timestamp' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+  },
+}
+
+// PENDING_RECORD: shape of docs/extract/.pending/<pendingId>.json — the durable
+// scratch checkpoint written by the preflight and updated on promotion.
+const PENDING_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    task: { type: 'string' },
+    verdict: { type: 'object' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED', 'EXPIRED'] },
+    createdAt: { type: 'string' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+    expiredAt: { type: 'string', description: 'Set when the bulky payload is TTL-expired' },
+  },
+}
+
+// LOCATOR_ENTRY: compact permanent record in docs/extract/.pending-locator.json.
+// Retained indefinitely so --confirm <pendingId> always resolves to the authoritative
+// folder even after the bulky pending payload is TTL-expired.
+const LOCATOR_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'featureId', 'planDir', 'promotedAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    featureId: { type: 'string' },
+    planDir: { type: 'string' },
+    promotedAt: { type: 'string' },
+  },
+}
+
 // ---- Helpers --------------------------------------------------------------
 
 // Global retry budget. The pipeline only exits on a TRUE hard error (no artifact,
@@ -5020,6 +5074,277 @@ ${sections}`,
   }
   plogFromResult(result, `Design Audit: report at ${verdict.auditPath}; findings=${(verdict.findings || []).length} (${upstream.length} upstream)`)
   return verdict
+}
+
+// ---- Pending-confirmation protocol (extract D0) ----------------------------
+
+// Durable paths for the pending checkpoint and permanent locator.
+const PENDING_DIR = 'docs/extract/.pending/'
+const PENDING_LOCATOR_PATH = 'docs/extract/.pending-locator.json'
+
+// File-reader result schemas (local — not exported).
+const PENDING_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['record'],
+  properties: {
+    record: { type: ['object', 'null'], description: 'Parsed pending record, or null if the file does not exist' },
+  },
+}
+
+const LOCATOR_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['entries'],
+  properties: {
+    entries: { type: 'array', items: { type: 'object' }, description: 'Locator entries (empty if file does not exist)' },
+  },
+}
+
+// generatePendingId: deterministic 16-hex pending id from task text + timestamp.
+// Uses djb2 hash — sandbox-safe (no RNG or wall-clock dependency). PURE.
+function generatePendingId(task, timestamp) {
+  var raw = String(task || '') + '|' + String(timestamp || '')
+  return computeDigest(raw).padStart(16, '0').slice(0, 16)
+}
+
+// buildPendingRecord: construct the PENDING-shaped record from preflight parts. PURE.
+function buildPendingRecord(pendingId, task, verdict, createdAt) {
+  return {
+    pendingId: pendingId,
+    task: String(task || ''),
+    verdict: verdict,
+    state: 'PENDING',
+    createdAt: String(createdAt || ''),
+  }
+}
+
+// isPendingExpired: check whether a pending record's bulky payload is past the TTL.
+// Elapsed-time comparison via Date.parse; the caller supplies the current timestamp. PURE.
+function isPendingExpired(record, maxAgeDays, nowTimestamp) {
+  if (!record || !record.createdAt) return true
+  if (record.state === 'EXPIRED') return true
+  var createdMs = Date.parse(record.createdAt)
+  var nowMs = Date.parse(nowTimestamp)
+  if (isNaN(createdMs) || isNaN(nowMs)) return false
+  var ageMs = nowMs - createdMs
+  var maxMs = (maxAgeDays || 30) * 24 * 60 * 60 * 1000
+  return ageMs > maxMs
+}
+
+// resolveLocatorEntry: pure lookup in a locator array. Returns the entry or null.
+function resolveLocatorEntry(locator, pendingId) {
+  if (!Array.isArray(locator)) return null
+  for (var i = 0; i < locator.length; i++) {
+    if (locator[i] && locator[i].pendingId === pendingId) return locator[i]
+  }
+  return null
+}
+
+// resolveScopePreflight: resolve the extraction scope WITHOUT writing any files.
+// Wraps the code-explorer agent call — captures the verdict in-memory for the
+// pending checkpoint. Returns { pendingId, task, verdict, state:'PENDING', createdAt }
+// or null if scope resolution fails. WRITES NOTHING TO DISK.
+async function resolveScopePreflight(arg) {
+  var task = arg && arg.task
+  var result = arg && arg.result
+  var timestamp = arg && arg.timestamp
+  var pendingId = generatePendingId(task, timestamp)
+  var verdict = await flexibleAgent(
+    'You are the code-explorer agent. Resolve the extraction input below into a CONCRETE code scope.\n' +
+    'DO NOT WRITE ANY FILES — just resolve the scope and return the verdict fields.\n' +
+    'Use Serena tools (activate the project, list_dir, find_symbol, find_referencing_symbols,\n' +
+    'search_for_pattern) to locate the code — do NOT guess paths.\n\n' +
+    'IMPORTANT: You are running inside an automated workflow pipeline. AskUserQuestion is NOT available.\n' +
+    'Record anything needing user judgment in the ambiguities array instead of asking.\n\n' +
+    'Extraction input:\n' + (task || '') + '\n\n' +
+    'Return in the verdict:\n' +
+    '- files: every concrete file path in scope (resolved, existing files only)\n' +
+    '- entryPoints: observable entry points into this code (routes, commands, handlers, exports)\n' +
+    '- symbols: the key classes/functions anchoring the scope\n' +
+    '- confidence: high|medium|low\n' +
+    '- wide: true ONLY if the scope spans multiple coherent subsystems\n' +
+    '- suggestedSlices: when wide, candidate subsystem slices\n' +
+    '- ambiguities: unclear boundaries or intent questions (recorded, not blocking)\n' +
+    '- scopePath: set to "pending" (the manifest is written later after confirmation)\n' +
+    '- summary: one-line scope summary\n\n' +
+    'Do NOT modify any code. Do NOT commit. Do NOT write any files.',
+    { label: 'code-explorer(scope-preflight)', phase: 'Pending Confirm', schema: SCOPE_VERDICT, model: gm('scopeResolver') },
+    result
+  )
+  if (!verdict || !verdict.files || !verdict.files.length) return null
+  return {
+    pendingId: pendingId,
+    task: String(task || ''),
+    verdict: verdict,
+    state: 'PENDING',
+    createdAt: String(timestamp || ''),
+  }
+}
+
+// writePendingRecord: persist the pending record JSON to <pendingDir><pendingId>.json
+// via a file-writer agent (temp-then-rename pattern).
+async function writePendingRecord(pendingDir, record, result) {
+  var filePath = pendingDir + record.pendingId + '.json'
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + filePath + ' using a\n' +
+    'temp-then-rename pattern (write to a .tmp file first, then rename to the target).\n' +
+    'Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + filePath + '.\n\nJSON:\n' + JSON.stringify(record, null, 2),
+    { label: 'file-writer(pending-record)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// readPendingRecord: read + parse a pending record via a file-reader agent.
+// Returns the record object or null if the file does not exist.
+async function readPendingRecord(pendingDir, pendingId, result) {
+  var filePath = pendingDir + pendingId + '.json'
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + filePath + ' and return its full JSON content parsed\n' +
+    'as an object in the "record" field. If the file does not exist, return record=null.',
+    { label: 'file-reader(pending-record)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: PENDING_READ_RESULT, model: gm('todo') },
+    result
+  )
+  return loaded
+}
+
+// appendLocatorEntry: append a permanent locator entry to the locator JSON file.
+// Reads the existing array (or starts fresh), appends, writes atomically.
+async function appendLocatorEntry(locatorPath, entry, result) {
+  var existing = await safeAgent(
+    'You are a file-reader agent. Read ' + locatorPath + ' and return its JSON content as an\n' +
+    'array in the "entries" field. If the file does not exist, return entries=[].',
+    { label: 'file-reader(locator)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: LOCATOR_READ_RESULT, model: gm('todo') },
+    result
+  )
+  var entries = (existing && Array.isArray(existing.entries)) ? existing.entries : []
+  entries.push(entry)
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON array to ' + locatorPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + locatorPath + '.\n\nJSON:\n' + JSON.stringify(entries, null, 2),
+    { label: 'file-writer(locator)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// resolveLocator: look up a pendingId in the locator file via a file-reader agent.
+// Returns { featureId, planDir, promotedAt } or null.
+async function resolveLocator(locatorPath, pendingId, result) {
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + locatorPath + ' and return its JSON content as an\n' +
+    'array in the "entries" field. If the file does not exist, return entries=[].',
+    { label: 'file-reader(locator-lookup)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: LOCATOR_READ_RESULT, model: gm('todo') },
+    result
+  )
+  var entries = (loaded && Array.isArray(loaded.entries)) ? loaded.entries : []
+  return resolveLocatorEntry(entries, pendingId)
+}
+
+// writeScopeManifestFromVerdict: serialize a scope verdict to scope-manifest.md
+// and write via a file-writer agent (temp-then-rename).
+async function writeScopeManifestFromVerdict(scopeManifestPath, verdict, result) {
+  var files = (verdict && verdict.files) || []
+  var entryPoints = (verdict && verdict.entryPoints) || []
+  var symbols = (verdict && verdict.symbols) || []
+  var confidence = (verdict && verdict.confidence) || 'unspecified'
+  var ambiguities = (verdict && verdict.ambiguities) || []
+  var summary = (verdict && verdict.summary) || ''
+  var lines = ['# Scope Manifest', '', '**Confidence:** ' + confidence, '', '## Files in scope']
+  for (var i = 0; i < files.length; i++) lines.push('- ' + files[i])
+  if (entryPoints.length) { lines.push('', '## Entry points'); for (var j = 0; j < entryPoints.length; j++) lines.push('- ' + entryPoints[j]) }
+  if (symbols.length) { lines.push('', '## Key symbols'); for (var k = 0; k < symbols.length; k++) lines.push('- ' + symbols[k]) }
+  if (summary) lines.push('', '## Summary', '', summary)
+  if (ambiguities.length) { lines.push('', '## Ambiguities'); for (var m = 0; m < ambiguities.length; m++) lines.push('- ' + ambiguities[m]) }
+  var md = lines.join('\n') + '\n'
+  return safeAgent(
+    'You are a file-writer agent. Write the following markdown to ' + scopeManifestPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + scopeManifestPath + '.\n\nContent:\n' + md,
+    { label: 'file-writer(scope-manifest)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// writeIdentityStub: write the D0 .identity.json placeholder. Ownership digest
+// is null — Phase 13 fills it in with the real deterministic hash.
+async function writeIdentityStub(identityPath, planDir, timestamp, result) {
+  var identity = {
+    featureId: planDir.split('/').filter(Boolean).pop() || '',
+    planDir: planDir,
+    ownershipScopeDigest: null,
+    createdAt: String(timestamp || ''),
+  }
+  return safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + identityPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + identityPath + '.\n\nJSON:\n' + JSON.stringify(identity, null, 2),
+    { label: 'file-writer(identity-stub)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// promotePendingRecord: atomically promote a PENDING record to PROMOTED.
+// NEW-feature branch: create folder + scope-manifest.md + .identity.json stub,
+//   then root-last pipeline-state.json via flushPipelineState.
+// EXISTING-feature branch: update scope-manifest.md only (do NOT overwrite identity).
+// Both branches: update pending record state + append permanent locator entry.
+async function promotePendingRecord(arg) {
+  var pendingDir = arg && arg.pendingDir
+  var record = arg && arg.record
+  var planDir = arg && arg.planDir
+  var result = arg && arg.result
+  var config = arg && arg.config
+  var timestamp = arg && arg.timestamp
+  var identityPath = planDir + '.identity.json'
+  var scopeManifestPath = planDir + 'scope-manifest.md'
+
+  // Check if pipeline-state.json already exists at planDir (EXISTING vs NEW).
+  var existingCheck = await safeAgent(
+    'You are a file-reader agent. Check if ' + planDir + 'pipeline-state.json exists.\n' +
+    'Return exists=true and sizeBytes if it exists; exists=false if not.',
+    { label: 'file-reader(promotion-check)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: ARTIFACT_CHECK, model: gm('todo') },
+    result
+  )
+  var isExisting = existingCheck && existingCheck.exists === true
+
+  if (!isExisting) {
+    // NEW feature — create scope-manifest.md + .identity.json (root-last: state after)
+    await writeScopeManifestFromVerdict(scopeManifestPath, record.verdict, result)
+    await writeIdentityStub(identityPath, planDir, timestamp, result)
+    // Root-last: pipeline-state.json only after identity + manifest exist
+    await flushPipelineState(planDir, result, config)
+  } else {
+    // EXISTING feature — revision, NOT a new identity.
+    // Do NOT create folder, do NOT overwrite .identity.json.
+    // Update scope-manifest.md with the new scope verdict.
+    await writeScopeManifestFromVerdict(scopeManifestPath, record.verdict, result)
+    // pipeline-state.json already exists — preserved; updated later by the extract flow
+  }
+
+  // Update pending record to PROMOTED (durable — survives crash on replay)
+  var promotedRecord = Object.assign({}, record, {
+    state: 'PROMOTED',
+    promotedAt: String(timestamp || ''),
+    planDir: planDir,
+  })
+  await writePendingRecord(pendingDir, promotedRecord, result)
+
+  // Append permanent compact locator entry (retained indefinitely)
+  await appendLocatorEntry(PENDING_LOCATOR_PATH, {
+    pendingId: record.pendingId,
+    featureId: planDir.split('/').filter(Boolean).pop() || planDir,
+    planDir: planDir,
+    promotedAt: String(timestamp || ''),
+  }, result)
+
+  if (result && Array.isArray(result.logLines)) {
+    result.logLines.push('Promote: ' + record.pendingId + ' → ' + planDir + ' (' + (isExisting ? 'EXISTING' : 'NEW') + ')')
+  }
+  return { promoted: true, record: promotedRecord, isNew: !isExisting }
 }
 
 // ---- Review mode (standalone design-docset audit) ---------------------------

@@ -227,6 +227,16 @@ const CANDIDATES = [
   'TRANSIENT_BACKOFF_BASE_MS',
   'verifyArtifactDigest',
   'flexibleAgent',
+  // Phase 12 — pending-confirmation protocol (extract D0)
+  'generatePendingId',
+  'buildPendingRecord',
+  'isPendingExpired',
+  'resolveLocatorEntry',
+  'PENDING_DIR',
+  'PENDING_LOCATOR_PATH',
+  'PREFLIGHT_VERDICT',
+  'PENDING_RECORD',
+  'LOCATOR_ENTRY',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

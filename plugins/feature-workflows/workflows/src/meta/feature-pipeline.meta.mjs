@@ -41,5 +41,7 @@ export const meta = {
     { title: 'Goalkeeper' },
     { title: 'Decide' },
     { title: 'Checkpoint' },
+    { title: 'Pending Confirm' },
+    { title: 'Promote' },
   ],
 }

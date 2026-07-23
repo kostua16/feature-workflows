@@ -7,7 +7,7 @@ import { computeContentDigest } from './revision.mjs'
 import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
-import { seedExtractQueue, nextPendingSlice, resolveScope } from './extract-scope.mjs'
+import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH } from './extract-scope.mjs'
 import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectReviewDocs, buildReviewReport, runReviewLenses, mergeReviewFindings, verifyReviewFindings, recordReviewIssues } from './review-mode.mjs'
 import { extractSlice, writeSystemOverview } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
@@ -39,6 +39,58 @@ async function main() {
     try { args = JSON.parse(args) } catch (e) { log(`main: args arrived as unparseable string, coercing to {} (${String(e && e.message)})`); args = {} }
   } else if (args == null) {
     args = {}
+  }
+
+  // --confirm <pendingId>: pending-confirmation protocol entry point (extract D0).
+  // Resolves a pending scope checkpoint: PENDING → promote during extract; PROMOTED
+  // or locator-only → redirect to --resume; unknown/expired → blocked. Must execute
+  // BEFORE resumeArg parsing so a redirect flows through the existing resume handler.
+  let confirmRecord = null
+  if (args && args.confirm) {
+    phase('Pending Confirm')
+    log('main: --confirm ' + args.confirm + ' — resolving pending checkpoint')
+    const pendingRead = await readPendingRecord(PENDING_DIR, args.confirm, null)
+    if (pendingRead && pendingRead.record) {
+      const pr = pendingRead.record
+      if (pr.state === 'PROMOTED' && pr.planDir) {
+        log('main: --confirm ' + args.confirm + ' already PROMOTED at ' + pr.planDir + ' — redirecting to --resume')
+        args = Object.assign({}, args, { resume: pr.planDir, confirm: null })
+      } else if (pr.state === 'EXPIRED') {
+        const locEntry = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+        if (locEntry && locEntry.planDir) {
+          log('main: --confirm ' + args.confirm + ' payload expired, locator resolved — redirecting to --resume ' + locEntry.planDir)
+          args = Object.assign({}, args, { resume: locEntry.planDir, confirm: null })
+        } else {
+          log('main: --confirm ' + args.confirm + ' expired, no locator — blocked')
+          await writeFailedLaunch('confirm', 'confirm-expired', 'pendingId ' + args.confirm + ' expired', Object.keys(args || {}))
+          return {
+            task: '', mode: 'extract', ready: false, blockedAt: 'confirm-expired',
+            handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' has expired (30-day TTL). Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+            logLines: ['main: --confirm ' + args.confirm + ' expired'],
+          }
+        }
+      } else {
+        // PENDING or CONFIRMED — promote during the extract flow
+        confirmRecord = pr
+        args = Object.assign({}, args, { task: pr.task })
+        log('main: --confirm ' + args.confirm + ' PENDING — will promote during extract')
+      }
+    } else {
+      // Not in pending records — check locator (payload may have been TTL-expired)
+      const locEntry2 = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+      if (locEntry2 && locEntry2.planDir) {
+        log('main: --confirm ' + args.confirm + ' not in pending but locator resolved — redirecting to --resume ' + locEntry2.planDir)
+        args = Object.assign({}, args, { resume: locEntry2.planDir, confirm: null })
+      } else {
+        log('main: --confirm ' + args.confirm + ' not found — blocked')
+        await writeFailedLaunch('confirm', 'confirm-not-found', 'pendingId ' + args.confirm + ' not found', Object.keys(args || {}))
+        return {
+          task: '', mode: 'extract', ready: false, blockedAt: 'confirm-not-found',
+          handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' was not found. It may have expired or never existed. Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+          logLines: ['main: --confirm ' + args.confirm + ' not found'],
+        }
+      }
+    }
   }
 
   // --resume <planDir>: hydrate persisted pipeline state and re-run linearly.
@@ -1098,33 +1150,85 @@ ${task}`,
     // output is a /tune-feature- and /design-feature-compatible baseline. Runs AFTER
     // Translate (free-text scope input benefits from translation), never enters E4.
     if (isExtractMode) {
-      // Gate X0: scope resolution — hybrid input -> concrete scope manifest. Blocking.
+      // --confirm promotion: if entering via --confirm <pendingId>, promote the
+      // pending record before Gate X0. Promotion creates the folder, writes
+      // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
+      // and appends the permanent locator entry. Crash-idempotent on replay.
+      if (confirmRecord && !result.scopeManifestPath) {
+        phase('Promote')
+        plog('Promoting pending record ' + confirmRecord.pendingId + ' -> ' + planDir)
+        const promo = await promotePendingRecord({
+          pendingDir: PENDING_DIR,
+          record: confirmRecord,
+          planDir,
+          result,
+          config,
+          timestamp: args && args.timestamp,
+        })
+        result.extractScope = confirmRecord.verdict
+        result.scopeManifestPath = planDir + 'scope-manifest.md'
+        result.scopeConfirmed = true
+        if ((confirmRecord.verdict.ambiguities || []).length) {
+          await writeOpenQuestions(planDir, confirmRecord.verdict.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        }
+        plog('Promoted ' + confirmRecord.pendingId + ' -> ' + planDir + ' (' + (promo.isNew ? 'NEW' : 'EXISTING') + ')')
+        stateCheckpoint('Promote', 'done')
+      }
+
+      // Gate X0: scope resolution. Fresh runs use preflight (writes nothing to disk,
+      // returns a pendingId for confirmation). --confirm and --resume paths arrive
+      // with scopeManifestPath already set (via promotion or persisted state).
       if (result.scopeManifestPath) {
-        plog('resume: skip Extract Scope (scopeManifestPath set)')
+        plog('skip Extract Scope (scopeManifestPath set)')
       } else {
-        phase('Extract Scope')
-        plog('Resolving extraction input into a scope manifest')
-        const scope = await resolveScope({ task, planDir, result })
-        if (!scope || !scope.scopePath || !(scope.files || []).length) {
+        // Fresh run — preflight: resolve scope WITHOUT writing files, write pending
+        // record, return awaiting-scope-confirm with pendingId (D0 protocol).
+        phase('Pending Confirm')
+        plog('Resolving extraction scope (preflight — no file writes)')
+        const preflight = await resolveScopePreflight({ task, result, timestamp: args && args.timestamp })
+        if (!preflight || !preflight.verdict || !(preflight.verdict.files || []).length) {
           result.blockedAt = 'extract-scope'
           result.handoff = {
             from: 'extract',
-            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points), or --resume ${planDir} after inspecting scope-manifest.md.`,
+            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points).`,
             nextMode: 'extract',
             planDir,
           }
-          plog('Extract Scope: no scope resolved — blocking')
-          stateCheckpoint('Extract Scope', 'blocked')
+          plog('Preflight: no scope resolved — blocking')
+          stateCheckpoint('Pending Confirm', 'blocked')
           await consolidate(slug, result, config)
           return result
         }
-        result.extractScope = scope
-        result.scopeManifestPath = scope.scopePath
-        plog(`Extract Scope: ${scope.files.length} file(s), ${(scope.entryPoints || []).length} entry point(s), confidence=${scope.confidence || 'unspecified'}, wide=${!!scope.wide}`)
-        if ((scope.ambiguities || []).length) {
-          await writeOpenQuestions(planDir, scope.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        // Write pending record — the ONLY durable state before promotion.
+        // pipeline-state.json is intentionally NOT written (RED gate: --resume
+        // cannot resume a not-yet-promoted checkpoint).
+        await writePendingRecord(PENDING_DIR, preflight, result)
+        result.extractScope = preflight.verdict
+        result.pendingId = preflight.pendingId
+        plog(`Preflight: ${(preflight.verdict.files || []).length} file(s), ${(preflight.verdict.entryPoints || []).length} entry point(s), confidence=${preflight.verdict.confidence || 'unspecified'}, pendingId=${preflight.pendingId}`)
+        // Return awaiting-scope-confirm with pendingId (primary: --confirm <pendingId>)
+        const pscope = preflight.verdict
+        result.handoff = {
+          from: 'extract',
+          status: 'awaiting-scope-confirm',
+          message: `Scope resolved to ${(pscope.files || []).length} file(s). Confirm: /extract-design --confirm ${preflight.pendingId}`,
+          nextMode: 'extract',
+          planDir,
+          pendingId: preflight.pendingId,
+          scopeSummary: {
+            files: pscope.files || [],
+            entryPoints: pscope.entryPoints || [],
+            confidence: pscope.confidence || 'unspecified',
+            wide: !!pscope.wide,
+            suggestedSlices: pscope.suggestedSlices || [],
+          },
         }
-        stateCheckpoint('Extract Scope', 'done')
+        plog('Preflight: awaiting scope confirmation (pendingId=' + preflight.pendingId + ') — returning')
+        stateCheckpoint('Pending Confirm', 'awaiting-confirm')
+        // Intentionally NO consolidate here — pipeline-state.json must not exist
+        // before promotion (RED gate: --resume cannot resume a pre-promotion checkpoint).
+        // The pending record is the sole durable state; --confirm recovers from it.
+        return result
       }
 
       // Gate X0.5: scope confirmation — pause-and-resume checkpoint, NO agent involved.

@@ -50,6 +50,8 @@ export const meta = {
     { title: 'Goalkeeper' },
     { title: 'Decide' },
     { title: 'Checkpoint' },
+    { title: 'Pending Confirm' },
+    { title: 'Promote' },
   ],
 }
 
@@ -1020,6 +1022,60 @@ const OVERVIEW_VERDICT = {
       },
     },
     summary: { type: 'string' },
+  },
+}
+
+// --- Pending-confirmation protocol schemas (extract D0) -------------------
+
+// PREFLIGHT_VERDICT: returned by resolveScopePreflight — wraps a SCOPE_VERDICT with
+// the pending-confirmation lifecycle fields. The pendingId is engine-generated
+// (deterministic djb2 of task+timestamp); the agent resolves the scope but does NOT
+// write any files. State transitions: PENDING → PROMOTED (on --confirm).
+const PREFLIGHT_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string', description: 'Deterministic 16-hex confirmation id' },
+    task: { type: 'string' },
+    verdict: { type: 'object', description: 'Full SCOPE_VERDICT from the preflight resolution' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED'] },
+    createdAt: { type: 'string', description: 'ISO-like timestamp from args.timestamp' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+  },
+}
+
+// PENDING_RECORD: shape of docs/extract/.pending/<pendingId>.json — the durable
+// scratch checkpoint written by the preflight and updated on promotion.
+const PENDING_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    task: { type: 'string' },
+    verdict: { type: 'object' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED', 'EXPIRED'] },
+    createdAt: { type: 'string' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+    expiredAt: { type: 'string', description: 'Set when the bulky payload is TTL-expired' },
+  },
+}
+
+// LOCATOR_ENTRY: compact permanent record in docs/extract/.pending-locator.json.
+// Retained indefinitely so --confirm <pendingId> always resolves to the authoritative
+// folder even after the bulky pending payload is TTL-expired.
+const LOCATOR_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'featureId', 'planDir', 'promotedAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    featureId: { type: 'string' },
+    planDir: { type: 'string' },
+    promotedAt: { type: 'string' },
   },
 }
 
@@ -5058,6 +5114,277 @@ ${sections}`,
   return verdict
 }
 
+// ---- Pending-confirmation protocol (extract D0) ----------------------------
+
+// Durable paths for the pending checkpoint and permanent locator.
+const PENDING_DIR = 'docs/extract/.pending/'
+const PENDING_LOCATOR_PATH = 'docs/extract/.pending-locator.json'
+
+// File-reader result schemas (local — not exported).
+const PENDING_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['record'],
+  properties: {
+    record: { type: ['object', 'null'], description: 'Parsed pending record, or null if the file does not exist' },
+  },
+}
+
+const LOCATOR_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['entries'],
+  properties: {
+    entries: { type: 'array', items: { type: 'object' }, description: 'Locator entries (empty if file does not exist)' },
+  },
+}
+
+// generatePendingId: deterministic 16-hex pending id from task text + timestamp.
+// Uses djb2 hash — sandbox-safe (no RNG or wall-clock dependency). PURE.
+function generatePendingId(task, timestamp) {
+  var raw = String(task || '') + '|' + String(timestamp || '')
+  return computeDigest(raw).padStart(16, '0').slice(0, 16)
+}
+
+// buildPendingRecord: construct the PENDING-shaped record from preflight parts. PURE.
+function buildPendingRecord(pendingId, task, verdict, createdAt) {
+  return {
+    pendingId: pendingId,
+    task: String(task || ''),
+    verdict: verdict,
+    state: 'PENDING',
+    createdAt: String(createdAt || ''),
+  }
+}
+
+// isPendingExpired: check whether a pending record's bulky payload is past the TTL.
+// Elapsed-time comparison via Date.parse; the caller supplies the current timestamp. PURE.
+function isPendingExpired(record, maxAgeDays, nowTimestamp) {
+  if (!record || !record.createdAt) return true
+  if (record.state === 'EXPIRED') return true
+  var createdMs = Date.parse(record.createdAt)
+  var nowMs = Date.parse(nowTimestamp)
+  if (isNaN(createdMs) || isNaN(nowMs)) return false
+  var ageMs = nowMs - createdMs
+  var maxMs = (maxAgeDays || 30) * 24 * 60 * 60 * 1000
+  return ageMs > maxMs
+}
+
+// resolveLocatorEntry: pure lookup in a locator array. Returns the entry or null.
+function resolveLocatorEntry(locator, pendingId) {
+  if (!Array.isArray(locator)) return null
+  for (var i = 0; i < locator.length; i++) {
+    if (locator[i] && locator[i].pendingId === pendingId) return locator[i]
+  }
+  return null
+}
+
+// resolveScopePreflight: resolve the extraction scope WITHOUT writing any files.
+// Wraps the code-explorer agent call — captures the verdict in-memory for the
+// pending checkpoint. Returns { pendingId, task, verdict, state:'PENDING', createdAt }
+// or null if scope resolution fails. WRITES NOTHING TO DISK.
+async function resolveScopePreflight(arg) {
+  var task = arg && arg.task
+  var result = arg && arg.result
+  var timestamp = arg && arg.timestamp
+  var pendingId = generatePendingId(task, timestamp)
+  var verdict = await flexibleAgent(
+    'You are the code-explorer agent. Resolve the extraction input below into a CONCRETE code scope.\n' +
+    'DO NOT WRITE ANY FILES — just resolve the scope and return the verdict fields.\n' +
+    'Use Serena tools (activate the project, list_dir, find_symbol, find_referencing_symbols,\n' +
+    'search_for_pattern) to locate the code — do NOT guess paths.\n\n' +
+    'IMPORTANT: You are running inside an automated workflow pipeline. AskUserQuestion is NOT available.\n' +
+    'Record anything needing user judgment in the ambiguities array instead of asking.\n\n' +
+    'Extraction input:\n' + (task || '') + '\n\n' +
+    'Return in the verdict:\n' +
+    '- files: every concrete file path in scope (resolved, existing files only)\n' +
+    '- entryPoints: observable entry points into this code (routes, commands, handlers, exports)\n' +
+    '- symbols: the key classes/functions anchoring the scope\n' +
+    '- confidence: high|medium|low\n' +
+    '- wide: true ONLY if the scope spans multiple coherent subsystems\n' +
+    '- suggestedSlices: when wide, candidate subsystem slices\n' +
+    '- ambiguities: unclear boundaries or intent questions (recorded, not blocking)\n' +
+    '- scopePath: set to "pending" (the manifest is written later after confirmation)\n' +
+    '- summary: one-line scope summary\n\n' +
+    'Do NOT modify any code. Do NOT commit. Do NOT write any files.',
+    { label: 'code-explorer(scope-preflight)', phase: 'Pending Confirm', schema: SCOPE_VERDICT, model: gm('scopeResolver') },
+    result
+  )
+  if (!verdict || !verdict.files || !verdict.files.length) return null
+  return {
+    pendingId: pendingId,
+    task: String(task || ''),
+    verdict: verdict,
+    state: 'PENDING',
+    createdAt: String(timestamp || ''),
+  }
+}
+
+// writePendingRecord: persist the pending record JSON to <pendingDir><pendingId>.json
+// via a file-writer agent (temp-then-rename pattern).
+async function writePendingRecord(pendingDir, record, result) {
+  var filePath = pendingDir + record.pendingId + '.json'
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + filePath + ' using a\n' +
+    'temp-then-rename pattern (write to a .tmp file first, then rename to the target).\n' +
+    'Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + filePath + '.\n\nJSON:\n' + JSON.stringify(record, null, 2),
+    { label: 'file-writer(pending-record)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// readPendingRecord: read + parse a pending record via a file-reader agent.
+// Returns the record object or null if the file does not exist.
+async function readPendingRecord(pendingDir, pendingId, result) {
+  var filePath = pendingDir + pendingId + '.json'
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + filePath + ' and return its full JSON content parsed\n' +
+    'as an object in the "record" field. If the file does not exist, return record=null.',
+    { label: 'file-reader(pending-record)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: PENDING_READ_RESULT, model: gm('todo') },
+    result
+  )
+  return loaded
+}
+
+// appendLocatorEntry: append a permanent locator entry to the locator JSON file.
+// Reads the existing array (or starts fresh), appends, writes atomically.
+async function appendLocatorEntry(locatorPath, entry, result) {
+  var existing = await safeAgent(
+    'You are a file-reader agent. Read ' + locatorPath + ' and return its JSON content as an\n' +
+    'array in the "entries" field. If the file does not exist, return entries=[].',
+    { label: 'file-reader(locator)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: LOCATOR_READ_RESULT, model: gm('todo') },
+    result
+  )
+  var entries = (existing && Array.isArray(existing.entries)) ? existing.entries : []
+  entries.push(entry)
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON array to ' + locatorPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + locatorPath + '.\n\nJSON:\n' + JSON.stringify(entries, null, 2),
+    { label: 'file-writer(locator)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// resolveLocator: look up a pendingId in the locator file via a file-reader agent.
+// Returns { featureId, planDir, promotedAt } or null.
+async function resolveLocator(locatorPath, pendingId, result) {
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + locatorPath + ' and return its JSON content as an\n' +
+    'array in the "entries" field. If the file does not exist, return entries=[].',
+    { label: 'file-reader(locator-lookup)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: LOCATOR_READ_RESULT, model: gm('todo') },
+    result
+  )
+  var entries = (loaded && Array.isArray(loaded.entries)) ? loaded.entries : []
+  return resolveLocatorEntry(entries, pendingId)
+}
+
+// writeScopeManifestFromVerdict: serialize a scope verdict to scope-manifest.md
+// and write via a file-writer agent (temp-then-rename).
+async function writeScopeManifestFromVerdict(scopeManifestPath, verdict, result) {
+  var files = (verdict && verdict.files) || []
+  var entryPoints = (verdict && verdict.entryPoints) || []
+  var symbols = (verdict && verdict.symbols) || []
+  var confidence = (verdict && verdict.confidence) || 'unspecified'
+  var ambiguities = (verdict && verdict.ambiguities) || []
+  var summary = (verdict && verdict.summary) || ''
+  var lines = ['# Scope Manifest', '', '**Confidence:** ' + confidence, '', '## Files in scope']
+  for (var i = 0; i < files.length; i++) lines.push('- ' + files[i])
+  if (entryPoints.length) { lines.push('', '## Entry points'); for (var j = 0; j < entryPoints.length; j++) lines.push('- ' + entryPoints[j]) }
+  if (symbols.length) { lines.push('', '## Key symbols'); for (var k = 0; k < symbols.length; k++) lines.push('- ' + symbols[k]) }
+  if (summary) lines.push('', '## Summary', '', summary)
+  if (ambiguities.length) { lines.push('', '## Ambiguities'); for (var m = 0; m < ambiguities.length; m++) lines.push('- ' + ambiguities[m]) }
+  var md = lines.join('\n') + '\n'
+  return safeAgent(
+    'You are a file-writer agent. Write the following markdown to ' + scopeManifestPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + scopeManifestPath + '.\n\nContent:\n' + md,
+    { label: 'file-writer(scope-manifest)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// writeIdentityStub: write the D0 .identity.json placeholder. Ownership digest
+// is null — Phase 13 fills it in with the real deterministic hash.
+async function writeIdentityStub(identityPath, planDir, timestamp, result) {
+  var identity = {
+    featureId: planDir.split('/').filter(Boolean).pop() || '',
+    planDir: planDir,
+    ownershipScopeDigest: null,
+    createdAt: String(timestamp || ''),
+  }
+  return safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + identityPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + identityPath + '.\n\nJSON:\n' + JSON.stringify(identity, null, 2),
+    { label: 'file-writer(identity-stub)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// promotePendingRecord: atomically promote a PENDING record to PROMOTED.
+// NEW-feature branch: create folder + scope-manifest.md + .identity.json stub,
+//   then root-last pipeline-state.json via flushPipelineState.
+// EXISTING-feature branch: update scope-manifest.md only (do NOT overwrite identity).
+// Both branches: update pending record state + append permanent locator entry.
+async function promotePendingRecord(arg) {
+  var pendingDir = arg && arg.pendingDir
+  var record = arg && arg.record
+  var planDir = arg && arg.planDir
+  var result = arg && arg.result
+  var config = arg && arg.config
+  var timestamp = arg && arg.timestamp
+  var identityPath = planDir + '.identity.json'
+  var scopeManifestPath = planDir + 'scope-manifest.md'
+
+  // Check if pipeline-state.json already exists at planDir (EXISTING vs NEW).
+  var existingCheck = await safeAgent(
+    'You are a file-reader agent. Check if ' + planDir + 'pipeline-state.json exists.\n' +
+    'Return exists=true and sizeBytes if it exists; exists=false if not.',
+    { label: 'file-reader(promotion-check)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: ARTIFACT_CHECK, model: gm('todo') },
+    result
+  )
+  var isExisting = existingCheck && existingCheck.exists === true
+
+  if (!isExisting) {
+    // NEW feature — create scope-manifest.md + .identity.json (root-last: state after)
+    await writeScopeManifestFromVerdict(scopeManifestPath, record.verdict, result)
+    await writeIdentityStub(identityPath, planDir, timestamp, result)
+    // Root-last: pipeline-state.json only after identity + manifest exist
+    await flushPipelineState(planDir, result, config)
+  } else {
+    // EXISTING feature — revision, NOT a new identity.
+    // Do NOT create folder, do NOT overwrite .identity.json.
+    // Update scope-manifest.md with the new scope verdict.
+    await writeScopeManifestFromVerdict(scopeManifestPath, record.verdict, result)
+    // pipeline-state.json already exists — preserved; updated later by the extract flow
+  }
+
+  // Update pending record to PROMOTED (durable — survives crash on replay)
+  var promotedRecord = Object.assign({}, record, {
+    state: 'PROMOTED',
+    promotedAt: String(timestamp || ''),
+    planDir: planDir,
+  })
+  await writePendingRecord(pendingDir, promotedRecord, result)
+
+  // Append permanent compact locator entry (retained indefinitely)
+  await appendLocatorEntry(PENDING_LOCATOR_PATH, {
+    pendingId: record.pendingId,
+    featureId: planDir.split('/').filter(Boolean).pop() || planDir,
+    planDir: planDir,
+    promotedAt: String(timestamp || ''),
+  }, result)
+
+  if (result && Array.isArray(result.logLines)) {
+    result.logLines.push('Promote: ' + record.pendingId + ' → ' + planDir + ' (' + (isExisting ? 'EXISTING' : 'NEW') + ')')
+  }
+  return { promoted: true, record: promotedRecord, isNew: !isExisting }
+}
+
 // ---- Review mode (standalone design-docset audit) ---------------------------
 // Review is the INSPECT flow: it reads an existing planDir docset (forward-designed,
 // extracted, or tuned), fans out one reviewer per review dimension (lens), dedups the
@@ -7178,6 +7505,58 @@ async function main() {
     args = {}
   }
 
+  // --confirm <pendingId>: pending-confirmation protocol entry point (extract D0).
+  // Resolves a pending scope checkpoint: PENDING → promote during extract; PROMOTED
+  // or locator-only → redirect to --resume; unknown/expired → blocked. Must execute
+  // BEFORE resumeArg parsing so a redirect flows through the existing resume handler.
+  let confirmRecord = null
+  if (args && args.confirm) {
+    phase('Pending Confirm')
+    log('main: --confirm ' + args.confirm + ' — resolving pending checkpoint')
+    const pendingRead = await readPendingRecord(PENDING_DIR, args.confirm, null)
+    if (pendingRead && pendingRead.record) {
+      const pr = pendingRead.record
+      if (pr.state === 'PROMOTED' && pr.planDir) {
+        log('main: --confirm ' + args.confirm + ' already PROMOTED at ' + pr.planDir + ' — redirecting to --resume')
+        args = Object.assign({}, args, { resume: pr.planDir, confirm: null })
+      } else if (pr.state === 'EXPIRED') {
+        const locEntry = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+        if (locEntry && locEntry.planDir) {
+          log('main: --confirm ' + args.confirm + ' payload expired, locator resolved — redirecting to --resume ' + locEntry.planDir)
+          args = Object.assign({}, args, { resume: locEntry.planDir, confirm: null })
+        } else {
+          log('main: --confirm ' + args.confirm + ' expired, no locator — blocked')
+          await writeFailedLaunch('confirm', 'confirm-expired', 'pendingId ' + args.confirm + ' expired', Object.keys(args || {}))
+          return {
+            task: '', mode: 'extract', ready: false, blockedAt: 'confirm-expired',
+            handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' has expired (30-day TTL). Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+            logLines: ['main: --confirm ' + args.confirm + ' expired'],
+          }
+        }
+      } else {
+        // PENDING or CONFIRMED — promote during the extract flow
+        confirmRecord = pr
+        args = Object.assign({}, args, { task: pr.task })
+        log('main: --confirm ' + args.confirm + ' PENDING — will promote during extract')
+      }
+    } else {
+      // Not in pending records — check locator (payload may have been TTL-expired)
+      const locEntry2 = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+      if (locEntry2 && locEntry2.planDir) {
+        log('main: --confirm ' + args.confirm + ' not in pending but locator resolved — redirecting to --resume ' + locEntry2.planDir)
+        args = Object.assign({}, args, { resume: locEntry2.planDir, confirm: null })
+      } else {
+        log('main: --confirm ' + args.confirm + ' not found — blocked')
+        await writeFailedLaunch('confirm', 'confirm-not-found', 'pendingId ' + args.confirm + ' not found', Object.keys(args || {}))
+        return {
+          task: '', mode: 'extract', ready: false, blockedAt: 'confirm-not-found',
+          handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' was not found. It may have expired or never existed. Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+          logLines: ['main: --confirm ' + args.confirm + ' not found'],
+        }
+      }
+    }
+  }
+
   // --resume <planDir>: hydrate persisted pipeline state and re-run linearly.
   // args.resume is the ORIGINAL RUN's planDir (e.g. docs/parser/feature/add-retry-layer).
   // When set, args.task is optional (resolved from the persisted state). Slug-only resume
@@ -8235,33 +8614,85 @@ ${task}`,
     // output is a /tune-feature- and /design-feature-compatible baseline. Runs AFTER
     // Translate (free-text scope input benefits from translation), never enters E4.
     if (isExtractMode) {
-      // Gate X0: scope resolution — hybrid input -> concrete scope manifest. Blocking.
+      // --confirm promotion: if entering via --confirm <pendingId>, promote the
+      // pending record before Gate X0. Promotion creates the folder, writes
+      // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
+      // and appends the permanent locator entry. Crash-idempotent on replay.
+      if (confirmRecord && !result.scopeManifestPath) {
+        phase('Promote')
+        plog('Promoting pending record ' + confirmRecord.pendingId + ' -> ' + planDir)
+        const promo = await promotePendingRecord({
+          pendingDir: PENDING_DIR,
+          record: confirmRecord,
+          planDir,
+          result,
+          config,
+          timestamp: args && args.timestamp,
+        })
+        result.extractScope = confirmRecord.verdict
+        result.scopeManifestPath = planDir + 'scope-manifest.md'
+        result.scopeConfirmed = true
+        if ((confirmRecord.verdict.ambiguities || []).length) {
+          await writeOpenQuestions(planDir, confirmRecord.verdict.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        }
+        plog('Promoted ' + confirmRecord.pendingId + ' -> ' + planDir + ' (' + (promo.isNew ? 'NEW' : 'EXISTING') + ')')
+        stateCheckpoint('Promote', 'done')
+      }
+
+      // Gate X0: scope resolution. Fresh runs use preflight (writes nothing to disk,
+      // returns a pendingId for confirmation). --confirm and --resume paths arrive
+      // with scopeManifestPath already set (via promotion or persisted state).
       if (result.scopeManifestPath) {
-        plog('resume: skip Extract Scope (scopeManifestPath set)')
+        plog('skip Extract Scope (scopeManifestPath set)')
       } else {
-        phase('Extract Scope')
-        plog('Resolving extraction input into a scope manifest')
-        const scope = await resolveScope({ task, planDir, result })
-        if (!scope || !scope.scopePath || !(scope.files || []).length) {
+        // Fresh run — preflight: resolve scope WITHOUT writing files, write pending
+        // record, return awaiting-scope-confirm with pendingId (D0 protocol).
+        phase('Pending Confirm')
+        plog('Resolving extraction scope (preflight — no file writes)')
+        const preflight = await resolveScopePreflight({ task, result, timestamp: args && args.timestamp })
+        if (!preflight || !preflight.verdict || !(preflight.verdict.files || []).length) {
           result.blockedAt = 'extract-scope'
           result.handoff = {
             from: 'extract',
-            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points), or --resume ${planDir} after inspecting scope-manifest.md.`,
+            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points).`,
             nextMode: 'extract',
             planDir,
           }
-          plog('Extract Scope: no scope resolved — blocking')
-          stateCheckpoint('Extract Scope', 'blocked')
+          plog('Preflight: no scope resolved — blocking')
+          stateCheckpoint('Pending Confirm', 'blocked')
           await consolidate(slug, result, config)
           return result
         }
-        result.extractScope = scope
-        result.scopeManifestPath = scope.scopePath
-        plog(`Extract Scope: ${scope.files.length} file(s), ${(scope.entryPoints || []).length} entry point(s), confidence=${scope.confidence || 'unspecified'}, wide=${!!scope.wide}`)
-        if ((scope.ambiguities || []).length) {
-          await writeOpenQuestions(planDir, scope.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        // Write pending record — the ONLY durable state before promotion.
+        // pipeline-state.json is intentionally NOT written (RED gate: --resume
+        // cannot resume a not-yet-promoted checkpoint).
+        await writePendingRecord(PENDING_DIR, preflight, result)
+        result.extractScope = preflight.verdict
+        result.pendingId = preflight.pendingId
+        plog(`Preflight: ${(preflight.verdict.files || []).length} file(s), ${(preflight.verdict.entryPoints || []).length} entry point(s), confidence=${preflight.verdict.confidence || 'unspecified'}, pendingId=${preflight.pendingId}`)
+        // Return awaiting-scope-confirm with pendingId (primary: --confirm <pendingId>)
+        const pscope = preflight.verdict
+        result.handoff = {
+          from: 'extract',
+          status: 'awaiting-scope-confirm',
+          message: `Scope resolved to ${(pscope.files || []).length} file(s). Confirm: /extract-design --confirm ${preflight.pendingId}`,
+          nextMode: 'extract',
+          planDir,
+          pendingId: preflight.pendingId,
+          scopeSummary: {
+            files: pscope.files || [],
+            entryPoints: pscope.entryPoints || [],
+            confidence: pscope.confidence || 'unspecified',
+            wide: !!pscope.wide,
+            suggestedSlices: pscope.suggestedSlices || [],
+          },
         }
-        stateCheckpoint('Extract Scope', 'done')
+        plog('Preflight: awaiting scope confirmation (pendingId=' + preflight.pendingId + ') — returning')
+        stateCheckpoint('Pending Confirm', 'awaiting-confirm')
+        // Intentionally NO consolidate here — pipeline-state.json must not exist
+        // before promotion (RED gate: --resume cannot resume a pre-promotion checkpoint).
+        // The pending record is the sole durable state; --confirm recovers from it.
+        return result
       }
 
       // Gate X0.5: scope confirmation — pause-and-resume checkpoint, NO agent involved.

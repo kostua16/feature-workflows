@@ -970,4 +970,58 @@ const OVERVIEW_VERDICT = {
   },
 }
 
-export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT }
+// --- Pending-confirmation protocol schemas (extract D0) -------------------
+
+// PREFLIGHT_VERDICT: returned by resolveScopePreflight — wraps a SCOPE_VERDICT with
+// the pending-confirmation lifecycle fields. The pendingId is engine-generated
+// (deterministic djb2 of task+timestamp); the agent resolves the scope but does NOT
+// write any files. State transitions: PENDING → PROMOTED (on --confirm).
+const PREFLIGHT_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string', description: 'Deterministic 16-hex confirmation id' },
+    task: { type: 'string' },
+    verdict: { type: 'object', description: 'Full SCOPE_VERDICT from the preflight resolution' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED'] },
+    createdAt: { type: 'string', description: 'ISO-like timestamp from args.timestamp' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+  },
+}
+
+// PENDING_RECORD: shape of docs/extract/.pending/<pendingId>.json — the durable
+// scratch checkpoint written by the preflight and updated on promotion.
+const PENDING_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    task: { type: 'string' },
+    verdict: { type: 'object' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED', 'EXPIRED'] },
+    createdAt: { type: 'string' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+    expiredAt: { type: 'string', description: 'Set when the bulky payload is TTL-expired' },
+  },
+}
+
+// LOCATOR_ENTRY: compact permanent record in docs/extract/.pending-locator.json.
+// Retained indefinitely so --confirm <pendingId> always resolves to the authoritative
+// folder even after the bulky pending payload is TTL-expired.
+const LOCATOR_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'featureId', 'planDir', 'promotedAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    featureId: { type: 'string' },
+    planDir: { type: 'string' },
+    promotedAt: { type: 'string' },
+  },
+}
+
+export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT, PREFLIGHT_VERDICT, PENDING_RECORD, LOCATOR_ENTRY }

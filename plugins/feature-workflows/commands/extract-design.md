@@ -1,6 +1,6 @@
 ---
 description: EXTRACT flow — reverse-engineer design docs (code facts -> e2e use cases -> detailed design -> architecture [-> requirements]) from existing code, slice by slice; audit for design debt. Output is a /tune-feature- and /design-feature-compatible baseline.
-argument-hint: <scope: free text, paths/globs, or entry points> [--plan=PLAN_PATH] [--profile=full|standard|light] [--no-confirm] [--no-decompose] [--max-slices=N] [--slices=id1,id2] [--no-audit] [--no-requirements] [--no-review] [--no-e2e] [--no-arch] [--no-design] [--no-enhancer] [--no-quick-decider] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--decision-cap=N] [--retries=N] [--timestamp=TS] [--resume <planDir>]
+argument-hint: <scope: free text, paths/globs, or entry points> [--plan=PLAN_PATH] [--profile=full|standard|light] [--no-confirm] [--no-decompose] [--max-slices=N] [--slices=id1,id2] [--no-audit] [--no-requirements] [--no-review] [--no-e2e] [--no-arch] [--no-design] [--no-enhancer] [--no-quick-decider] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--decision-cap=N] [--retries=N] [--timestamp=TS] [--resume <planDir>] [--confirm <pendingId>]
 allowed-tools: Workflow, AskUserQuestion, Read, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*), Bash(mktemp:*), Bash(rm:*)
 ---
 
@@ -91,6 +91,9 @@ Parse `$ARGUMENTS` into:
 - `--decision-cap=N`: → `decisionCap` (default 50)
 - `--retries=N`: → `retryBudget` (default 20; shared global budget)
 - `--timestamp=<TS>`: → `timestamp` (planDir leaf when no JIRA id in task)
+- `--confirm <pendingId>`: → `confirm: <pendingId>` (promote a pending scope checkpoint from a prior
+  fresh run. Resolves the pending record, creates the feature folder + identity + pipeline-state,
+  and continues extraction. Works even after the 30-day bulky-payload TTL via the permanent locator.)
 
 Then call the Workflow tool:
 
@@ -121,7 +124,8 @@ Workflow({
     decisionCap: <int>,
     retryBudget: <int>,
     timestamp: <TS or "">,
-    resume: <planDir or "">
+    resume: <planDir or "">,
+    confirm: <pendingId or "">
   }
 })
 ```
@@ -134,24 +138,26 @@ checkpoint loop below, and passing `scopeConfirmed: false` cancels the run.
 Subagents inside the workflow cannot use AskUserQuestion, so scope confirmation is a
 pause-and-resume checkpoint driven by YOU (the main session):
 
-1. If the returned result has `handoff.status === "awaiting-scope-confirm"`: the engine paused
-   after resolving the scope. Present `handoff.scopeSummary` to the user via **AskUserQuestion**:
-   show the file count + key files, entry points, `confidence`, and (when `wide`) the
-   `suggestedSlices`. Read `result.scopeManifestPath` for detail if the summary is not enough.
-   Offer: **approve as-is** / **adjust** (user supplies a corrected file list and/or slice ids) /
+### Primary path: `--confirm <pendingId>` (D0 protocol)
+
+1. A fresh `/extract-design <scope>` run resolves the scope WITHOUT writing files and returns a
+   `pendingId` in `result.handoff.pendingId`. The scope verdict is stored in a pending record at
+   `docs/extract/.pending/<pendingId>.json`.
+2. Present `handoff.scopeSummary` to the user via **AskUserQuestion**: show the file count + key
+   files, entry points, `confidence`, and (when `wide`) the `suggestedSlices`. Offer: **approve** /
    **cancel**.
-2. Re-invoke the Workflow tool with the confirmation payload:
-   ```
-   Workflow({ name: "feature-pipeline", args: {
-     mode: "extract", resume: <result.planDir>,
-     scopeConfirmed: <true | false>,        // false = cancel
-     scopeFiles: <[adjusted files] or omit>, // only when the user adjusted the file list
-     slices: <[selected slice ids] or omit>  // only when the user narrowed the slices
-   }})
-   ```
-3. Continue reporting from whatever that second call returns. The whole loop is ONE user-visible
-   command invocation. A run interrupted at the checkpoint resumes through the same leg:
-   `/extract-design --resume <planDir>` re-returns `awaiting-scope-confirm`.
+3. To confirm: `/extract-design --confirm <pendingId>`. This promotes the pending record (creates
+   the feature folder, writes scope-manifest.md + .identity.json + pipeline-state.json), and
+   continues extraction in one invocation.
+4. To cancel: simply don't confirm. The pending record expires after 30 days (bulky payload only;
+   the permanent locator entry is retained).
+
+### Fallback: `--resume <planDir>` (post-promotion only)
+
+After promotion, `--resume <planDir>` resumes the extraction flow. Before promotion, `--resume`
+fails (no pipeline-state.json exists — use `--confirm` instead).
+
+**Concurrent same-feature invocations are unsupported.**
 
 When the workflow returns its final result JSON, report it concisely:
 - Always print `result.planDir` first. If `result._categorization` is set, show `category/subCategory`.
@@ -166,6 +172,8 @@ When the workflow returns its final result JSON, report it concisely:
   - `extract-scope`: the input could not be resolved into concrete code — re-run with more
     specific paths/entry points.
   - `extract-cancelled`: the user cancelled at scope confirmation.
+  - `confirm-not-found`: the `--confirm <pendingId>` was not found or never existed.
+  - `confirm-expired`: the `--confirm <pendingId>` payload expired (30-day TTL) with no locator.
   - `extract-budget`: retry budget exhausted mid-queue — completed slices preserved.
   - `artifact-missing`: a done slice's mandated artifact failed verification (`result.artifactChecks`).
   - `uncaught-throw`: inspect `<planDir>/pipeline.log`.
@@ -178,6 +186,7 @@ Examples:
 /extract-design the whole engine at plugins/feature-workflows/workflows/ --max-slices=4
 /extract-design api routes in server/routes.js and their handlers --no-confirm
 /extract-design --resume docs/parser/extract/auth-flow
+/extract-design --confirm a1b2c3d4e5f60718
 ```
 
 ## Editing the workflow script
