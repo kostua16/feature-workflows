@@ -66,6 +66,11 @@ function callsRemaining(accountant) {
 }
 
 // Compute remaining token budget after subtracting spent and reserved.
+// NOTE: totalReserve() is denominated in CALL units (DESIGN_RESERVE_CALLS etc.).
+// Token-unit reserve accounting is deferred until tokenCeiling is characterized in
+// real terms (v1.5.0 cleanup D3); until then reserves are a single call-unit pool
+// applied to both budgets — harmless while tokenCeiling is uncharacterized (default 0,
+// which short-circuits to Infinity above).
 function tokensRemaining(accountant) {
   if (!accountant.limits.tokenCeiling) return Infinity
   var reserved = totalReserve(accountant)

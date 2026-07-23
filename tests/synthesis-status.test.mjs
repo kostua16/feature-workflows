@@ -678,4 +678,8 @@ test('REGRESSION: no direct FS or shell access in new modules', () => {
     assert.ok(!src.match(/Math\.random/), `no Math.random in ${name}`)
     assert.ok(!src.match(/new Date/), `no new Date in ${name}`)
   }
+  // Self-containment: synthSortKeys must not reference bare `sortKeys` (undefined
+  // outside dist concatenation scope). Regression guard for the rename bug.
+  assert.ok(!synthSrc.match(/\bsortKeys\b/),
+    'synthesis.mjs must be self-contained — recursive sort calls must use synthSortKeys, not bare sortKeys')
 })

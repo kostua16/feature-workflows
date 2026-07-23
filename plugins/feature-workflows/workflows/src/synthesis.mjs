@@ -24,10 +24,10 @@ function synthDigest(obj) {
 
 function synthSortKeys(obj) {
   if (obj === null || typeof obj !== 'object') return obj
-  if (Array.isArray(obj)) return obj.map(sortKeys)
+  if (Array.isArray(obj)) return obj.map(synthSortKeys)
   var sorted = {}
   for (var key of Object.keys(obj).sort()) {
-    sorted[key] = sortKeys(obj[key])
+    sorted[key] = synthSortKeys(obj[key])
   }
   return sorted
 }
