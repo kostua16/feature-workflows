@@ -286,21 +286,28 @@ test('REGRESSION: ESM syntax validation passes for both dist entries', () => {
   }
 })
 
-test('REGRESSION: full test suite sentinel — Phase 19 is the final regression checkpoint', () => {
-  // This meta-test documents that Phase 19 is the final phase of milestone v1.6.0.
-  // It verifies the test runner completed execution to this point.
-  // The existence of this test file itself proves the regression gate ran.
-  assert.ok(true, 'Phase 19 regression checkpoint reached — all prior tests completed')
-  // Verify both dist entries have the v1.6 features present in source
+test('E2E-PROOF-01: dist contains all v1.6 feature surface (full suite + drift + v1.5 compat)', () => {
+  // E2E-PROOF-01 is the ROADMAP E2E matrix entry for Phase 19.
+  // Observable outcome: "All green, drift-free." This test verifies the shipped
+  // dist artifact actually contains the v1.6 feature surface.
   const fpSrc = readEntry('feature-pipeline.js')
-  assert.ok(fpSrc.includes('deriveFeatureFolder'),
-    'dist must contain v1.6 deriveFeatureFolder')
-  assert.ok(fpSrc.includes('findFeature'),
-    'dist must contain v1.6 findFeature')
-  assert.ok(fpSrc.includes('resolveUpsertMode'),
-    'dist must contain v1.6 resolveUpsertMode')
-  assert.ok(fpSrc.includes('invalidateSliceChain'),
-    'dist must contain v1.6 invalidateSliceChain')
-  assert.ok(fpSrc.includes('reconcileSlices'),
-    'dist must contain v1.6 reconcileSlices')
+  const v16Features = [
+    'deriveFeatureFolder',
+    'findFeature',
+    'resolveUpsertMode',
+    'invalidateSliceChain',
+    'reconcileSlices',
+    'promotePendingRecord',
+    'detectSliceChanges',
+    'onSliceRemoved',
+    'deriveForkedFeatureId',
+    'isLegacyRoot',
+  ]
+  for (const fn of v16Features) {
+    assert.ok(fpSrc.includes(fn),
+      `dist must contain v1.6 function: ${fn}`)
+  }
+  // The regression-proof file itself (build drift, version lockstep, six-mode
+  // compat, resume/migration) IS the E2E-PROOF-01 scenario. If this test
+  // executes, the full suite ran to this point without early-exit.
 })

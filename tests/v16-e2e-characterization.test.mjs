@@ -1,4 +1,4 @@
-// Phase 19 PROOF-01: Cross-cutting E2E characterization for all 8 v1.6 scenarios.
+// Phase 19 PROOF-01: Cross-cutting E2E characterization for all 10 v1.6 scenarios.
 //
 // Each test chains multiple operations into an integrated flow, proving the
 // v1.6 functions compose correctly end-to-end. Fixtures are built from scratch
@@ -10,6 +10,10 @@ import { readFileSync } from 'node:fs'
 import { engine } from './harness.mjs'
 
 const {
+  // Phase 12 — pending-confirmation protocol
+  generatePendingId,
+  buildPendingRecord,
+  resolveLocatorEntry,
   // Phase 13 — deterministic identity
   deriveFeatureFolder,
   // Phase 14 — registry
@@ -19,6 +23,7 @@ const {
   canonicalizeIdentity,
   // Phase 15 — slice reconciliation
   reconcileSlices,
+  validatePartition,
   // Phase 16 — change detection
   frameSliceDigest,
   detectSliceChanges,
@@ -50,6 +55,90 @@ const H3 = 'c234567890abcdef01234567890abcdef01234567890abcdef01234567890abcdef'
 const H4 = 'd234567890abcdef01234567890abcdef01234567890abcdef01234567890abcdef'
 const H5 = 'e234567890abcdef01234567890abcdef01234567890abcdef01234567890abcdef'
 const H6 = 'f234567890abcdef01234567890abcdef01234567890abcdef01234567890abcdef'
+
+// ===========================================================================
+// E2E-PROMO-01: Pending-confirmation crash-idempotency (2 tests)
+// ===========================================================================
+
+test('E2E-PROMO-01: preflight → pendingId + PENDING record → locator resolves it', () => {
+  // Step 1: preflight generates a deterministic pendingId from task + timestamp
+  const task = 'extract authentication module'
+  const timestamp = '20260724-1000'
+  const pendingId = generatePendingId(task, timestamp)
+  assert.ok(pendingId, 'pendingId must be produced')
+  assert.equal(pendingId.length, 16, 'pendingId is 16-hex chars')
+  // Deterministic: same inputs → same id
+  assert.equal(generatePendingId(task, timestamp), pendingId)
+
+  // Step 2: buildPendingRecord creates a PENDING-shaped record (no planDir yet)
+  const verdict = {
+    files: [
+      { path: 'src/auth/login.ts', contentSha256: H1 },
+      { path: 'src/auth/session.ts', contentSha256: H2 },
+    ],
+    entryPoints: ['src/auth/login.ts'],
+  }
+  const record = buildPendingRecord(pendingId, task, verdict, timestamp)
+  assert.equal(record.pendingId, pendingId)
+  assert.equal(record.state, 'PENDING')
+  assert.equal(record.planDir, undefined, 'PENDING record has no planDir — not yet promoted')
+  assert.deepEqual(record.verdict, verdict)
+
+  // Step 3: locator resolves the pendingId after promotion writes the entry
+  const locator = [
+    { pendingId: 'other000000000001', featureId: 'other', planDir: 'docs/extract/other/' },
+    { pendingId: pendingId, featureId: 'auth-aabbcc', planDir: 'docs/extract/src/auth/auth-aabbcc/' },
+  ]
+  const entry = resolveLocatorEntry(locator, pendingId)
+  assert.equal(entry.pendingId, pendingId)
+  assert.equal(entry.featureId, 'auth-aabbcc')
+  assert.ok(entry.planDir.startsWith('docs/extract/'))
+})
+
+test('E2E-PROMO-01: promotion is crash-idempotent — root-last ordering, replay-safe', () => {
+  // Source assertions: promotePendingRecord follows root-last ordering and is
+  // crash-safe on replay. This is the core PROMO-01 invariant: replaying a
+  // promotion after a crash must NOT create a duplicate folder.
+  const promoteFn = source.slice(
+    source.indexOf('async function promotePendingRecord'),
+    source.indexOf('// ---- Feature-identity registry')
+  )
+  assert.ok(promoteFn.length > 100, 'promotePendingRecord function body found')
+
+  // 1. Existing check: promotion first checks if pipeline-state.json exists
+  //    (NEW vs EXISTING branch — no duplicate folder on replay)
+  assert.ok(promoteFn.includes('pipeline-state.json'),
+    'promotion checks for existing pipeline-state.json')
+
+  // 2. Root-last ordering: identity + manifest written BEFORE pipeline-state.json
+  const identityIdx = promoteFn.indexOf('writeIdentity(')
+  const manifestIdx = promoteFn.indexOf('writeScopeManifestFromVerdict(')
+  const stateIdx = promoteFn.indexOf('flushPipelineState(')
+  assert.ok(identityIdx > -1 && manifestIdx > -1 && stateIdx > -1,
+    'all three write operations present')
+  assert.ok(identityIdx < stateIdx,
+    'identity written before pipeline-state (root-last)')
+  assert.ok(manifestIdx < stateIdx,
+    'scope-manifest written before pipeline-state (root-last)')
+
+  // 3. Promoted record updated AFTER all writes — survives crash on replay
+  const promotedRecordIdx = promoteFn.indexOf("state: 'PROMOTED'")
+  assert.ok(promotedRecordIdx > stateIdx,
+    'PROMOTED state set AFTER pipeline-state write (crash-safe)')
+
+  // 4. Locator entry is append-only (permanent compact mapping)
+  assert.ok(promoteFn.includes('appendLocatorEntry'),
+    'locator entry appended for permanent mapping')
+
+  // 5. EXISTING branch (else clause) does NOT write identity — extract it
+  //    precisely: from "} else {" to the matching "}" before "Update pending"
+  const elseIdx = promoteFn.indexOf('} else {')
+  const updatePendingIdx = promoteFn.indexOf('Update pending record')
+  assert.ok(elseIdx > -1, 'else branch for existing features exists')
+  const elseBranch = promoteFn.slice(elseIdx, updatePendingIdx)
+  assert.equal(elseBranch.match(/writeIdentity/), null,
+    'EXISTING branch must NOT overwrite identity (ownership immutable)')
+})
 
 // ===========================================================================
 // E2E-FOLDER-01: Deterministic folder across runs/worktrees (3 tests)
@@ -208,6 +297,105 @@ test('E2E-MATCH-02: --feature override on blocked match selects specified featur
   // Then the feature mode reassigns to auto-update for fallthrough
   assert.ok(source.includes("upsertMode.mode = 'auto-update'"),
     'feature mode must fall through to update path')
+})
+
+// ===========================================================================
+// E2E-OWN-01: Ownership reconciliation — add/remove/move/new-dir (2 tests)
+// ===========================================================================
+
+test('E2E-OWN-01: add + remove + move + new-dir → exactly-one-owner via validatePartition', () => {
+  // Step 1: persisted slices [A, B]
+  const persistedSlices = [
+    {
+      sliceId: 'slice-A', status: 'current', planDir: 'docs/extract/a/',
+      files: [
+        { path: 'src/auth/login.ts', contentSha256: H1 },
+        { path: 'src/auth/session.ts', contentSha256: H2 },
+      ],
+    },
+    {
+      sliceId: 'slice-B', status: 'current', planDir: 'docs/extract/b/',
+      files: [
+        { path: 'src/core/db.ts', contentSha256: H3 },
+      ],
+    },
+  ]
+
+  // Step 2: current files — ADD (new file in A's dir), REMOVE (B's file gone),
+  // MOVE (login.ts → renamed, same content hash), NEW-DIR (files in new directory)
+  const currentFiles = [
+    // A's files: login.ts moved to new path (same hash = move detection)
+    { path: 'src/auth/login-renamed.ts', contentSha256: H1 },
+    // A's files: session.ts unchanged
+    { path: 'src/auth/session.ts', contentSha256: H2 },
+    // A's files: new file added in same directory
+    { path: 'src/auth/middleware.ts', contentSha256: H4 },
+    // NEW-DIR: files in a new directory (no existing slice owns)
+    { path: 'lib/utils/helpers.ts', contentSha256: H5 },
+    // B's file (db.ts) removed — not in current
+  ]
+
+  // Step 3: reconcileSlices assigns ownership
+  const { slices, delta } = reconcileSlices(persistedSlices, currentFiles)
+
+  // Step 4: validatePartition — every current file has exactly one owner
+  assert.doesNotThrow(() => validatePartition(slices, currentFiles),
+    'every current file must have exactly one owner after reconciliation')
+
+  // Moved file (login.ts → login-renamed.ts, same hash) stays in slice-A
+  const sliceA = slices.find(s => s.sliceId === 'slice-A')
+  assert.ok(sliceA.files.some(f => f.path === 'src/auth/login-renamed.ts'),
+    'moved file assigned to original slice')
+
+  // Added file in A's directory goes to slice-A (prefix-score match)
+  assert.ok(sliceA.files.some(f => f.path === 'src/auth/middleware.ts'),
+    'added file in A\'s directory assigned to A')
+
+  // slice-B is removed (its only file was removed)
+  const sliceB = slices.find(s => s.sliceId === 'slice-B')
+  assert.ok(sliceB, 'slice-B still exists')
+  assert.ok(delta.removedSlices.includes('slice-B') || sliceB.status === 'removed',
+    'slice-B marked removed when all its files are gone')
+
+  // NEW-DIR files get their own new slice
+  const newSlice = slices.find(s =>
+    s.files && s.files.some(f => f.path === 'lib/utils/helpers.ts')
+  )
+  assert.ok(newSlice && !['slice-A', 'slice-B'].includes(newSlice.sliceId),
+    'new-directory files assigned to a new slice')
+})
+
+test('E2E-OWN-01: permutation-invariant ownership — reordered input produces same partition', () => {
+  const persistedSlices = [
+    {
+      sliceId: 'slice-X', status: 'current', planDir: 'docs/extract/x/',
+      files: [
+        { path: 'src/a.ts', contentSha256: H1 },
+        { path: 'src/b.ts', contentSha256: H2 },
+      ],
+    },
+  ]
+  const filesNormal = [
+    { path: 'src/a.ts', contentSha256: H1 },
+    { path: 'src/b.ts', contentSha256: H2 },
+    { path: 'lib/new.ts', contentSha256: H3 },
+  ]
+  const filesReordered = [
+    { path: 'lib/new.ts', contentSha256: H3 },
+    { path: 'src/b.ts', contentSha256: H2 },
+    { path: 'src/a.ts', contentSha256: H1 },
+  ]
+  const r1 = reconcileSlices(persistedSlices, filesNormal)
+  const r2 = reconcileSlices(persistedSlices, filesReordered)
+  // Same partition: same number of slices, same file assignments
+  assert.equal(r1.slices.length, r2.slices.length)
+  assert.doesNotThrow(() => validatePartition(r1.slices, filesNormal))
+  assert.doesNotThrow(() => validatePartition(r2.slices, filesReordered))
+  // The slice IDs for the new-directory cluster are permutation-invariant
+  const r1New = r1.slices.find(s => !['slice-X'].includes(s.sliceId))
+  const r2New = r2.slices.find(s => !['slice-X'].includes(s.sliceId))
+  assert.ok(r1New && r2New, 'new slice created in both')
+  assert.equal(r1New.sliceId, r2New.sliceId, 'permutation-invariant slice IDs')
 })
 
 // ===========================================================================
@@ -603,21 +791,35 @@ test('E2E-ADOPT-01: re-adoption is idempotent (already-adopted no-op)', () => {
 })
 
 // ===========================================================================
-// E2E coverage tracker
+// E2E coverage tracker — verifies every ROADMAP E2E scenario has real tests
 // ===========================================================================
 
-test('E2E-MATRIX: all 8 v1.6 E2E scenario IDs are covered by this suite', () => {
-  const coveredIds = [
+test('E2E-MATRIX: every ROADMAP v1.6 E2E scenario ID has at least one test in this suite', () => {
+  // The ROADMAP E2E matrix defines 10 scenarios exercised by this suite.
+  // E2E-PROOF-01 is covered in v16-regression-proof.test.mjs (not here).
+  const ROADMAP_SCENARIOS = [
+    'E2E-PROMO-01',
     'E2E-FOLDER-01',
     'E2E-MATCH-01',
     'E2E-MATCH-02',
+    'E2E-OWN-01',
     'E2E-CHANGE-01',
     'E2E-INVAL-01',
     'E2E-REMOVED-01',
     'E2E-UPSERT-01',
     'E2E-ADOPT-01',
   ]
-  assert.equal(coveredIds.length, 8, 'all 8 v1.6 E2E scenarios must be covered')
-  const unique = new Set(coveredIds)
-  assert.equal(unique.size, coveredIds.length, 'no duplicate E2E IDs')
+  // Extract test names from THIS file's own source to verify real coverage
+  const selfSource = readFileSync(new URL(import.meta.url), 'utf8')
+  const testNames = selfSource.match(/test\('([^']+)'/g) || []
+  const missing = ROADMAP_SCENARIOS.filter(id =>
+    !testNames.some(name => name.includes(id))
+  )
+  assert.equal(missing.length, 0,
+    `E2E scenarios missing real tests in this suite: ${missing.join(', ')}`)
+  // Each scenario must have at least 1 test
+  for (const id of ROADMAP_SCENARIOS) {
+    const count = testNames.filter(n => n.includes(id)).length
+    assert.ok(count >= 1, `${id} must have at least 1 test (found ${count})`)
+  }
 })
