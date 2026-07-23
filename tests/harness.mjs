@@ -281,6 +281,12 @@ const CANDIDATES = [
   'markStaleForSlice',
   'onSliceRemoved',
   'INVALIDATION_EVENT',
+  // Phase 18 — upsert entrypoints + v1.5 migration (D3/D4)
+  'resolveUpsertMode',
+  'deriveForkedFeatureId',
+  'isLegacyRoot',
+  'UPSERT_MODE_VERDICT',
+  'ADOPT_RESULT',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)

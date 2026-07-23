@@ -1,4 +1,4 @@
-import { FILE_ACK, SCOPE_VERDICT, AUDIT_VERDICT, ARTIFACT_CHECK, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD, REGISTRY_FILE, REGISTRY_ENTRY, SLICE_DIGEST, SLICE_DIGEST_RESULT } from './schemas.mjs'
+import { FILE_ACK, SCOPE_VERDICT, AUDIT_VERDICT, ARTIFACT_CHECK, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD, REGISTRY_FILE, REGISTRY_ENTRY, SLICE_DIGEST, SLICE_DIGEST_RESULT, UPSERT_MODE_VERDICT, ADOPT_RESULT } from './schemas.mjs'
 import { nsAgent, gm } from './config.mjs'
 import { categorizeSlug } from './text-utils.mjs'
 import { classifyAndRecordIssue } from './stages-issues.mjs'
@@ -1570,4 +1570,239 @@ async function runChangeDetection(arg) {
   return { decisions: decisions, digests: currentDigests, extractReady: extractReady }
 }
 
-export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, normalizeToPosix, validateHashes, deriveFeatureFolder, hashSources, writeIdentity, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, REGISTRY_ENTRY, REGISTRY_FILE, computePrefixScore, clusterByTwoSegDir, deriveClusterSliceId, detectMoves, validatePartition, reconcileSlices, frameSliceDigest, validateDigest64Hex, detectSliceChanges, computeSliceDigests, writeSliceDigestFile, readSliceDigestFile, runChangeDetection }
+// ---- Phase 18: Upsert entrypoints + v1.5 migration (D3/D4) -----------------
+
+// resolveUpsertMode: PURE — resolves the update behavior for an existing feature
+// from CLI args and the findFeature result. No agent calls, no I/O, no async.
+// Priority: mutual-exclusion check → --new → --feature → --force → --no-update →
+// findResult.decision (reuse→auto-update default, new→new, blocked→blocked).
+function resolveUpsertMode(args, findResult) {
+  args = args || {}
+  findResult = findResult || {}
+  var newFolder = !!(args.newFolder || args.new)
+  var feature = args.feature || ''
+  var force = !!(args.force)
+  var noUpdate = !!(args.noUpdate)
+  var update = !!(args.update)
+
+  // --new and --feature are mutually exclusive.
+  if (newFolder && feature) {
+    return { mode: 'error', reason: 'mutually-exclusive' }
+  }
+  if (newFolder) return { mode: 'new' }
+  if (feature) return { mode: 'feature', featureId: feature }
+  if (force) return { mode: 'force' }
+  if (noUpdate) return { mode: 'continue-incomplete' }
+
+  var decision = findResult.decision || ''
+  if (decision === 'reuse') return { mode: 'auto-update' }
+  if (decision === 'new') return { mode: 'new' }
+  if (decision === 'blocked') return { mode: 'blocked', reason: findResult.reason || 'ambiguous' }
+
+  return { mode: 'new' }
+}
+
+// deriveForkedFeatureId: PURE — finds the next available fork suffix for a base
+// feature id (e.g. <base>-2, <base>-3). Scans the registry for existing forks.
+function deriveForkedFeatureId(baseFeatureId, registry) {
+  var features = (registry && registry.features) || {}
+  var n = 2
+  var key = baseFeatureId + '-' + n
+  while (features[key]) {
+    n++
+    key = baseFeatureId + '-' + n
+  }
+  return { featureId: key, n: n }
+}
+
+// isLegacyRoot: PURE — qualifies a folder as a v1.5 extraction root based on
+// marker files present and path exclusions. Operates on strings only.
+function isLegacyRoot(folderPath, markerFiles) {
+  if (!folderPath || !Array.isArray(markerFiles)) return false
+  // Exclude slice children, pending dirs, registry, sidecars.
+  if (folderPath.indexOf('/slices/') !== -1) return false
+  if (folderPath.indexOf('/.pending/') !== -1) return false
+  if (folderPath.endsWith('.registry.json')) return false
+  if (folderPath.endsWith('.identity.json')) return false
+  // Must contain a root marker.
+  return markerFiles.indexOf('pipeline-state.json') !== -1
+    || markerFiles.indexOf('plan.md') !== -1
+}
+
+// scanForLegacyFolders: agent-mediated — recursively lists docs/extract/ and
+// qualifies each folder as a v1.5 root via isLegacyRoot. Returns sorted roots.
+async function scanForLegacyFolders(arg) {
+  var docsRoot = (arg && arg.docsRoot) || 'docs/extract/'
+  var result = arg && arg.result
+  var listing = await safeAgent({
+    phase: 'Migrate',
+    label: 'scan-legacy-folders',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['folders'],
+      properties: {
+        folders: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path', 'files'],
+            properties: {
+              path: { type: 'string', description: 'Folder path relative to repo root' },
+              files: { type: 'array', items: { type: 'string' }, description: 'File names directly in this folder' },
+            },
+          },
+        },
+      },
+    },
+    prompt: 'List every folder under ' + docsRoot + ' recursively (depth-limited to 5 levels). ' +
+      'For each folder return its POSIX path (relative to repo root) and the names of files directly in it. ' +
+      'Return ONLY JSON.',
+  })
+  var folders = (listing && listing.folders) || []
+  var roots = []
+  for (var i = 0; i < folders.length; i++) {
+    var f = folders[i]
+    if (isLegacyRoot(f.path || '', f.files || [])) {
+      roots.push(f.path)
+    }
+  }
+  roots.sort()
+  return { roots: roots }
+}
+
+// adoptLegacyFolder: agent-mediated — imports a v1.5 extract folder into the
+// registry. Derives identity from the folder's persisted scope, writes
+// .identity.json + registry entry (root-last, temp-rename), with rollback.
+async function adoptLegacyFolder(arg) {
+  var planDir = (arg && arg.planDir) || ''
+  var result = arg && arg.result
+  var config = arg && arg.config
+  var timestamp = (arg && arg.timestamp) || ''
+
+  // 1. Validate root: read the folder's file list.
+  var folderRead = await safeAgent({
+    phase: 'Adopt',
+    label: 'read-folder-files',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['files'],
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'File names directly in the folder' },
+      },
+    },
+    prompt: 'List the file names (not directories) directly in ' + planDir + '. Return ONLY JSON.',
+  })
+  if (!isLegacyRoot(planDir, (folderRead && folderRead.files) || [])) {
+    return { adopted: false, reason: 'not-a-root' }
+  }
+
+  // 2. Check idempotence: read .identity.json if it exists.
+  var existingIdentity = await readIdentitySidecar(planDir + '.identity.json', result)
+  var existingRegistry = await readRegistry(REGISTRY_PATH, result)
+  if (!existingRegistry) existingRegistry = { features: {} }
+
+  if (existingIdentity && existingIdentity.featureId) {
+    var regEntry = existingRegistry.features[existingIdentity.featureId]
+    if (regEntry && regEntry.ownershipScopeDigest === existingIdentity.ownershipScopeDigest) {
+      return { adopted: false, reason: 'already-adopted' }
+    }
+  }
+
+  // 3. Read the folder's persisted scope (scope-manifest.md or pipeline-state.json).
+  var scopeRead = await safeAgent({
+    phase: 'Adopt',
+    label: 'read-scope-manifest',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['files'],
+      properties: {
+        files: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path'],
+            properties: {
+              path: { type: 'string', description: 'Repo-relative POSIX path of a source file' },
+              contentSha256: { type: 'string', description: '64-hex SHA-256 content hash (if known)' },
+            },
+          },
+        },
+      },
+    },
+    prompt: 'Read ' + planDir + 'scope-manifest.md (or pipeline-state.json if no manifest) ' +
+      'and extract the list of source files that belong to this extraction scope. ' +
+      'Return each file as { path, contentSha256 }. Return ONLY JSON.',
+  })
+  var scopeFiles = (scopeRead && scopeRead.files) || []
+
+  // 4. Hash the source files to compute per-file contentSha256 + scopeDigest.
+  var hashResult = await hashSources({ files: scopeFiles, phase: 'Adopt', result: result })
+  var fileHashes = (hashResult && hashResult.fileHashes) || []
+  var scopeDigest = (hashResult && hashResult.scopeDigest) || ''
+
+  // 5. Derive the deterministic feature folder.
+  var derived = deriveFeatureFolder({
+    fileHashes: fileHashes,
+    scopeDigest: scopeDigest,
+    entryPoints: [],
+  })
+
+  var featureId = derived.featureId
+  var reason = 'success'
+
+  // 6. Collision check: if registry has the featureId with a different digest, fork.
+  var collisionEntry = existingRegistry.features[featureId]
+  if (collisionEntry && collisionEntry.ownershipScopeDigest !== scopeDigest) {
+    var forked = deriveForkedFeatureId(featureId, existingRegistry)
+    featureId = forked.featureId
+    reason = 'collision-forked'
+  }
+
+  // 7. Write .identity.json (temp-then-rename via writeIdentity agent).
+  try {
+    await writeIdentity({
+      planDir: planDir,
+      featureId: featureId,
+      scopeDigest: scopeDigest,
+      scopeId16: derived.scopeId16,
+      area: derived.area,
+      anchorPath: derived.anchorPath,
+      files: fileHashes.map(function (fh) {
+        return { path: fh.path, contentSha256: fh.contentSha256 }
+      }),
+      phase: 'Adopt',
+      result: result,
+    })
+  } catch (e) {
+    // Rollback: do not update registry.
+    return { adopted: false, reason: 'not-a-root' }
+  }
+
+  // 8. Upsert registry entry + write root-last (temp-rename).
+  var regEntry2 = {
+    featureId: featureId,
+    planDir: planDir,
+    ownershipScopeDigest: scopeDigest,
+    scopeId16: derived.scopeId16 || '',
+    files: fileHashes.map(function (fh) {
+      return { path: fh.path, contentSha256: fh.contentSha256 }
+    }),
+    anchorPath: derived.anchorPath || '',
+    status: 'current',
+    updatedAt: String(timestamp),
+  }
+  var updatedReg = upsertRegistryEntry(existingRegistry, regEntry2)
+  await writeRegistry(REGISTRY_PATH, updatedReg, result)
+
+  return { adopted: true, featureId: featureId, planDir: planDir, reason: reason }
+}
+
+export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, normalizeToPosix, validateHashes, deriveFeatureFolder, hashSources, writeIdentity, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, REGISTRY_ENTRY, REGISTRY_FILE, computePrefixScore, clusterByTwoSegDir, deriveClusterSliceId, detectMoves, validatePartition, reconcileSlices, frameSliceDigest, validateDigest64Hex, detectSliceChanges, computeSliceDigests, writeSliceDigestFile, readSliceDigestFile, runChangeDetection, resolveUpsertMode, deriveForkedFeatureId, isLegacyRoot, scanForLegacyFolders, adoptLegacyFolder, UPSERT_MODE_VERDICT, ADOPT_RESULT }

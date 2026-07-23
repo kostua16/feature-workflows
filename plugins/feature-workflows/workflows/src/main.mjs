@@ -7,9 +7,9 @@ import { computeContentDigest } from './revision.mjs'
 import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
-import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH } from './extract-scope.mjs'
+import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, reconcileSlices, runChangeDetection, resolveUpsertMode, deriveForkedFeatureId, isLegacyRoot, scanForLegacyFolders, adoptLegacyFolder } from './extract-scope.mjs'
 import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectReviewDocs, buildReviewReport, runReviewLenses, mergeReviewFindings, verifyReviewFindings, recordReviewIssues } from './review-mode.mjs'
-import { extractSlice, writeSystemOverview } from './extract-slice.mjs'
+import { extractSlice, writeSystemOverview, invalidateSliceChain } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
 import { runTests } from './test-run.mjs'
 import { safeAgent, flexibleAgent, renderTelemetrySummary, recordDegradationEvent, degradationLogSummary } from './agent-core.mjs'
@@ -19,7 +19,7 @@ import { createBudgetLimits, createBudgetAccountant, setReserve, callsRemaining,
 import { createRetryPolicy, createAttemptHistory, recordAttempt, isTerminalFailure, terminalReason, attemptSummary, ATTEMPT_OUTCOMES } from './retry-policy.mjs'
 import { isolateFailure, shouldContinueAfterFailure, segmentOutcome, eligibleIndependents } from './failure-isolation.mjs'
 import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIntent, acknowledgeSegment, resolveConvergence, shouldContinue, resumeCommand, continuationSummary, canAutoRelaunch } from './continuation.mjs'
-import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary } from './synthesis.mjs'
+import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary, markStaleForSlice } from './synthesis.mjs'
 import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport, invalidatePersistenceEvidence } from './observe-persist.mjs'
 import { deriveExtractReadiness, projectStatusProjection, readinessSummary, deriveDesignReadiness, DESIGN_READINESS_REASONS } from './status-truth.mjs'
 import { createDesignBudget, spendDesignGate, gateCallsRemaining, canAdmitDesignGate, designBudgetSummary, DESIGN_BUDGET_DEFAULTS } from './design-budget.mjs'
@@ -1169,6 +1169,52 @@ ${task}`,
       }
       stateCheckpoint('Registry Recovery', 'done')
 
+      // Phase 18 (D4): auto-scan for legacy v1.5 folders on first post-upgrade run.
+      // Fires ONLY when registry has zero entries AND docs/extract/ exists.
+      // --adopt <planDir> bypasses the scan and directly adopts a specific folder.
+      if (!args || (!args.confirm && !args.resume)) {
+        var migrateRegistry = await readRegistry(REGISTRY_PATH, result)
+        var hasRegisteredFeatures = migrateRegistry
+          && migrateRegistry.features
+          && Object.keys(migrateRegistry.features).length > 0
+
+        if (!hasRegisteredFeatures && args && args.adoptPlanDir) {
+          phase('Adopt')
+          var adoptResult = await adoptLegacyFolder({
+            planDir: args.adoptPlanDir, result, config,
+            timestamp: args && args.timestamp,
+          })
+          if (adoptResult && adoptResult.adopted) {
+            plog('Adopt: imported ' + adoptResult.planDir + ' -> ' + adoptResult.featureId)
+          } else if (adoptResult) {
+            plog('Adopt: ' + args.adoptPlanDir + ' — ' + adoptResult.reason)
+          }
+          stateCheckpoint('Adopt', 'done')
+        }
+
+        if (!hasRegisteredFeatures && !(args && args.adoptPlanDir)) {
+          phase('Migrate')
+          var scanResult = await scanForLegacyFolders({
+            docsRoot: 'docs/extract/', result,
+          })
+          if (scanResult && scanResult.roots && scanResult.roots.length > 0) {
+            result.handoff = {
+              from: 'extract',
+              status: 'awaiting-adopt-confirm',
+              message: 'Found ' + scanResult.roots.length + ' legacy extraction folder(s). ' +
+                'Adopt: /extract-design --adopt ' + scanResult.roots[0],
+              nextMode: 'extract',
+              legacyRoots: scanResult.roots,
+            }
+            plog('Migrate: found ' + scanResult.roots.length + ' legacy root(s) — awaiting adopt')
+            stateCheckpoint('Migrate', 'awaiting-adopt')
+            await consolidate(slug, result, config)
+            return result
+          }
+          stateCheckpoint('Migrate', 'done')
+        }
+      }
+
       // --confirm promotion: if entering via --confirm <pendingId>, promote the
       // pending record before Gate X0. Promotion creates the folder, writes
       // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
@@ -1346,6 +1392,136 @@ ${task}`,
         }
         stateCheckpoint('Registry Lookup', 'done')
 
+        // Phase 18: resolve upsert mode (D3 — explicit upsert entrypoints).
+        // Determines whether this is an auto-update, force, fork-new, feature-select,
+        // continue-incomplete, or the default first-extraction pending-confirmation flow.
+        phase('Upsert')
+        var upsertMode = resolveUpsertMode(args, findResult)
+        preflight.upsertMode = upsertMode.mode
+        plog('Upsert: mode=' + upsertMode.mode +
+          (upsertMode.featureId ? ' featureId=' + upsertMode.featureId : '') +
+          (upsertMode.reason ? ' reason=' + upsertMode.reason : ''))
+
+        // --new + --feature: mutually exclusive — block.
+        if (upsertMode.mode === 'error') {
+          result.blockedAt = 'upsert-mutually-exclusive'
+          result.handoff = {
+            from: 'extract',
+            message: '--new and --feature are mutually exclusive. Use one or the other.',
+            nextMode: 'extract',
+            planDir,
+          }
+          plog('Upsert: blocked — mutually exclusive')
+          stateCheckpoint('Upsert', 'error')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // --feature=<id>: override findResult to force-select the specified feature.
+        if (upsertMode.mode === 'feature') {
+          var featureEntry = registry.features[upsertMode.featureId]
+          if (!featureEntry) {
+            result.blockedAt = 'feature-not-found'
+            result.handoff = {
+              from: 'extract',
+              message: 'Feature ' + upsertMode.featureId + ' not found in registry.',
+              nextMode: 'extract',
+              planDir,
+            }
+            plog('Upsert: feature not found — ' + upsertMode.featureId)
+            stateCheckpoint('Upsert', 'feature-not-found')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+          planDir = featureEntry.planDir
+          preflight.derivedPlanDir = planDir
+          plog('Upsert: --feature selected ' + upsertMode.featureId + ' at ' + planDir)
+          // Fall through to auto-update for the selected feature.
+          upsertMode.mode = 'auto-update'
+        }
+
+        // --new on an existing feature: fork a distinct folder.
+        if (upsertMode.mode === 'new' && findResult.decision === 'reuse') {
+          var forked = deriveForkedFeatureId(findResult.featureId, registry)
+          preflight.forkedFeatureId = forked.featureId
+          preflight.forkedN = forked.n
+          plog('Upsert: --new forks ' + findResult.featureId + ' -> ' + forked.featureId)
+          stateCheckpoint('Upsert', 'forked')
+          // Continue with the pending-confirmation flow (new folder for the fork).
+        }
+
+        // Auto-update / force / continue-incomplete: load existing state and run
+        // the update flow (or just continue), then proceed to extraction.
+        if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force' || upsertMode.mode === 'continue-incomplete') {
+          // Scope is already confirmed for an existing feature — skip confirmation.
+          result.extractScope = preflight.verdict
+          result.scopeManifestPath = planDir + 'scope-manifest.md'
+          result.scopeConfirmed = true
+
+          // Load existing pipeline-state (like --resume) to get the extract queue.
+          var loadedExisting = await loadPipelineStateWithRecovery(planDir)
+          var existingResult = loadedExisting && loadedExisting.state && loadedExisting.state.result
+          if (existingResult) {
+            if (Array.isArray(existingResult.extractQueue)) result.extractQueue = existingResult.extractQueue
+            if (existingResult.synthesisState !== undefined) result.synthesisState = existingResult.synthesisState
+            if (existingResult.persistenceTracker !== undefined) result.persistenceTracker = existingResult.persistenceTracker
+            if (existingResult.overviewPath !== undefined) result.overviewPath = existingResult.overviewPath
+          }
+          result.extractReady = false
+
+          if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force') {
+            // Change detection: reconcile slices → detect changes → invalidate.
+            phase('Reconcile Slices')
+            var reconciled = reconcileSlices(result.extractQueue, preflight.fileHashes || [])
+            plog('Reconcile Slices: ' + reconciled.slices.length + ' slices, ' +
+              reconciled.delta.added.length + ' added, ' + reconciled.delta.removed.length + ' removed')
+            stateCheckpoint('Reconcile Slices', 'done')
+
+            phase('Change Detection')
+            var detection = await runChangeDetection({
+              reconciledSlices: reconciled.slices,
+              fileHashes: preflight.fileHashes || [],
+              force: upsertMode.mode === 'force',
+              result: result,
+            })
+            plog('Change Detection: ' + ((detection && detection.decisions) || []).length + ' decisions')
+            stateCheckpoint('Change Detection', 'done')
+
+            // Apply invalidation for changed/removed slices.
+            phase('Invalidation')
+            var cdDecisions = (detection && detection.decisions) || []
+            for (var di = 0; di < cdDecisions.length; di++) {
+              var cd = cdDecisions[di]
+              var cdEntry = null
+              for (var qi = 0; qi < result.extractQueue.length; qi++) {
+                if (result.extractQueue[qi].id === cd.sliceId) {
+                  cdEntry = result.extractQueue[qi]
+                  break
+                }
+              }
+              if (!cdEntry) continue
+              if (cd.status === 'removed' || cd.status === 'slice-removed') {
+                onSliceRemoved(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' removed (parent path)')
+              } else if (cd.status === 'changed') {
+                invalidateSliceChain(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' invalidated for re-extraction')
+              }
+            }
+            stateCheckpoint('Invalidation', 'done')
+            result.extractQueue = reconciled.slices
+          }
+
+          stateCheckpoint('Upsert', upsertMode.mode)
+          plog('Upsert: ' + upsertMode.mode + ' prepared — continuing to extraction')
+          // Do NOT write pending record or return — fall through to extraction.
+          // scopeManifestPath is set (Gate X0 skips), scopeConfirmed is true (Gate X0.5 passes),
+          // extractQueue is loaded (Gate X1 skips re-seeding).
+        } else {
+          // Default fresh-run path: write pending record + return awaiting-scope-confirm.
+
         // Write pending record — the ONLY durable state before promotion.
         // pipeline-state.json is intentionally NOT written (RED gate: --resume
         // cannot resume a not-yet-promoted checkpoint).
@@ -1376,6 +1552,7 @@ ${task}`,
         // before promotion (RED gate: --resume cannot resume a pre-promotion checkpoint).
         // The pending record is the sole durable state; --confirm recovers from it.
         return result
+        } // end default fresh-run else (Phase 18 upsert-mode conditional)
       }
 
       // Gate X0.5: scope confirmation — pause-and-resume checkpoint, NO agent involved.

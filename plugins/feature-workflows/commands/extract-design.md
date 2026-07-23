@@ -1,6 +1,6 @@
 ---
 description: EXTRACT flow — reverse-engineer design docs (code facts -> e2e use cases -> detailed design -> architecture [-> requirements]) from existing code, slice by slice; audit for design debt. Output is a /tune-feature- and /design-feature-compatible baseline.
-argument-hint: <scope: free text, paths/globs, or entry points> [--plan=PLAN_PATH] [--profile=full|standard|light] [--no-confirm] [--no-decompose] [--max-slices=N] [--slices=id1,id2] [--no-audit] [--no-requirements] [--no-review] [--no-e2e] [--no-arch] [--no-design] [--no-enhancer] [--no-quick-decider] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--decision-cap=N] [--retries=N] [--timestamp=TS] [--resume <planDir>] [--confirm <pendingId>]
+argument-hint: <scope: free text, paths/globs, or entry points> [--plan=PLAN_PATH] [--profile=full|standard|light] [--no-confirm] [--no-decompose] [--max-slices=N] [--slices=id1,id2] [--no-audit] [--no-requirements] [--no-review] [--no-e2e] [--no-arch] [--no-design] [--no-enhancer] [--no-quick-decider] [--no-translator] [--no-categorizer] [--no-publish] [--no-persist] [--decision-cap=N] [--retries=N] [--timestamp=TS] [--resume <planDir>] [--confirm <pendingId>] [--update] [--no-update] [--force] [--feature=<featureId>] [--new] [--adopt <planDir>]
 allowed-tools: Workflow, AskUserQuestion, Read, Bash(test:*), Bash(grep:*), Bash(echo:*), Bash(ln:*), Bash(mkdir:*), Bash(cp:*), Bash(readlink:*), Bash(uname:*), Bash(powershell:*), Bash(mktemp:*), Bash(rm:*)
 ---
 
@@ -94,6 +94,19 @@ Parse `$ARGUMENTS` into:
 - `--confirm <pendingId>`: → `confirm: <pendingId>` (promote a pending scope checkpoint from a prior
   fresh run. Resolves the pending record, creates the feature folder + identity + pipeline-state,
   and continues extraction. Works even after the 30-day bulky-payload TTL via the permanent locator.)
+- `--update`: → `update: true` (explicit update trigger — matches the default behavior for existing
+  features. Useful in scripts and combined with `--force`.)
+- `--no-update`: → `noUpdate: true` (opt OUT of auto-update. An existing feature continues from where
+  it left off without re-detecting changes — the legacy `--resume` behavior for finishing interrupted runs.)
+- `--force`: → `force: true` (re-extract all slices regardless of digest changes. Combine with
+  `--update` or use on an existing feature to force full re-extraction.)
+- `--feature=<featureId>`: → `feature: <featureId>` (select a specific existing feature when the
+  registry lookup is ambiguous or to disambiguate a weak match.)
+- `--new`: → `newFolder: true` (force a distinct forked folder for the same scope — appends a stable
+  disambiguator `<featureId>-<n>` and registers a separate feature. Mutually exclusive with `--feature`.)
+- `--adopt <planDir>`: → `adoptPlanDir: <planDir>` (import an existing v1.5 extract folder into the
+  registry. Derives the feature identity from the folder's persisted scope, writes `.identity.json` +
+  registry entry. Useful after upgrading from v1.5 to v1.6.)
 
 Then call the Workflow tool:
 
@@ -125,7 +138,13 @@ Workflow({
     retryBudget: <int>,
     timestamp: <TS or "">,
     resume: <planDir or "">,
-    confirm: <pendingId or "">
+    confirm: <pendingId or "">,
+    update: <bool>,
+    noUpdate: <bool>,
+    force: <bool>,
+    feature: <featureId or "">,
+    newFolder: <bool>,
+    adoptPlanDir: <planDir or "">
   }
 })
 ```
@@ -236,6 +255,38 @@ are durable.
 
 **Concurrency:** concurrent same-feature invocations are explicitly UNSUPPORTED (may corrupt state).
 Run one extract/update at a time per feature.
+
+## Auto-update (v1.6.0)
+
+Re-running `/extract-design` on code that resolves to an **existing** feature now defaults to
+**auto-update**: change detection runs automatically, and changed slices are re-extracted in place.
+This makes "re-run = refresh" the default behavior.
+
+- **Default (no flags):** if the registry lookup finds an existing feature, auto-update runs —
+  slices with changed source files are invalidated and re-extracted; unchanged slices skip via
+  checkpoint guards.
+- `--update`: explicit trigger (same as default — useful in scripts).
+- `--no-update`: opt out — just continue an interrupted run without re-detecting changes.
+- `--force`: re-extract ALL slices regardless of digest (combine with an existing feature).
+- `--feature=<id>`: select a specific feature when the lookup is ambiguous.
+- `--new`: create a distinct forked folder (`<featureId>-<n>`) instead of updating the existing one.
+
+**Mutual exclusion:** `--new` and `--feature` cannot be used together.
+
+## v1.5 migration (v1.6.0)
+
+Existing v1.5 extract folders have no registry entry or `.identity.json`. On the first post-upgrade
+run (when the registry is empty and `docs/extract/` exists), the engine auto-scans for legacy roots
+and offers them for adoption:
+
+- **Auto-scan:** a folder qualifies as a root if it contains `pipeline-state.json` (or `plan.md`)
+  and its path does NOT contain `/slices/`, `/.pending/`, or end with `.registry.json`/`.identity.json`.
+  Roots are offered in deterministic sorted order.
+- `--adopt <planDir>`: manually adopt a specific folder (bypasses the scan).
+- Adoption derives the feature identity from the folder's persisted scope, writes `.identity.json` +
+  registry entry (root-last, temp-rename, with rollback on failure).
+- After adoption, old `--resume <planDir>` and fresh `/extract-design <scope>` converge on the same
+  folder — no duplicates.
 
 ## Editing the workflow script
 

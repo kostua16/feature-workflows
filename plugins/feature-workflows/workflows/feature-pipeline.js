@@ -58,6 +58,9 @@ export const meta = {
     { title: 'Reconcile Slices' },
     { title: 'Change Detection' },
     { title: 'Invalidation' },
+    { title: 'Upsert' },
+    { title: 'Adopt' },
+    { title: 'Migrate' },
   ],
 }
 
@@ -1350,6 +1353,37 @@ const INVALIDATION_EVENT = {
     key: { type: 'string', description: 'Durable key that was versioned or removed' },
     action: { type: 'string', enum: ['versioned', 'removed', 'superseded'], description: 'How the key was invalidated (no-demote: never demoted)' },
     reason: { type: 'string', description: 'Why the evidence was invalidated' },
+  },
+}
+
+const UPSERT_MODE_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['mode'],
+  properties: {
+    mode: {
+      type: 'string',
+      enum: ['auto-update', 'continue-incomplete', 'force', 'new', 'feature', 'blocked', 'error'],
+      description: 'Resolved update behavior for an existing feature',
+    },
+    featureId: { type: 'string', description: 'Selected feature id (mode=feature)' },
+    reason: { type: 'string', description: 'Block/error reason' },
+  },
+}
+
+const ADOPT_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['adopted'],
+  properties: {
+    adopted: { type: 'boolean', description: 'Whether adoption occurred' },
+    featureId: { type: 'string', description: 'Derived or forked feature id' },
+    planDir: { type: 'string', description: 'Adopted folder path' },
+    reason: {
+      type: 'string',
+      enum: ['already-adopted', 'not-a-root', 'collision-forked', 'success'],
+      description: 'Why adoption did or did not occur',
+    },
   },
 }
 
@@ -6849,6 +6883,241 @@ async function runChangeDetection(arg) {
   return { decisions: decisions, digests: currentDigests, extractReady: extractReady }
 }
 
+// ---- Phase 18: Upsert entrypoints + v1.5 migration (D3/D4) -----------------
+
+// resolveUpsertMode: PURE — resolves the update behavior for an existing feature
+// from CLI args and the findFeature result. No agent calls, no I/O, no async.
+// Priority: mutual-exclusion check → --new → --feature → --force → --no-update →
+// findResult.decision (reuse→auto-update default, new→new, blocked→blocked).
+function resolveUpsertMode(args, findResult) {
+  args = args || {}
+  findResult = findResult || {}
+  var newFolder = !!(args.newFolder || args.new)
+  var feature = args.feature || ''
+  var force = !!(args.force)
+  var noUpdate = !!(args.noUpdate)
+  var update = !!(args.update)
+
+  // --new and --feature are mutually exclusive.
+  if (newFolder && feature) {
+    return { mode: 'error', reason: 'mutually-exclusive' }
+  }
+  if (newFolder) return { mode: 'new' }
+  if (feature) return { mode: 'feature', featureId: feature }
+  if (force) return { mode: 'force' }
+  if (noUpdate) return { mode: 'continue-incomplete' }
+
+  var decision = findResult.decision || ''
+  if (decision === 'reuse') return { mode: 'auto-update' }
+  if (decision === 'new') return { mode: 'new' }
+  if (decision === 'blocked') return { mode: 'blocked', reason: findResult.reason || 'ambiguous' }
+
+  return { mode: 'new' }
+}
+
+// deriveForkedFeatureId: PURE — finds the next available fork suffix for a base
+// feature id (e.g. <base>-2, <base>-3). Scans the registry for existing forks.
+function deriveForkedFeatureId(baseFeatureId, registry) {
+  var features = (registry && registry.features) || {}
+  var n = 2
+  var key = baseFeatureId + '-' + n
+  while (features[key]) {
+    n++
+    key = baseFeatureId + '-' + n
+  }
+  return { featureId: key, n: n }
+}
+
+// isLegacyRoot: PURE — qualifies a folder as a v1.5 extraction root based on
+// marker files present and path exclusions. Operates on strings only.
+function isLegacyRoot(folderPath, markerFiles) {
+  if (!folderPath || !Array.isArray(markerFiles)) return false
+  // Exclude slice children, pending dirs, registry, sidecars.
+  if (folderPath.indexOf('/slices/') !== -1) return false
+  if (folderPath.indexOf('/.pending/') !== -1) return false
+  if (folderPath.endsWith('.registry.json')) return false
+  if (folderPath.endsWith('.identity.json')) return false
+  // Must contain a root marker.
+  return markerFiles.indexOf('pipeline-state.json') !== -1
+    || markerFiles.indexOf('plan.md') !== -1
+}
+
+// scanForLegacyFolders: agent-mediated — recursively lists docs/extract/ and
+// qualifies each folder as a v1.5 root via isLegacyRoot. Returns sorted roots.
+async function scanForLegacyFolders(arg) {
+  var docsRoot = (arg && arg.docsRoot) || 'docs/extract/'
+  var result = arg && arg.result
+  var listing = await safeAgent({
+    phase: 'Migrate',
+    label: 'scan-legacy-folders',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['folders'],
+      properties: {
+        folders: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path', 'files'],
+            properties: {
+              path: { type: 'string', description: 'Folder path relative to repo root' },
+              files: { type: 'array', items: { type: 'string' }, description: 'File names directly in this folder' },
+            },
+          },
+        },
+      },
+    },
+    prompt: 'List every folder under ' + docsRoot + ' recursively (depth-limited to 5 levels). ' +
+      'For each folder return its POSIX path (relative to repo root) and the names of files directly in it. ' +
+      'Return ONLY JSON.',
+  })
+  var folders = (listing && listing.folders) || []
+  var roots = []
+  for (var i = 0; i < folders.length; i++) {
+    var f = folders[i]
+    if (isLegacyRoot(f.path || '', f.files || [])) {
+      roots.push(f.path)
+    }
+  }
+  roots.sort()
+  return { roots: roots }
+}
+
+// adoptLegacyFolder: agent-mediated — imports a v1.5 extract folder into the
+// registry. Derives identity from the folder's persisted scope, writes
+// .identity.json + registry entry (root-last, temp-rename), with rollback.
+async function adoptLegacyFolder(arg) {
+  var planDir = (arg && arg.planDir) || ''
+  var result = arg && arg.result
+  var config = arg && arg.config
+  var timestamp = (arg && arg.timestamp) || ''
+
+  // 1. Validate root: read the folder's file list.
+  var folderRead = await safeAgent({
+    phase: 'Adopt',
+    label: 'read-folder-files',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['files'],
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'File names directly in the folder' },
+      },
+    },
+    prompt: 'List the file names (not directories) directly in ' + planDir + '. Return ONLY JSON.',
+  })
+  if (!isLegacyRoot(planDir, (folderRead && folderRead.files) || [])) {
+    return { adopted: false, reason: 'not-a-root' }
+  }
+
+  // 2. Check idempotence: read .identity.json if it exists.
+  var existingIdentity = await readIdentitySidecar(planDir + '.identity.json', result)
+  var existingRegistry = await readRegistry(REGISTRY_PATH, result)
+  if (!existingRegistry) existingRegistry = { features: {} }
+
+  if (existingIdentity && existingIdentity.featureId) {
+    var regEntry = existingRegistry.features[existingIdentity.featureId]
+    if (regEntry && regEntry.ownershipScopeDigest === existingIdentity.ownershipScopeDigest) {
+      return { adopted: false, reason: 'already-adopted' }
+    }
+  }
+
+  // 3. Read the folder's persisted scope (scope-manifest.md or pipeline-state.json).
+  var scopeRead = await safeAgent({
+    phase: 'Adopt',
+    label: 'read-scope-manifest',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['files'],
+      properties: {
+        files: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path'],
+            properties: {
+              path: { type: 'string', description: 'Repo-relative POSIX path of a source file' },
+              contentSha256: { type: 'string', description: '64-hex SHA-256 content hash (if known)' },
+            },
+          },
+        },
+      },
+    },
+    prompt: 'Read ' + planDir + 'scope-manifest.md (or pipeline-state.json if no manifest) ' +
+      'and extract the list of source files that belong to this extraction scope. ' +
+      'Return each file as { path, contentSha256 }. Return ONLY JSON.',
+  })
+  var scopeFiles = (scopeRead && scopeRead.files) || []
+
+  // 4. Hash the source files to compute per-file contentSha256 + scopeDigest.
+  var hashResult = await hashSources({ files: scopeFiles, phase: 'Adopt', result: result })
+  var fileHashes = (hashResult && hashResult.fileHashes) || []
+  var scopeDigest = (hashResult && hashResult.scopeDigest) || ''
+
+  // 5. Derive the deterministic feature folder.
+  var derived = deriveFeatureFolder({
+    fileHashes: fileHashes,
+    scopeDigest: scopeDigest,
+    entryPoints: [],
+  })
+
+  var featureId = derived.featureId
+  var reason = 'success'
+
+  // 6. Collision check: if registry has the featureId with a different digest, fork.
+  var collisionEntry = existingRegistry.features[featureId]
+  if (collisionEntry && collisionEntry.ownershipScopeDigest !== scopeDigest) {
+    var forked = deriveForkedFeatureId(featureId, existingRegistry)
+    featureId = forked.featureId
+    reason = 'collision-forked'
+  }
+
+  // 7. Write .identity.json (temp-then-rename via writeIdentity agent).
+  try {
+    await writeIdentity({
+      planDir: planDir,
+      featureId: featureId,
+      scopeDigest: scopeDigest,
+      scopeId16: derived.scopeId16,
+      area: derived.area,
+      anchorPath: derived.anchorPath,
+      files: fileHashes.map(function (fh) {
+        return { path: fh.path, contentSha256: fh.contentSha256 }
+      }),
+      phase: 'Adopt',
+      result: result,
+    })
+  } catch (e) {
+    // Rollback: do not update registry.
+    return { adopted: false, reason: 'not-a-root' }
+  }
+
+  // 8. Upsert registry entry + write root-last (temp-rename).
+  var regEntry2 = {
+    featureId: featureId,
+    planDir: planDir,
+    ownershipScopeDigest: scopeDigest,
+    scopeId16: derived.scopeId16 || '',
+    files: fileHashes.map(function (fh) {
+      return { path: fh.path, contentSha256: fh.contentSha256 }
+    }),
+    anchorPath: derived.anchorPath || '',
+    status: 'current',
+    updatedAt: String(timestamp),
+  }
+  var updatedReg = upsertRegistryEntry(existingRegistry, regEntry2)
+  await writeRegistry(REGISTRY_PATH, updatedReg, result)
+
+  return { adopted: true, featureId: featureId, planDir: planDir, reason: reason }
+}
+
 // ---- Review mode (standalone design-docset audit) ---------------------------
 // Review is the INSPECT flow: it reads an existing planDir docset (forward-designed,
 // extracted, or tuned), fans out one reviewer per review dimension (lens), dedups the
@@ -10130,6 +10399,52 @@ ${task}`,
       }
       stateCheckpoint('Registry Recovery', 'done')
 
+      // Phase 18 (D4): auto-scan for legacy v1.5 folders on first post-upgrade run.
+      // Fires ONLY when registry has zero entries AND docs/extract/ exists.
+      // --adopt <planDir> bypasses the scan and directly adopts a specific folder.
+      if (!args || (!args.confirm && !args.resume)) {
+        var migrateRegistry = await readRegistry(REGISTRY_PATH, result)
+        var hasRegisteredFeatures = migrateRegistry
+          && migrateRegistry.features
+          && Object.keys(migrateRegistry.features).length > 0
+
+        if (!hasRegisteredFeatures && args && args.adoptPlanDir) {
+          phase('Adopt')
+          var adoptResult = await adoptLegacyFolder({
+            planDir: args.adoptPlanDir, result, config,
+            timestamp: args && args.timestamp,
+          })
+          if (adoptResult && adoptResult.adopted) {
+            plog('Adopt: imported ' + adoptResult.planDir + ' -> ' + adoptResult.featureId)
+          } else if (adoptResult) {
+            plog('Adopt: ' + args.adoptPlanDir + ' — ' + adoptResult.reason)
+          }
+          stateCheckpoint('Adopt', 'done')
+        }
+
+        if (!hasRegisteredFeatures && !(args && args.adoptPlanDir)) {
+          phase('Migrate')
+          var scanResult = await scanForLegacyFolders({
+            docsRoot: 'docs/extract/', result,
+          })
+          if (scanResult && scanResult.roots && scanResult.roots.length > 0) {
+            result.handoff = {
+              from: 'extract',
+              status: 'awaiting-adopt-confirm',
+              message: 'Found ' + scanResult.roots.length + ' legacy extraction folder(s). ' +
+                'Adopt: /extract-design --adopt ' + scanResult.roots[0],
+              nextMode: 'extract',
+              legacyRoots: scanResult.roots,
+            }
+            plog('Migrate: found ' + scanResult.roots.length + ' legacy root(s) — awaiting adopt')
+            stateCheckpoint('Migrate', 'awaiting-adopt')
+            await consolidate(slug, result, config)
+            return result
+          }
+          stateCheckpoint('Migrate', 'done')
+        }
+      }
+
       // --confirm promotion: if entering via --confirm <pendingId>, promote the
       // pending record before Gate X0. Promotion creates the folder, writes
       // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
@@ -10307,6 +10622,136 @@ ${task}`,
         }
         stateCheckpoint('Registry Lookup', 'done')
 
+        // Phase 18: resolve upsert mode (D3 — explicit upsert entrypoints).
+        // Determines whether this is an auto-update, force, fork-new, feature-select,
+        // continue-incomplete, or the default first-extraction pending-confirmation flow.
+        phase('Upsert')
+        var upsertMode = resolveUpsertMode(args, findResult)
+        preflight.upsertMode = upsertMode.mode
+        plog('Upsert: mode=' + upsertMode.mode +
+          (upsertMode.featureId ? ' featureId=' + upsertMode.featureId : '') +
+          (upsertMode.reason ? ' reason=' + upsertMode.reason : ''))
+
+        // --new + --feature: mutually exclusive — block.
+        if (upsertMode.mode === 'error') {
+          result.blockedAt = 'upsert-mutually-exclusive'
+          result.handoff = {
+            from: 'extract',
+            message: '--new and --feature are mutually exclusive. Use one or the other.',
+            nextMode: 'extract',
+            planDir,
+          }
+          plog('Upsert: blocked — mutually exclusive')
+          stateCheckpoint('Upsert', 'error')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // --feature=<id>: override findResult to force-select the specified feature.
+        if (upsertMode.mode === 'feature') {
+          var featureEntry = registry.features[upsertMode.featureId]
+          if (!featureEntry) {
+            result.blockedAt = 'feature-not-found'
+            result.handoff = {
+              from: 'extract',
+              message: 'Feature ' + upsertMode.featureId + ' not found in registry.',
+              nextMode: 'extract',
+              planDir,
+            }
+            plog('Upsert: feature not found — ' + upsertMode.featureId)
+            stateCheckpoint('Upsert', 'feature-not-found')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+          planDir = featureEntry.planDir
+          preflight.derivedPlanDir = planDir
+          plog('Upsert: --feature selected ' + upsertMode.featureId + ' at ' + planDir)
+          // Fall through to auto-update for the selected feature.
+          upsertMode.mode = 'auto-update'
+        }
+
+        // --new on an existing feature: fork a distinct folder.
+        if (upsertMode.mode === 'new' && findResult.decision === 'reuse') {
+          var forked = deriveForkedFeatureId(findResult.featureId, registry)
+          preflight.forkedFeatureId = forked.featureId
+          preflight.forkedN = forked.n
+          plog('Upsert: --new forks ' + findResult.featureId + ' -> ' + forked.featureId)
+          stateCheckpoint('Upsert', 'forked')
+          // Continue with the pending-confirmation flow (new folder for the fork).
+        }
+
+        // Auto-update / force / continue-incomplete: load existing state and run
+        // the update flow (or just continue), then proceed to extraction.
+        if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force' || upsertMode.mode === 'continue-incomplete') {
+          // Scope is already confirmed for an existing feature — skip confirmation.
+          result.extractScope = preflight.verdict
+          result.scopeManifestPath = planDir + 'scope-manifest.md'
+          result.scopeConfirmed = true
+
+          // Load existing pipeline-state (like --resume) to get the extract queue.
+          var loadedExisting = await loadPipelineStateWithRecovery(planDir)
+          var existingResult = loadedExisting && loadedExisting.state && loadedExisting.state.result
+          if (existingResult) {
+            if (Array.isArray(existingResult.extractQueue)) result.extractQueue = existingResult.extractQueue
+            if (existingResult.synthesisState !== undefined) result.synthesisState = existingResult.synthesisState
+            if (existingResult.persistenceTracker !== undefined) result.persistenceTracker = existingResult.persistenceTracker
+            if (existingResult.overviewPath !== undefined) result.overviewPath = existingResult.overviewPath
+          }
+          result.extractReady = false
+
+          if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force') {
+            // Change detection: reconcile slices → detect changes → invalidate.
+            phase('Reconcile Slices')
+            var reconciled = reconcileSlices(result.extractQueue, preflight.fileHashes || [])
+            plog('Reconcile Slices: ' + reconciled.slices.length + ' slices, ' +
+              reconciled.delta.added.length + ' added, ' + reconciled.delta.removed.length + ' removed')
+            stateCheckpoint('Reconcile Slices', 'done')
+
+            phase('Change Detection')
+            var detection = await runChangeDetection({
+              reconciledSlices: reconciled.slices,
+              fileHashes: preflight.fileHashes || [],
+              force: upsertMode.mode === 'force',
+              result: result,
+            })
+            plog('Change Detection: ' + ((detection && detection.decisions) || []).length + ' decisions')
+            stateCheckpoint('Change Detection', 'done')
+
+            // Apply invalidation for changed/removed slices.
+            phase('Invalidation')
+            var cdDecisions = (detection && detection.decisions) || []
+            for (var di = 0; di < cdDecisions.length; di++) {
+              var cd = cdDecisions[di]
+              var cdEntry = null
+              for (var qi = 0; qi < result.extractQueue.length; qi++) {
+                if (result.extractQueue[qi].id === cd.sliceId) {
+                  cdEntry = result.extractQueue[qi]
+                  break
+                }
+              }
+              if (!cdEntry) continue
+              if (cd.status === 'removed' || cd.status === 'slice-removed') {
+                onSliceRemoved(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' removed (parent path)')
+              } else if (cd.status === 'changed') {
+                invalidateSliceChain(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' invalidated for re-extraction')
+              }
+            }
+            stateCheckpoint('Invalidation', 'done')
+            result.extractQueue = reconciled.slices
+          }
+
+          stateCheckpoint('Upsert', upsertMode.mode)
+          plog('Upsert: ' + upsertMode.mode + ' prepared — continuing to extraction')
+          // Do NOT write pending record or return — fall through to extraction.
+          // scopeManifestPath is set (Gate X0 skips), scopeConfirmed is true (Gate X0.5 passes),
+          // extractQueue is loaded (Gate X1 skips re-seeding).
+        } else {
+          // Default fresh-run path: write pending record + return awaiting-scope-confirm.
+
         // Write pending record — the ONLY durable state before promotion.
         // pipeline-state.json is intentionally NOT written (RED gate: --resume
         // cannot resume a not-yet-promoted checkpoint).
@@ -10337,6 +10782,7 @@ ${task}`,
         // before promotion (RED gate: --resume cannot resume a pre-promotion checkpoint).
         // The pending record is the sole durable state; --confirm recovers from it.
         return result
+        } // end default fresh-run else (Phase 18 upsert-mode conditional)
       }
 
       // Gate X0.5: scope confirmation — pause-and-resume checkpoint, NO agent involved.

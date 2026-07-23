@@ -49,5 +49,8 @@ export const meta = {
     { title: 'Reconcile Slices' },
     { title: 'Change Detection' },
     { title: 'Invalidation' },
+    { title: 'Upsert' },
+    { title: 'Adopt' },
+    { title: 'Migrate' },
   ],
 }
