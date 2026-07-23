@@ -2,7 +2,7 @@
 
 ## Milestones
 
-- 🚧 **v1.6.0 Design-Extract Determination** — Phases 12-19 (in progress). Source plan: [`../plans/260723-extract-deterministic-folders-upsert/plan.md`](../plans/260723-extract-deterministic-folders-upsert/plan.md)
+- ✅ **v1.6.0 Design-Extract Determination** — Phases 12-19 (shipped 2026-07-24). Source plan: [`../plans/260723-extract-deterministic-folders-upsert/plan.md`](../plans/260723-extract-deterministic-folders-upsert/plan.md)
 - ✅ **v1.5.0 Project-Scale Extract Design** — Phases 1-11 (shipped 2026-07-22). Full details: [`milestones/v1.5.0-ROADMAP.md`](milestones/v1.5.0-ROADMAP.md)
 - ✅ **v1.4.5 Pre-GSD Baseline** — shipped before the GSD planning ledger.
 
@@ -22,13 +22,13 @@ Build/drift, version lockstep, six-mode compatibility (design/implement/tune/ext
 
 ### Phases
 
-- [ ] **Phase 12: Pending-Confirmation Protocol & Promotion** — addressable `--confirm`, atomic crash-idempotent promotion, new-vs-existing branches.
-- [ ] **Phase 13: Deterministic Identity & Hashing** — per-file `contentSha256` + `scopeDigest`, validated up front; deterministic folder derivation.
-- [ ] **Phase 14: Feature-Identity Registry, Lookup & Integrity** — registry + rename-resilient defensible lookup + collision guard + atomic recovery.
-- [ ] **Phase 15: Slice Ownership Reconciliation** — pure deterministic partition + clustering + move detection.
-- [ ] **Phase 16: Change Detection** — fail-closed full-digest comparison.
-- [ ] **Phase 17: Invalidation Chain & Removal Path** — full chain incl. publish/persist evidence + removal parent path.
-- [ ] **Phase 18: Upsert Entrypoints & v1.5 Migration** — auto-update default + flags + `--adopt`.
+- [x] **Phase 12: Pending-Confirmation Protocol & Promotion** — addressable `--confirm`, atomic crash-idempotent promotion, new-vs-existing branches.
+- [x] **Phase 13: Deterministic Identity & Hashing** — per-file `contentSha256` + `scopeDigest`, validated up front; deterministic folder derivation.
+- [x] **Phase 14: Feature-Identity Registry, Lookup & Integrity** — registry + rename-resilient defensible lookup + collision guard + atomic recovery.
+- [x] **Phase 15: Slice Ownership Reconciliation** — pure deterministic partition + clustering + move detection.
+- [x] **Phase 16: Change Detection** — fail-closed full-digest comparison.
+- [x] **Phase 17: Invalidation Chain & Removal Path** — full chain incl. publish/persist evidence + removal parent path.
+- [x] **Phase 18: Upsert Entrypoints & v1.5 Migration** — auto-update default + flags + `--adopt`.
 - [x] **Phase 19: Compatibility & Proof** — regression + E2E characterization + adopt dogfood.
 
 ### Phase Details
@@ -139,13 +139,13 @@ Build/drift, version lockstep, six-mode compatibility (design/implement/tune/ext
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 12. Pending-Confirmation & Promotion | v1.6.0 | 0/1 | Not started | — |
-| 13. Deterministic Identity & Hashing | v1.6.0 | 0/1 | Not started | — |
-| 14. Registry, Lookup & Integrity | v1.6.0 | 0/1 | Not started | — |
-| 15. Slice Ownership Reconciliation | v1.6.0 | 0/1 | Not started | — |
-| 16. Change Detection | v1.6.0 | 0/1 | Not started | — |
-| 17. Invalidation Chain & Removal | v1.6.0 | 0/1 | Not started | — |
-| 18. Upsert & Migration | v1.6.0 | 0/1 | Not started | — |
+| 12. Pending-Confirmation & Promotion | v1.6.0 | 1/1 | Complete | 2026-07-24 |
+| 13. Deterministic Identity & Hashing | v1.6.0 | 1/1 | Complete | 2026-07-24 |
+| 14. Registry, Lookup & Integrity | v1.6.0 | 1/1 | Complete | 2026-07-24 |
+| 15. Slice Ownership Reconciliation | v1.6.0 | 1/1 | Complete | 2026-07-24 |
+| 16. Change Detection | v1.6.0 | 1/1 | Complete | 2026-07-24 |
+| 17. Invalidation Chain & Removal | v1.6.0 | 1/1 | Complete | 2026-07-24 |
+| 18. Upsert & Migration | v1.6.0 | 1/1 | Complete | 2026-07-24 |
 | 19. Compatibility & Proof | v1.6.0 | 1/1 | Complete | 2026-07-24 |
 
 ## Deferred to Future Milestones
