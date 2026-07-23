@@ -812,7 +812,12 @@ test('source: no new crypto import in extract-scope.mjs', () => {
     'utf8'
   )
   // The reconcile section must not import or use crypto.
-  const reconcileBlock = src.slice(src.indexOf('function directorySegments'))
+  // Scope to Phase 15 functions only — Phase 16 change-detection functions follow
+  // and legitimately reference SHA-256 in agent prompt strings.
+  const reconcileBlock = src.slice(
+    src.indexOf('function directorySegments'),
+    src.indexOf('function frameSliceDigest')
+  )
   assert.doesNotMatch(reconcileBlock, /\brequire\(/)
   assert.doesNotMatch(reconcileBlock, /createHash/)
   assert.doesNotMatch(reconcileBlock, /\bcrypto\b/)

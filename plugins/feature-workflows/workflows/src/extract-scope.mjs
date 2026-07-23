@@ -1,4 +1,4 @@
-import { FILE_ACK, SCOPE_VERDICT, AUDIT_VERDICT, ARTIFACT_CHECK, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD, REGISTRY_FILE, REGISTRY_ENTRY } from './schemas.mjs'
+import { FILE_ACK, SCOPE_VERDICT, AUDIT_VERDICT, ARTIFACT_CHECK, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD, REGISTRY_FILE, REGISTRY_ENTRY, SLICE_DIGEST, SLICE_DIGEST_RESULT } from './schemas.mjs'
 import { nsAgent, gm } from './config.mjs'
 import { categorizeSlug } from './text-utils.mjs'
 import { classifyAndRecordIssue } from './stages-issues.mjs'
@@ -1305,4 +1305,269 @@ function reconcileSlices(persistedSlices, currentFiles) {
   return { slices: outputSlices, delta: delta }
 }
 
-export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, normalizeToPosix, validateHashes, deriveFeatureFolder, hashSources, writeIdentity, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, REGISTRY_ENTRY, REGISTRY_FILE, computePrefixScore, clusterByTwoSegDir, deriveClusterSliceId, detectMoves, validatePartition, reconcileSlices }
+// ---- Change Detection (D2.2) ------------------------------------------------
+
+// frameSliceDigest: PURE — sort + JSON-frame a slice's per-file hashes into a
+// deterministic string for agent-mediated SHA-256 computation. Permutation-invariant:
+// sorting by path ascending makes the frame independent of input order. The [path, hash]
+// pair structure separates path from hash so different file sets never collide.
+// The engine NEVER computes SHA-256 — this function only frames.
+function frameSliceDigest(fileHashes) {
+  var pairs = (fileHashes || [])
+    .slice()
+    .sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+    .map(function (fh) { return [fh.path, fh.contentSha256] })
+  return JSON.stringify(pairs)
+}
+
+// validateDigest64Hex: PURE — validate a 64-lowercase-hex SHA-256 string.
+// Returns { valid: true } or { valid: false, reason }.
+function validateDigest64Hex(digest) {
+  if (typeof digest !== 'string' || !digest) {
+    return { valid: false, reason: 'digest is missing or empty' }
+  }
+  if (!HEX64.test(digest)) {
+    return { valid: false, reason: 'digest is not 64-lowercase-hex' }
+  }
+  return { valid: true }
+}
+
+// detectSliceChanges: PURE — compare persisted vs current per-slice digests.
+// Fail-closed: any missing/invalid/unverifiable digest is classified as 'changed'
+// (never skip). Returns { decisions, changedCount, unchangedCount }.
+// decisions: [{ sliceId, status, reason }]
+function detectSliceChanges(persistedDigests, currentDigests) {
+  var persisted = persistedDigests || {}
+  var current = currentDigests || {}
+  var decisions = []
+  var changedCount = 0
+  var unchangedCount = 0
+
+  // Check every current slice against persisted digests.
+  for (var sliceId in current) {
+    var cur = current[sliceId]
+    var old = persisted[sliceId]
+
+    if (!cur || !cur.valid) {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'current-invalid' })
+      changedCount++
+    } else if (!old) {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'new-slice' })
+      changedCount++
+    } else if (!old.valid) {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'persisted-invalid' })
+      changedCount++
+    } else if (cur.digest === old.digest) {
+      decisions.push({ sliceId: sliceId, status: 'unchanged', reason: 'digest-match' })
+      unchangedCount++
+    } else {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'digest-mismatch' })
+      changedCount++
+    }
+  }
+
+  // Detect removed slices (in persisted but not in current) — independent loop.
+  for (var oldSliceId in persisted) {
+    if (!(oldSliceId in current)) {
+      decisions.push({ sliceId: oldSliceId, status: 'changed', reason: 'slice-removed' })
+      changedCount++
+    }
+  }
+
+  return { decisions: decisions, changedCount: changedCount, unchangedCount: unchangedCount }
+}
+
+// Read-result schema for the slice-digest file-reader agent.
+var SLICE_DIGEST_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['sliceDigest'],
+  properties: {
+    sliceDigest: { type: ['object', 'null'], description: 'Parsed slice digest record, or null if the file does not exist' },
+  },
+}
+
+// computeSliceDigests: agent-mediated SHA-256 computation for each slice frame.
+// The engine NEVER computes SHA-256 — the agent uses Node's crypto to hash each
+// pre-framed string. Returns { slices: [{sliceId, digest}] } or null on failure.
+async function computeSliceDigests(arg) {
+  var sliceFrames = (arg && arg.sliceFrames) || []
+  var result = arg && arg.result
+  if (!sliceFrames.length) return { slices: [] }
+
+  var prompt = 'You are a slice-digest agent. For each slice below, compute the SHA-256 hash\n' +
+    'of the provided frame string. The frame is already deterministic (sorted,\n' +
+    'JSON-stringified [path, hash] pairs) — just hash each frame string.\n' +
+    'Return lowercase hex digests (64 chars each). Use whatever SHA-256 tooling\n' +
+    'is available to you (Node.js, shell, scripts).\n\n' +
+    'Slices to hash:\n' +
+    sliceFrames.map(function (sf) { return sf.sliceId + ':\n' + sf.frame }).join('\n\n') +
+    '\n\nDo NOT modify any files. Do NOT commit.'
+
+  return safeAgent(
+    prompt,
+    { label: 'slice-digest', phase: 'Change Detection', schema: SLICE_DIGEST_RESULT, model: gm('todo') },
+    result
+  )
+}
+
+// writeSliceDigestFile: persist <sliceDir>/.source-digest.json via file-writer agent.
+// Validates the digest via validateDigest64Hex before writing — fail-closed (no
+// malformed digest persisted). Returns { ok: true } or null on failure/invalid.
+async function writeSliceDigestFile(arg) {
+  var sliceDir = arg && arg.sliceDir
+  var files = (arg && arg.files) || []
+  var digest = arg && arg.digest
+  var result = arg && arg.result
+
+  // Fail-closed: validate the digest BEFORE calling the agent.
+  var validation = validateDigest64Hex(digest)
+  if (!validation.valid) return null
+
+  var filePath = String(sliceDir || '').replace(/\/$/, '') + '/.source-digest.json'
+  var payload = {
+    files: files.map(function (fh) { return { path: fh.path, contentSha256: fh.contentSha256 } }),
+    digest: digest,
+  }
+
+  return safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + filePath + ' using a\n' +
+    'temp-then-rename pattern (write to a .tmp file first, then rename to the target).\n' +
+    'Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + filePath + '.\n\nJSON:\n' + JSON.stringify(payload, null, 2),
+    { label: 'file-writer(slice-digest)', phase: 'Change Detection', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// readSliceDigestFile: load <sliceDir>/.source-digest.json via file-reader agent.
+// Returns { files, digest, valid } or null if the file does not exist.
+// The validity flag comes from validateDigest64Hex so detectSliceChanges can
+// make fail-closed decisions without re-validating.
+async function readSliceDigestFile(arg) {
+  var sliceDir = arg && arg.sliceDir
+  var result = arg && arg.result
+
+  var filePath = String(sliceDir || '').replace(/\/$/, '') + '/.source-digest.json'
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + filePath + ' and return its full JSON content parsed\n' +
+    'as an object in the "sliceDigest" field. If the file does not exist, return sliceDigest=null.\n' +
+    'If the file exists but contains invalid JSON, return sliceDigest=null.',
+    { label: 'file-reader(slice-digest)', phase: 'Change Detection', agentType: nsAgent('file-writer'), schema: SLICE_DIGEST_READ_RESULT, model: gm('todo') },
+    result
+  )
+
+  if (!loaded || !loaded.sliceDigest) return null
+
+  var sd = loaded.sliceDigest
+  var digestValidation = validateDigest64Hex(sd.digest)
+  return {
+    files: Array.isArray(sd.files) ? sd.files : [],
+    digest: typeof sd.digest === 'string' ? sd.digest : '',
+    valid: digestValidation.valid,
+  }
+}
+
+// runChangeDetection: orchestrator — frame, hash, validate, read-persisted, compare,
+// persist new digests. Returns { decisions, digests, extractReady }.
+// The invalidation chain (invalidateSliceChain for changed slices) is NOT wired here —
+// Phase 17 adds it. This phase delivers decisions + persisted digests only.
+async function runChangeDetection(arg) {
+  var reconciledSlices = (arg && arg.reconciledSlices) || []
+  var fileHashes = (arg && arg.fileHashes) || []
+  var force = arg && arg.force
+  var result = arg && arg.result
+
+  // 1. Build a path → contentSha256 lookup from the flat file-hash list.
+  var hashByPath = {}
+  for (var hi = 0; hi < fileHashes.length; hi++) {
+    hashByPath[fileHashes[hi].path] = fileHashes[hi]
+  }
+
+  // 2. Partition file hashes by slice + frame each slice.
+  var sliceFrames = []
+  var sliceFileHashes = {} // sliceId → [{path, contentSha256}]
+  for (var si = 0; si < reconciledSlices.length; si++) {
+    var sl = reconciledSlices[si]
+    var sId = sl.sliceId
+    var sFiles = (sl.files || []).map(function (f) {
+      return hashByPath[f.path] || { path: f.path, contentSha256: f.contentSha256 || '' }
+    })
+    sliceFileHashes[sId] = sFiles
+    sliceFrames.push({ sliceId: sId, frame: frameSliceDigest(sFiles) })
+  }
+
+  // 3. Compute current digests via agent.
+  var digestResult = await computeSliceDigests({ sliceFrames: sliceFrames, result: result })
+
+  // 4. Build currentDigests map with validity flags.
+  var currentDigests = {}
+  if (digestResult && Array.isArray(digestResult.slices)) {
+    for (var di = 0; di < digestResult.slices.length; di++) {
+      var entry = digestResult.slices[di]
+      var dValid = validateDigest64Hex(entry.digest)
+      currentDigests[entry.sliceId] = { digest: entry.digest, valid: dValid.valid }
+    }
+  } else {
+    // Agent failed entirely — mark all slices as current-invalid (fail-closed).
+    for (var fi = 0; fi < reconciledSlices.length; fi++) {
+      currentDigests[reconciledSlices[fi].sliceId] = { digest: '', valid: false }
+    }
+  }
+
+  // 5. Read persisted digests per slice.
+  var persistedDigests = {}
+  for (var ri = 0; ri < reconciledSlices.length; ri++) {
+    var rSl = reconciledSlices[ri]
+    var rDir = rSl.planDir || ''
+    var persisted = await readSliceDigestFile({ sliceDir: rDir, result: result })
+    if (persisted) {
+      persistedDigests[rSl.sliceId] = { digest: persisted.digest, valid: persisted.valid }
+    }
+    // Missing persisted file → not in map → treated as new-slice by detectSliceChanges.
+  }
+
+  // 6. Detect changes.
+  var detection = detectSliceChanges(persistedDigests, currentDigests)
+  var decisions = detection.decisions
+
+  // 7. Force override: all slices become 'changed' regardless of digest comparison.
+  if (force) {
+    decisions = decisions.map(function (d) {
+      return { sliceId: d.sliceId, status: 'changed', reason: 'forced' }
+    })
+  }
+
+  // 8. Persist new digests for valid current digests (fail-closed — no invalid write).
+  for (var wi = 0; wi < reconciledSlices.length; wi++) {
+    var wSl = reconciledSlices[wi]
+    var wId = wSl.sliceId
+    var curEntry = currentDigests[wId]
+    if (curEntry && curEntry.valid) {
+      await writeSliceDigestFile({
+        sliceDir: wSl.planDir || '',
+        files: sliceFileHashes[wId],
+        digest: curEntry.digest,
+        result: result,
+      })
+    }
+  }
+
+  // 9. Feature-level digest on pipeline-state.
+  if (fileHashes.length && result) {
+    result._sourceDigest = { files: fileHashes }
+  }
+
+  // 10. extractReady: false if any slice is unverifiable (invalid current digest).
+  var extractReady = true
+  for (var ei = 0; ei < decisions.length; ei++) {
+    if (decisions[ei].reason === 'current-invalid') {
+      extractReady = false
+      break
+    }
+  }
+
+  return { decisions: decisions, digests: currentDigests, extractReady: extractReady }
+}
+
+export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, normalizeToPosix, validateHashes, deriveFeatureFolder, hashSources, writeIdentity, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, REGISTRY_ENTRY, REGISTRY_FILE, computePrefixScore, clusterByTwoSegDir, deriveClusterSliceId, detectMoves, validatePartition, reconcileSlices, frameSliceDigest, validateDigest64Hex, detectSliceChanges, computeSliceDigests, writeSliceDigestFile, readSliceDigestFile, runChangeDetection }

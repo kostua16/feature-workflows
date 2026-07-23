@@ -265,6 +265,16 @@ const CANDIDATES = [
   'reconcileSlices',
   'RECONCILE_FILE',
   'RECONCILE_DELTA',
+  // Phase 16 — change detection (D2.2)
+  'frameSliceDigest',
+  'validateDigest64Hex',
+  'detectSliceChanges',
+  'computeSliceDigests',
+  'writeSliceDigestFile',
+  'readSliceDigestFile',
+  'runChangeDetection',
+  'SLICE_DIGEST',
+  'SLICE_DIGEST_RESULT',
 ]
 const declared = CANDIDATES.filter((name) =>
   new RegExp(`\\b(?:function|const|let)\\s+${name}\\b`).test(stripped)
