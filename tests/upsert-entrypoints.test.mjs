@@ -282,3 +282,83 @@ test('--adopt path exists in main.mjs (adoptLegacyFolder called)', () => {
 test('auto-scan trigger exists in main.mjs (scanForLegacyFolders called)', () => {
   assert.ok(srcMain.includes('scanForLegacyFolders('), 'scanForLegacyFolders called in main.mjs')
 })
+
+// ---- Nyquist validation gap-filling: update-flow wiring source assertions ----
+
+test('runChangeDetection receives force parameter wired to mode check', () => {
+  const upsertIdx = srcMain.indexOf("upsertMode.mode === 'auto-update'")
+  const block = srcMain.slice(upsertIdx, upsertIdx + 5000)
+  assert.ok(block.includes("force: upsertMode.mode === 'force'"),
+    'force parameter wired to mode===force in runChangeDetection call')
+})
+
+test('deriveForkedFeatureId called inside new+reuse branch specifically', () => {
+  const newBranchIdx = srcMain.indexOf("upsertMode.mode === 'new' && findResult.decision === 'reuse'")
+  assert.ok(newBranchIdx > -1, 'new+reuse branch exists')
+  const branch = srcMain.slice(newBranchIdx, newBranchIdx + 500)
+  assert.ok(branch.includes('deriveForkedFeatureId('),
+    'deriveForkedFeatureId called inside the new+reuse conditional branch')
+})
+
+test('--no-update (continue-incomplete) is EXCLUDED from change-detection inner block', () => {
+  // The change-detection inner block must include only auto-update + force,
+  // NOT continue-incomplete (--no-update must skip change detection).
+  const innerMatch = srcMain.match(/upsertMode\.mode === 'auto-update' \|\| upsertMode\.mode === 'force'\)\s*\{/)
+  assert.ok(innerMatch, 'inner change-detection condition with only auto-update+force')
+  const innerIdx = srcMain.indexOf(innerMatch[0])
+  const innerBlock = srcMain.slice(innerIdx, innerIdx + 100)
+  assert.ok(!innerBlock.includes('continue-incomplete'),
+    'continue-incomplete must NOT appear in change-detection condition (--no-update opt-out)')
+})
+
+test('--feature mode reassigns to auto-update for fallthrough', () => {
+  const featureBranchIdx = srcMain.indexOf("upsertMode.mode === 'feature'")
+  assert.ok(featureBranchIdx > -1, 'feature branch exists')
+  const branch = srcMain.slice(featureBranchIdx, featureBranchIdx + 1000)
+  assert.ok(branch.includes("upsertMode.mode = 'auto-update'"),
+    'feature mode reassigns to auto-update to fall through to update path')
+})
+
+test('--feature nonexistent blocks with feature-not-found handoff', () => {
+  assert.ok(srcMain.includes("'feature-not-found'"),
+    'feature-not-found blockedAt exists')
+  assert.ok(srcMain.includes('not found in registry'),
+    'feature-not-found handoff message exists')
+})
+
+test('error mode blocks with upsert-mutually-exclusive handoff', () => {
+  assert.ok(srcMain.includes("'upsert-mutually-exclusive'"),
+    'upsert-mutually-exclusive blockedAt exists')
+  assert.ok(srcMain.includes('mutually exclusive'),
+    'mutual-exclusion handoff message exists')
+})
+
+test('--new fork sets preflight.forkedFeatureId and preflight.forkedN', () => {
+  const newBranchIdx = srcMain.indexOf("upsertMode.mode === 'new' && findResult.decision === 'reuse'")
+  const branch = srcMain.slice(newBranchIdx, newBranchIdx + 500)
+  assert.ok(branch.includes('preflight.forkedFeatureId'),
+    'forkedFeatureId set in preflight for --new fork')
+  assert.ok(branch.includes('preflight.forkedN'),
+    'forkedN set in preflight for --new fork')
+})
+
+test('auto-update/force/continue-incomplete resets extractReady to false', () => {
+  const updateBlockIdx = srcMain.indexOf(
+    "upsertMode.mode === 'auto-update' || upsertMode.mode === 'force' || upsertMode.mode === 'continue-incomplete'"
+  )
+  assert.ok(updateBlockIdx > -1, 'update block condition exists')
+  const block = srcMain.slice(updateBlockIdx, updateBlockIdx + 2000)
+  assert.ok(block.includes('result.extractReady = false'),
+    'extractReady reset to false in update path (forces re-extraction)')
+})
+
+test('auto-update copies extractQueue from loaded existing state', () => {
+  const updateBlockIdx = srcMain.indexOf(
+    "upsertMode.mode === 'auto-update' || upsertMode.mode === 'force' || upsertMode.mode === 'continue-incomplete'"
+  )
+  const block = srcMain.slice(updateBlockIdx, updateBlockIdx + 2000)
+  assert.ok(block.includes('existingResult.extractQueue'),
+    'extractQueue copied from loaded state for resume continuity')
+  assert.ok(block.includes('loadPipelineStateWithRecovery'),
+    'existing state loaded via loadPipelineStateWithRecovery')
+})

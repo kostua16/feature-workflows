@@ -144,7 +144,7 @@ test('auto-scan returns awaiting-adopt-confirm handoff', () => {
 test('auto-scan does NOT fire when --confirm or --resume is used', () => {
   // The guard should skip auto-scan for confirm/resume paths.
   const scanBlock = srcMain.slice(
-    srcMain.indexOf('Phase 18 (D4): auto-scan'),
+    srcMain.indexOf("Phase 18 (D4): auto-scan"),
     srcMain.indexOf('Phase 18 (D4): auto-scan') + 500
   )
   assert.ok(scanBlock.includes('!args.confirm') || scanBlock.includes('!args.resume'),
@@ -251,4 +251,137 @@ test('extract-design.md documents v1.5 migration', () => {
     'utf8'
   )
   assert.ok(cmdDoc.includes('migration'), 'migration section present')
+})
+
+// ---- Nyquist validation gap-filling: adoption + migration wiring ----
+
+// Helper: slice the adoptLegacyFolder function body from extract-scope source
+function adoptFnBody() {
+  return srcExtractScope.slice(
+    srcExtractScope.indexOf('async function adoptLegacyFolder'),
+    srcExtractScope.indexOf('\nexport {')
+  )
+}
+
+// Helper: slice the scanForLegacyFolders function body
+function scanFnBody() {
+  return srcExtractScope.slice(
+    srcExtractScope.indexOf('async function scanForLegacyFolders'),
+    srcExtractScope.indexOf('async function adoptLegacyFolder')
+  )
+}
+
+test('adoptLegacyFolder idempotence: already-adopted check exists', () => {
+  const fn = adoptFnBody()
+  assert.ok(fn.includes("'already-adopted'"),
+    'already-adopted idempotence return exists')
+  assert.ok(fn.includes('existingIdentity') && fn.includes('ownershipScopeDigest'),
+    'idempotence check compares identity digest with registry entry digest')
+})
+
+test('adoptLegacyFolder rollback: try/catch wraps writeIdentity', () => {
+  const fn = adoptFnBody()
+  const tryIdx = fn.indexOf('try {')
+  const catchIdx = fn.indexOf('catch', tryIdx)
+  assert.ok(tryIdx > -1 && catchIdx > -1,
+    'try/catch block exists in adoptLegacyFolder for rollback')
+  const tryBlock = fn.slice(tryIdx, catchIdx)
+  assert.ok(tryBlock.includes('writeIdentity'),
+    'try block wraps writeIdentity — on failure, registry is NOT updated')
+  // After catch, the function returns early (no registry write)
+  const catchBlock = fn.slice(catchIdx, catchIdx + 200)
+  assert.ok(catchBlock.includes('return'),
+    'catch block returns early — rollback prevents registry write')
+})
+
+test('adoptLegacyFolder collision-fork: different digest triggers deriveForkedFeatureId', () => {
+  const fn = adoptFnBody()
+  assert.ok(fn.includes("'collision-forked'"),
+    'collision-forked reason exists in adoptLegacyFolder')
+  assert.ok(fn.includes('deriveForkedFeatureId('),
+    'deriveForkedFeatureId called in collision path')
+  // Verify collision check compares digests
+  const collisionLine = fn.indexOf('collisionEntry')
+  assert.ok(collisionLine > -1, 'collision entry lookup exists')
+  const collisionBlock = fn.slice(collisionLine, collisionLine + 200)
+  assert.ok(collisionBlock.includes('ownershipScopeDigest') && collisionBlock.includes('scopeDigest'),
+    'collision check compares ownershipScopeDigest !== scopeDigest')
+})
+
+test('scanForLegacyFolders sorts roots lexicographically before returning', () => {
+  const fn = scanFnBody()
+  assert.ok(fn.includes('roots.sort()'),
+    'scanForLegacyFolders calls roots.sort() for deterministic order')
+})
+
+test('scanForLegacyFolders uses isLegacyRoot to qualify folders', () => {
+  const fn = scanFnBody()
+  assert.ok(fn.includes('isLegacyRoot('),
+    'scanForLegacyFolders calls isLegacyRoot for folder qualification')
+})
+
+test('auto-scan is guarded against --confirm and --resume paths', () => {
+  const migrateComment = srcMain.indexOf('Phase 18 (D4): auto-scan')
+  assert.ok(migrateComment > -1, 'D4 auto-scan comment exists')
+  const guardBlock = srcMain.slice(migrateComment - 100, migrateComment + 400)
+  assert.ok(guardBlock.includes('!args.confirm') && guardBlock.includes('!args.resume'),
+    'auto-scan guarded with !args.confirm && !args.resume check')
+})
+
+test('auto-scan fires only when registry has zero entries', () => {
+  const migrateBlock = srcMain.slice(
+    srcMain.indexOf("Phase 18 (D4): auto-scan"),
+    srcMain.indexOf('Phase 18 (D4): auto-scan') + 1600
+  )
+  assert.ok(migrateBlock.includes('!hasRegisteredFeatures'),
+    'auto-scan gated on !hasRegisteredFeatures')
+})
+
+test('--adopt bypasses scan and calls adoptLegacyFolder directly', () => {
+  const migrateBlock = srcMain.slice(
+    srcMain.indexOf("Phase 18 (D4): auto-scan"),
+    srcMain.indexOf('Phase 18 (D4): auto-scan') + 1600
+  )
+  assert.ok(migrateBlock.includes('args.adoptPlanDir'),
+    '--adopt path checks args.adoptPlanDir')
+  assert.ok(migrateBlock.includes('adoptLegacyFolder('),
+    '--adopt calls adoptLegacyFolder directly')
+  assert.ok(migrateBlock.includes('!(args && args.adoptPlanDir)'),
+    'auto-scan skipped when --adopt is used (mutual exclusion)')
+})
+
+test('adoptLegacyFolder calls isLegacyRoot internally for root validation', () => {
+  const fn = adoptFnBody()
+  assert.ok(fn.includes('isLegacyRoot('),
+    'isLegacyRoot called inside adoptLegacyFolder for root validation')
+  assert.ok(fn.includes("'not-a-root'"),
+    'not-a-root reason returned when validation fails')
+})
+
+test('adoptLegacyFolder calls hashSources for content hashing', () => {
+  const fn = adoptFnBody()
+  assert.ok(fn.includes('hashSources('),
+    'hashSources called in adoptLegacyFolder for per-file SHA-256')
+})
+
+test('adoptLegacyFolder calls deriveFeatureFolder for deterministic identity', () => {
+  const fn = adoptFnBody()
+  assert.ok(fn.includes('deriveFeatureFolder('),
+    'deriveFeatureFolder called in adoptLegacyFolder for feature id derivation')
+})
+
+test('adoptLegacyFolder calls upsertRegistryEntry before writeRegistry (correct order)', () => {
+  const fn = adoptFnBody()
+  assert.ok(fn.includes('upsertRegistryEntry('),
+    'upsertRegistryEntry called in adoptLegacyFolder')
+  assert.ok(fn.includes('writeRegistry('),
+    'writeRegistry called in adoptLegacyFolder')
+  assert.ok(fn.indexOf('upsertRegistryEntry(') < fn.indexOf('writeRegistry('),
+    'upsertRegistryEntry called before writeRegistry (correct commit order)')
+})
+
+test('adoptLegacyFolder reads scope-manifest or pipeline-state for source files', () => {
+  const fn = adoptFnBody()
+  assert.ok(fn.includes('scope-manifest.md'),
+    'adoptLegacyFolder reads scope-manifest.md for persisted scope')
 })
