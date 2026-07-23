@@ -237,5 +237,7 @@ test('slice loop flushes parent state after each slice (mid-queue resume substra
 })
 
 test('multi-slice runs never claim parent designReady', () => {
-  assert.match(source, /if \(!multiSlice\) result\.designReady = true/)
+  // Phase 6: designReady for single-slice now uses truthful readiness derivation.
+  // The guard (multi-slice never claims parent designReady) is still enforced.
+  assert.match(source, /if \(!multiSlice\) result\.designReady = /)
 })

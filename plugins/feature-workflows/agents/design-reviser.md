@@ -2,13 +2,6 @@
 name: design-reviser
 description: |-
   Use this agent to incorporate review feedback into design document (architecture, detailed design, or other artifact) after review. Bridges design creation and approval by applying reviewer adjustments precisely and holistically.
-
-  <example>
-  assistant: "reviewer found issues in architecture design. I'll use design-reviser agent to incorporate feedback."
-  <commentary>
-  When design has been reviewed and feedback needs to be applied, use design-reviser agent.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Edit, NotebookEdit, Write, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: opus
 color: yellow

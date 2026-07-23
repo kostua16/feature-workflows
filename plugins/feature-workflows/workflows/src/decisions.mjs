@@ -3,6 +3,7 @@ import { nsAgent, retryState, decisionState, decisionBudgetExhausted, spendDecis
 import { consolidate } from './state.mjs'
 import { safeAgent } from './agent-core.mjs'
 import { plogFromResult } from './review-loop.mjs'
+import { computeContentDigest } from './revision.mjs'
 import { main } from './main.mjs'
 
 
@@ -281,11 +282,29 @@ function applyApprovalDecision(result, decision) {
 function verifyAppendGrowth(result, path, ack) {
   if (!result) return { ok: true, unknown: true }
   if (!result._appendSizes) result._appendSizes = {}
+  // Digest-based comparison is authoritative when content is available — a
+  // writer-reported byte count can be hallucinated, but a content digest
+  // deterministically reflects what was actually written.
+  if (ack && ack.content != null) {
+    if (!result._appendDigests) result._appendDigests = {}
+    const currentDigest = computeContentDigest(ack.content)
+    const prevDigest = result._appendDigests[path] || null
+    result._appendDigests[path] = currentDigest
+    if (prevDigest == null) return { ok: true, prev: null, now: currentDigest, reason: 'digest-first-write' }
+    const ok = currentDigest !== prevDigest
+    const outcome = { ok, shrank: !ok, prev: prevDigest, now: currentDigest, reason: ok ? 'digest-grew' : 'digest-unchanged' }
+    if (!ok) {
+      if (!result.appendWarnings) result.appendWarnings = []
+      result.appendWarnings.push(`append-only file content unchanged (possible overwrite): ${path}`)
+    }
+    return outcome
+  }
+  // Fall back to byte-count comparison when no content is available
   const now = ack && Number.isFinite(ack.totalBytes) ? ack.totalBytes : null
-  if (now == null) return { ok: true, unknown: true } // writer didn't report a size — can't check
+  if (now == null) return { ok: true, unknown: true }
   const prev = Number.isFinite(result._appendSizes[path]) ? result._appendSizes[path] : null
   result._appendSizes[path] = now
-  if (prev == null) return { ok: true, prev: null, now } // first write to this path this run
+  if (prev == null) return { ok: true, prev: null, now }
   const ok = now > prev
   const outcome = { ok, shrank: now < prev, prev, now }
   if (!ok) {

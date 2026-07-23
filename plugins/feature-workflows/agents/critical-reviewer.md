@@ -2,14 +2,6 @@
 name: critical-reviewer
 description: |-
   Use this agent when you need a rigorous, high-signal review of any artifact — code, architecture design, plan, or task breakdown — to uncover bugs, design flaws, security vulnerabilities (OWASP), wrong decisions, and open questions.
-
-  <example>
-  user: "I've finished implementing the JWT token refresh logic. Can you review it?"
-  assistant: "I'll use the critical-reviewer agent to perform a deep review of the authentication code for bugs, security vulnerabilities, and design issues."
-  <commentary>
-  New security-sensitive code was just written. Use the critical-reviewer agent to hunt for bugs, OWASP vulnerabilities, and logic errors.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Bash,mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: opus
 color: red

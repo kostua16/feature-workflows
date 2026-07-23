@@ -2,14 +2,6 @@
 name: simple-task-executor
 description: |-
   Use this agent for straightforward, well-defined tasks: single-line edits, renames, config updates, formatting fixes, or executing steps from an existing plan.
-
-  <example>
-  user: "Change the timeout value in config.py from 30 to 60"
-  assistant: "I'll use the simple-task-executor agent to make this trivial change."
-  <commentary>
-  The task is a single-value change with no ambiguity. Use the simple-task-executor agent.
-  </commentary>
-  </example>
 model: haiku
 color: green
 memory: project

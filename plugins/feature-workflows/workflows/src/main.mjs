@@ -1,8 +1,10 @@
 import { ENGINE_VERSION } from './engine-version.mjs'
 import { DEFINE_VERDICT, TRANSLATOR_VERDICT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, RECONCILE_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT } from './schemas.mjs'
-import { RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECONCILE_SUBCAP_DEFAULT, DECISION_CAP_DEFAULT, resolveProfile, resolveConfigFlag, profileDefault, resolveUseTestWriter, retryState, budgetExhausted, spendRetry, hydrateBudget, decisionState, decisionBudgetExhausted, gm, resolveMode, gateModeActive } from './config.mjs'
+import { RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECONCILE_SUBCAP_DEFAULT, ESCALATION_RETRIES_DEFAULT, DECISION_CAP_DEFAULT, resolveProfile, resolveConfigFlag, profileDefault, resolveUseTestWriter, retryState, budgetExhausted, spendRetry, hydrateBudget, decisionState, decisionBudgetExhausted, gm, resolveMode, gateModeActive } from './config.mjs'
 import { taskSlug, categorizeSlug, jiraIdFromTask, detectNonEnglish } from './text-utils.mjs'
-import { consolidate, writeChunkedFile, validatePipelineState, renderStatusReport, flushPipelineState, loadPipelineState, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew } from './state.mjs'
+import { consolidate, writeChunkedFile, validatePipelineState, renderStatusReport, flushPipelineState, flushPipelineStateWithSnapshot, loadPipelineState, loadPipelineStateWithRecovery, verifyArtifactPresence, repairResumeArtifactFlags, detectResumeEngineSkew } from './state.mjs'
+import { computeContentDigest } from './revision.mjs'
+import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
 import { seedExtractQueue, nextPendingSlice, resolveScope } from './extract-scope.mjs'
@@ -10,9 +12,18 @@ import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectRevie
 import { extractSlice, writeSystemOverview } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
 import { runTests } from './test-run.mjs'
-import { safeAgent, flexibleAgent, renderTelemetrySummary } from './agent-core.mjs'
+import { safeAgent, flexibleAgent, renderTelemetrySummary, recordDegradationEvent, degradationLogSummary } from './agent-core.mjs'
 import { reviewLoop, enhancePrompt } from './review-loop.mjs'
 import { runQuickDecider, runGoalkeeper, appendDecisionLog, writeOpenQuestions, writeFailedLaunch, LOOPBACK_FLAG_MAP, clearGateAndDownstream, normalizeGateTarget, resetStageForRerun, applyApprovalDecision, detectOwnershipViolations, compactList } from './decisions.mjs'
+import { createBudgetLimits, createBudgetAccountant, setReserve, callsRemaining, admitSegment, spendBudget, canFinishNextGate, budgetSummary, RESERVE_TYPES } from './budget-admission.mjs'
+import { createRetryPolicy, createAttemptHistory, recordAttempt, isTerminalFailure, terminalReason, attemptSummary, ATTEMPT_OUTCOMES } from './retry-policy.mjs'
+import { isolateFailure, shouldContinueAfterFailure, segmentOutcome, eligibleIndependents } from './failure-isolation.mjs'
+import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIntent, acknowledgeSegment, resolveConvergence, shouldContinue, resumeCommand, continuationSummary, canAutoRelaunch } from './continuation.mjs'
+import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary } from './synthesis.mjs'
+import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport } from './observe-persist.mjs'
+import { deriveExtractReadiness, projectStatusProjection, readinessSummary, deriveDesignReadiness, DESIGN_READINESS_REASONS } from './status-truth.mjs'
+import { createDesignBudget, spendDesignGate, gateCallsRemaining, canAdmitDesignGate, designBudgetSummary, DESIGN_BUDGET_DEFAULTS } from './design-budget.mjs'
+import { createLoopBudgets, spendLoop, loopBudgetExhausted, loopBudgetSummary } from './design-loops.mjs'
 
 
 // ---- Script body -----------------------------------------------------------
@@ -64,11 +75,18 @@ async function main() {
       }
     }
     const validation = validatePipelineState(state)
+    var statusReportStr = renderStatusReport(state, validation)
+    // Phase 6: augment status with truthful readiness projection if the state
+    // includes one (added by Phase 6 extract terminal). This is read-only — status
+    // mode never writes, and the projection is the same immutable object the handoff used.
+    if (state.result && state.result.statusProjection) {
+      statusReportStr += '\n\n' + readinessSummary(state.result.statusProjection)
+    }
     return {
       mode: 'status',
       planDir: statusDir,
       ready: true,
-      statusReport: renderStatusReport(state, validation),
+      statusReport: statusReportStr,
       logLines: [`main: status report rendered for ${statusDir}${validation.ok ? '' : ' (state failed validation — best-effort)'}`],
     }
   }
@@ -81,8 +99,11 @@ async function main() {
   if (resumeArg) {
     // resumeArg is a planDir (or a plan.md path); normalize to a dir.
     const resumeDir = resumeArg.replace(/(^|\/)plan\.md$/, '$1').replace(/\/$/, '') + '/'
-    const loaded = await loadPipelineState(resumeDir)
+    const loaded = await loadPipelineStateWithRecovery(resumeDir)
     resumed = loaded && loaded.state
+    if (loaded && loaded.recovered) {
+      log(`main: --resume auto-recovered from pipeline-state.last-good.json at ${resumeDir} (primary was corrupt/truncated)`)
+    }
     if (!resumed) {
       // No persisted state at the resume path. Return a clean blocked result instead of a raw
       // throw: this site sits BEFORE main()'s safety-net try-block, so a throw would escape as an
@@ -105,6 +126,18 @@ async function main() {
         logLines: [`main: resume blocked — no pipeline-state.json at ${resumeDir}`],
       }
       return block
+    }
+    // INT-MIGRATION-RESUME: explicit --migrate converts a v1.4.5 legacy state file
+    // (one carrying result.slices) to v1.5.0 format before validation. Opt-in flag
+    // avoids misfire-prone auto-detection on every resume. When the flag is absent,
+    // a legacy state file that passes structural validation resumes as-is (backward
+    // compatible); one that fails validation still blocks with resume-invalid-state.
+    if (args && args.migrate) {
+      const beforeVersion = resumed.schemaVersion || 'pre-1.5.0'
+      resumed = migrateResumeState(resumed)
+      if (resumed.schemaVersion === '1.5.0' && beforeVersion !== '1.5.0') {
+        log(`main: --migrate converted legacy state (${beforeVersion}) to v1.5.0`)
+      }
     }
     // EN-2: validate the hydrated state BEFORE trusting it into 25+ result flags. A
     // corrupt/truncated pipeline-state.json (a failed chunked write, IM-1) that still
@@ -166,13 +199,71 @@ async function main() {
   // derive it from the task. Persisted state.slug is the source of truth (L904).
   const slug = resumeArg ? (resumed && resumed.slug) || taskSlug(task) : taskSlug(task)
 
+  // D2 (two parallel budget systems): the Phase-5 global retryState (below) and
+  // the Phase-10 designBudget (further below) coexist by design. retryState is a
+  // module-level mutable singleton in config.mjs that tracks extract-mode retry
+  // spend across the entire run; designBudget is a local immutable-per-spend
+  // accountant that tracks design-mode per-gate/per-run call budgets. They serve
+  // different modes (extract vs design) and neither ceiling has been approached
+  // in production runs. Unifying them would add abstraction risk on verified
+  // code for no proven benefit (YAGNI). Unification would be warranted only if:
+  // (a) a single mode started hitting both ceilings, or (b) cross-mode budget
+  // sharing became a requirement.
   // Single global retry budget — the only "stop" condition for loops. Per-loop
   // soft sub-caps keep one loop from monopolizing the whole budget.
   const retryBudget = (args && args.retryBudget) || RETRY_BUDGET_DEFAULT
   const refineSubcap = (args && args.maxRefineIterations) || REFINE_SUBCAP_DEFAULT
   const debugSubcap = (args && args.maxDebugRetries) || DEBUG_SUBCAP_DEFAULT
   const reconcileSubcap = (args && args.maxReconcileIterations) || RECONCILE_SUBCAP_DEFAULT
+  const escalationCap = (args && args.maxEscalationRetries) || ESCALATION_RETRIES_DEFAULT
   const decisionCap = (args && args.decisionCap) || DECISION_CAP_DEFAULT
+  // DLOOP-01: per-loop sub-budgets so early-loop spend cannot starve later loops.
+  // The shared retryState remains as a secondary runaway guard.
+  let loopBudgets = createLoopBudgets({
+    refineCap: refineSubcap,
+    reconcileCap: reconcileSubcap,
+    debugCap: debugSubcap,
+    escalationCap: escalationCap,
+  })
+  // DBUDGET-01: per-gate/per-run call/token budget enforcement with non-spendable
+  // reserve for state flush/handoff (wraps the Phase 5 budget-admission pattern).
+  let designBudget = createDesignBudget({
+    callPerGate: args && args.designCallPerGate,
+    callPerRun: args && args.designCallPerRun,
+  })
+  // DBUDGET-01: per-gate budget admission gate. Returns true if the caller must
+  // block (budget exhausted); false if admitted (spend recorded). The non-spendable
+  // HANDOFF reserve is protected by callsRemaining inside canAdmitDesignGate.
+  //
+  // D1 (call-counting trade-off): each gate INVOCATION counts as 1 call, not the
+  // actual intra-gate agent calls. This is conservative: a gate that short-circuits
+  // (e.g. cached result) still costs 1 (over-count), while a gate that retries or
+  // escalates internally costs only 1 (under-count). The per-gate cap (default 8)
+  // acts as a multiplier ceiling, and the per-run cap (default 200) bounds the
+  // total. Counting actual agent calls would require instrumenting every gate's
+  // agent invocation — a deep change with regression risk on verified code. The
+  // post-gate token recording hook (recordGateTokenSpend in design-budget.mjs)
+  // provides the plumbing for future finer-grained measurement.
+  async function designBudgetGate(r, gateName) {
+    var admit = canAdmitDesignGate(designBudget, gateName, { calls: 1 })
+    if (admit.admitted) {
+      designBudget = spendDesignGate(designBudget, gateName, 1, 0)
+      return false
+    }
+    r.blockedAt = 'design-budget-exhausted'
+    r._designBudget = designBudgetSummary(designBudget)
+    r._loopBudgets = loopBudgetSummary(loopBudgets)
+    r.handoff = {
+      from: 'design',
+      message: `Design budget exhausted at gate '${gateName}' (${admit.reason}; gate remaining: ${admit.remaining.gate}, run remaining: ${admit.remaining.run}). Re-run with --resume ${planDir} or increase args.designCallPerRun.`,
+      nextMode: 'design',
+      planDir,
+    }
+    stateCheckpoint(gateName, 'budget-exhausted')
+    logTelemetrySummary()
+    await consolidate(slug, r, config)
+    return true
+  }
   const autoCommit = !!(args && args.autoCommit)
   const testTarget = (args && args.testTarget) || '' // empty => whole suite
   // IM-4: stack-agnostic test gate. --test-cmd pins an exact command; --test-framework
@@ -449,6 +540,14 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (!result.extractQueue) result.extractQueue = []
     if (result.overviewPath === undefined) result.overviewPath = null
     if (result.extractReady === undefined) result.extractReady = false
+    // Phase 5: backfill bounded scheduler state on pre-v1.5 resume.
+    if (result.continuationState === undefined) result.continuationState = null
+    if (result.budgetAccountant === undefined) result.budgetAccountant = null
+    if (result.attemptHistory === undefined) result.attemptHistory = null
+    // Phase 6: backfill synthesis, persistence, and status-truth state.
+    if (result.synthesisState === undefined) result.synthesisState = null
+    if (result.persistenceTracker === undefined) result.persistenceTracker = null
+    if (result.statusProjection === undefined) result.statusProjection = null
     if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
     // The user-level install is a symlink that tracks the plugin, so a resume after a
@@ -496,6 +595,8 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       useCasePath: null,
       openQuestionsPath: null, // F10/I4: <planDir>/open-questions.md tracked artifact
       reconcile: null,
+      _designCheckpoints: {}, // gate-name -> { acknowledged, artifactPath }
+      _artifactDigests: {}, // pathKey -> content digest recorded at checkpoint time
       published: null,
       recommendedPath: null,
       tddEnforced: false,
@@ -546,6 +647,15 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       overviewPath: null, // <planDir>/system-overview.md (multi-slice only)
       extractReady: false, // extract terminal: all pending slices processed
       auditPath: null, // <planDir>/design-audit.md (single-slice; per-slice audits live on queue entries)
+      // Phase 5: bounded scheduler and transactional automatic continuation state.
+      continuationState: null, // monotonic segment tracking + idempotency keys
+      budgetAccountant: null, // characterized budget admission with non-spendable reserve
+      attemptHistory: null, // per-gate/per-feature retry attempt journal
+      _degradationLog: [], // DHIST-01: durable journal of fail-forward/retry/escalation/fallback events
+      // Phase 6: synthesis, persistence tracking, and truthful status projection.
+      synthesisState: null, // incremental project views with selective revision invalidation
+      persistenceTracker: null, // attempted-vs-durable write lifecycle tracking
+      statusProjection: null, // immutable projection shared by handoff and status
       // Review mode (standalone design-docset audit) state. Defaults keep older
       // pipeline-state.json hydrating without breakage (same backward-compat rule).
       reviewPath: null, // <planDir>/design-review.md report
@@ -566,6 +676,34 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
   // gateDone: resume self-skip helper. Returns true (and logs) if the gate's
   // completion flag is already set, so the gate body can skip its agent call.
   const gateDone = (flag) => { if (result[flag]) { plog(`resume: skip gate (${flag} set)`); return true } return false }
+
+  // checkpointDesign: durably persist the in-memory result after each material
+  // design gate so an interrupted run resumes at the first incomplete gate
+  // without repeating verified work. Adopts the Phase 4 checkpointSlice pattern:
+  // record gate completion + artifact digest, then flush state to disk via the
+  // snapshot-retaining writer. Non-blocking — a flush failure only warns.
+  const checkpointDesign = async (gateName, artifactPathKey) => {
+    if (!result._designCheckpoints) result._designCheckpoints = {}
+    if (!result._artifactDigests) result._artifactDigests = {}
+    result._designCheckpoints[gateName] = {
+      acknowledged: true,
+      artifactPath: artifactPathKey ? (result[artifactPathKey] || null) : null,
+    }
+    if (artifactPathKey && result[artifactPathKey]) {
+      // The result data field for definitionPath is _define (gate name),
+      // not _definition (path prefix). All other keys follow the _ + replace
+      // convention and match their result field directly.
+      const dataKey = artifactPathKey === 'definitionPath' ? '_define'
+        : '_' + artifactPathKey.replace('Path', '')
+      result._artifactDigests[artifactPathKey] = computeContentDigest(result[dataKey] || result[artifactPathKey])
+    }
+    plog(`checkpointDesign: durable flush at gate '${gateName}'`)
+    try {
+      await flushPipelineStateWithSnapshot(planDir, result, config)
+    } catch (e) {
+      plog(`checkpointDesign: flush failed at '${gateName}' (non-blocking) — ${String(e)}`)
+    }
+  }
 
   // Surface the per-gate agent-call telemetry at terminal exits so users can see where a
   // run spent its calls/retries/escalations (and how much rode on fallbacks) without
@@ -1089,6 +1227,54 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       const multiSlice = result.extractQueue.length > 1
         || (result.extractQueue[0] && result.extractQueue[0].planDir !== planDir)
 
+      // Phase 5: initialize bounded scheduler state on first entry (not on resume).
+      // Budget accountant reserves non-spendable capacity for checkpoint, reconciliation,
+      // synthesis, and handoff so gate work cannot starve system-critical operations.
+      // Continuation state tracks monotonic segment IDs and idempotency keys.
+      // Attempt history journals every retry with a terminal reason.
+      if (!result.continuationState) {
+        result.continuationState = createContinuationState()
+      }
+      if (!result.budgetAccountant) {
+        const limits = createBudgetLimits({
+          callCeiling: 1000,
+          retryPerGate: 3,
+          retryPerFeature: 10,
+        })
+        let acct = createBudgetAccountant(limits)
+        // Reserve non-spendable capacity for each system-critical category.
+        // These reserves ensure checkpoint/synthesis/handoff can always complete
+        // even when gate work approaches the shared call ceiling.
+        acct = setReserve(acct, RESERVE_TYPES.CHECKPOINT, 5)
+        acct = setReserve(acct, RESERVE_TYPES.RECONCILIATION, 5)
+        acct = setReserve(acct, RESERVE_TYPES.SYNTHESIS, 5)
+        acct = setReserve(acct, RESERVE_TYPES.HANDOFF, 5)
+        result.budgetAccountant = acct
+      }
+      if (!result.attemptHistory) {
+        result.attemptHistory = createAttemptHistory()
+      }
+      // Phase 6: initialize synthesis and persistence tracking on first entry.
+      // Synthesis state holds incrementally built project views with revision tracking.
+      // Persistence tracker distinguishes attempted from durably verified writes.
+      if (!result.synthesisState) {
+        result.synthesisState = createSynthesisState()
+      }
+      if (!result.persistenceTracker) {
+        result.persistenceTracker = createPersistenceTracker()
+      }
+      // Allocate a monotonic segment ID and declare intent for this batch.
+      var segAlloc = nextSegmentId(result.continuationState)
+      result.continuationState = segAlloc.state
+      var currentSegmentId = segAlloc.segmentId
+      var segmentFeatureIds = result.extractQueue
+        .filter(function (s) { return s.status === 'pending' })
+        .map(function (s) { return s.id })
+      var segIntent = createSegmentIntent(
+        result.continuationState, currentSegmentId, segmentFeatureIds, result.scopeManifestPath
+      )
+      result.continuationState = segIntent.state
+
       // Slice loop: one full extraction cycle per pending slice, state flushed after each
       // slice so a kill/resume continues mid-queue. A blocked slice logs and the queue moves
       // on (one slice failing to extract is information, not a reason to abandon the rest).
@@ -1096,15 +1282,51 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       while ((slice = nextPendingSlice(result.extractQueue))) {
         if (budgetExhausted(retryBudget)) {
           result.blockedAt = 'extract-budget'
+          var budgetResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
           result.handoff = {
             from: 'extract',
             message: `Retry budget exhausted mid-queue (${retryState.used}/${retryBudget}). Completed slices are preserved; resume the rest: /extract-design --resume ${planDir}`,
             nextMode: 'extract',
             planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: budgetResume.counts,
           }
           plog(`Extract: retry budget exhausted with ${result.extractQueue.filter((s) => s.status === 'pending').length} slice(s) pending — blocking (resumable)`)
           stateCheckpoint('Extract Slice', 'blocked')
+          result.persistenceTracker = recordAttemptedWrite(
+            result.persistenceTracker, 'extract:blocked-budget:' + planDir, 'project-index'
+          )
           await consolidate(slug, result, config)
+          result.persistenceTracker = verifyDurableWrite(
+            result.persistenceTracker, 'extract:blocked-budget:' + planDir
+          )
+          return result
+        }
+        // Budget admission: verify the next slice can complete its gates without
+        // crossing the characterized call ceiling or spending non-spendable reserve.
+        var nextGateCost = { calls: 20 }
+        if (!canFinishNextGate(result.budgetAccountant, nextGateCost)) {
+          var adm = admitSegment(result.budgetAccountant, nextGateCost)
+          result.blockedAt = 'extract-budget-ceiling'
+          var ceilingResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
+          result.handoff = {
+            from: 'extract',
+            message: `Budget ceiling reached. Remaining calls: ${callsRemaining(result.budgetAccountant)} (reserve preserved). Resume: /extract-design --resume ${planDir}`,
+            nextMode: 'extract',
+            planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: ceilingResume.counts,
+            budget: budgetSummary(result.budgetAccountant),
+          }
+          plog(`Extract: budget ceiling — admission denied (${adm.reason}), blocking (resumable)`)
+          stateCheckpoint('Extract Slice', 'blocked')
+          result.persistenceTracker = recordAttemptedWrite(
+            result.persistenceTracker, 'extract:blocked-ceiling:' + planDir, 'project-index'
+          )
+          await consolidate(slug, result, config)
+          result.persistenceTracker = verifyDurableWrite(
+            result.persistenceTracker, 'extract:blocked-ceiling:' + planDir
+          )
           return result
         }
         slice.status = 'in-progress'
@@ -1131,10 +1353,30 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           auditPath: (slice.artifacts && slice.artifacts.auditPath) || null,
           _reviewedDesign: !!(slice.artifacts && slice.artifacts.reviewed),
           _reviewedArch: !!(slice.artifacts && slice.artifacts.reviewed),
+          lifecycle: 'in-progress',
+          _gateCheckpoints: {},
         }
         let outcome
         try {
-          outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          // For multi-slice runs, spawn the leaf via Workflow() composition (one level,
+          // no recursion). The leaf processes exactly one feature in its own sandbox;
+          // the top-level retains all scheduling/readiness authority. Fallback to direct
+          // call for single-slice runs or when Workflow is unavailable (test harness).
+          if (typeof Workflow === 'function' && !single && Workflow.name !== '') {
+            const leafResult = await Workflow({
+              name: 'fp-extract-slice',
+              args: { slice, task, config, sliceState, retryBudget, refineSubcap, decisionCap },
+            })
+            if (leafResult && leafResult.status) {
+              outcome = { status: leafResult.status, gate: leafResult.gate }
+              if (leafResult.sliceState) Object.assign(sliceState, leafResult.sliceState)
+              if (leafResult.logLines) for (const line of leafResult.logLines) plog(line)
+            } else {
+              outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+            }
+          } else {
+            outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          }
         } catch (e) {
           outcome = { status: 'blocked', gate: 'uncaught-throw' }
           plog(`Extract: slice ${slice.id} threw (${String(e)}) — marking blocked and continuing`)
@@ -1150,9 +1392,22 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           reviewed: !!sliceState._reviewedDesign,
         }
         slice.status = outcome.status === 'done' ? 'done' : 'blocked'
+        // Phase 5: record the attempt in the durable history journal.
+        // Success records a terminal-success entry; failure records the outcome
+        // and reason so exhausted retries are never reclassified as completed.
+        var attemptOutcome = outcome.status === 'done'
+          ? ATTEMPT_OUTCOMES.SUCCESS
+          : (outcome.gate === 'uncaught-throw' ? ATTEMPT_OUTCOMES.RETRYABLE_FAILURE : ATTEMPT_OUTCOMES.INVALID_OUTPUT)
+        result.attemptHistory = recordAttempt(
+          result.attemptHistory, slice.id, outcome.gate || 'extract', attemptOutcome, outcome.status !== 'done' ? ('blocked at ' + outcome.gate) : null
+        )
+        // Phase 5: spend budget for the completed gate work.
+        result.budgetAccountant = spendBudget(result.budgetAccountant, 10, 0)
         if (outcome.status !== 'done') {
           slice.blockedGate = outcome.gate
-          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — continuing with remaining slices`)
+          // Isolate the failure: only this slice is affected; independent work continues.
+          result.extractQueue = isolateFailure(result.extractQueue, slice.id, 'blocked')
+          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — isolated; continuing with remaining slices`)
         } else {
           plog(`Extract: slice ${slice.id} done`)
         }
@@ -1169,6 +1424,36 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         stateCheckpoint('Extract Slice', slice.status)
         await flushPipelineState(planDir, result, config)
       }
+
+      // Phase 5: acknowledge the segment completion with exact counts.
+      // The monotonic segment ID plus idempotency key ensures duplicate, lost,
+      // or out-of-order launches converge to one durable outcome.
+      var segCounts = segmentOutcome(result.extractQueue)
+      var segKey = idempotencyKey(currentSegmentId, segmentFeatureIds, result.scopeManifestPath)
+      var segAck = acknowledgeSegment(
+        result.continuationState, currentSegmentId, segKey,
+        segCounts.completed > 0 ? 'partial' : 'no-progress', segCounts
+      )
+      result.continuationState = segAck.state
+
+      // Phase 6: synthesize project views from verified feature summaries.
+      // Incremental: only changed inputs trigger view rebuilds; idempotent.
+      var featureSummaries = result.extractQueue.map(function (s) {
+        return {
+          id: s.id,
+          name: s.name,
+          lifecycle: s.status === 'done' ? 'completed' : (s.status === 'blocked' ? 'blocked' : 'deferred'),
+          artifacts: s.artifacts || {},
+          dependencies: s.dependencies || [],
+          crossCuttingConcerns: s.crossCuttingConcerns || [],
+        }
+      })
+      result.synthesisState = synthesizeProjectViews(
+        featureSummaries, result.synthesisState,
+        { scope: result.scopeManifestPath || null, graph: result.scopeManifestPath || null }
+      )
+      plog('Extract: synthesis — ' + (result.synthesisState.synthesized ? 'views rebuilt' : 'no change') +
+        ', coverage denominator: ' + (result.synthesisState.views.coverageIndex ? result.synthesisState.views.coverageIndex.denominator : 0))
 
       // Gate X8: system overview (multi-slice only, non-blocking).
       if (multiSlice && !result.overviewPath) {
@@ -1232,27 +1517,85 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         }
         plog(`Extract: terminal verification failed — doneSlices=${doneSlices.length}; failedChecks=${failedArtifactChecks.length}`)
         stateCheckpoint('Extract', 'blocked')
+        result.persistenceTracker = recordAttemptedWrite(
+          result.persistenceTracker, 'extract:artifact-missing:' + planDir, 'project-index'
+        )
         await consolidate(slug, result, config)
+        result.persistenceTracker = verifyDurableWrite(
+          result.persistenceTracker, 'extract:artifact-missing:' + planDir
+        )
         return result
       }
 
+      // Phase 6: truthful readiness derivation. extractReady is true ONLY when
+      // discovery is exhausted, graph is valid, every in-scope feature is verified
+      // complete, synthesis is current, and required artifacts are current.
       phase('Extract')
-      result.extractReady = true
-      if (!multiSlice) result.designReady = true
+      var extractProjectState = {
+        discoveryExhausted: true,
+        graphValid: !failedArtifactChecks.length,
+        features: result.extractQueue.map(function (s) {
+          return {
+            id: s.id,
+            lifecycle: s.status === 'done' ? 'completed' : (s.status === 'blocked' ? 'blocked' : 'deferred'),
+          }
+        }),
+        synthesisCurrent: isSynthesisCurrent(result.synthesisState, {
+          scope: result.scopeManifestPath || null,
+          graph: result.scopeManifestPath || null,
+        }),
+        artifactsCurrent: !failedArtifactChecks.length,
+      }
+      var readiness = deriveExtractReadiness(extractProjectState)
+      result.extractReady = readiness.ready
+      result.readinessReason = readiness.reason
+      if (!multiSlice) result.designReady = readiness.ready
       const blockedCount = result.extractQueue.filter((s) => s.status === 'blocked').length
       const skippedCount = result.extractQueue.filter((s) => s.status === 'skipped').length
+
+      // Phase 6: build the immutable status projection shared by handoff and status.
+      // Both surfaces report identical denominator, lifecycle outcomes, revisions,
+      // budgets, failures, readiness proof, and continuation evidence.
+      result.statusProjection = projectStatusProjection({
+        planDir: planDir,
+        scopeManifestPath: result.scopeManifestPath || null,
+        discoveryExhausted: extractProjectState.discoveryExhausted,
+        graphValid: extractProjectState.graphValid,
+        features: extractProjectState.features,
+        synthesisCurrent: extractProjectState.synthesisCurrent,
+        artifactsCurrent: extractProjectState.artifactsCurrent,
+        revisions: { scope: result.scopeManifestPath || null },
+        budget: budgetSummary(result.budgetAccountant),
+        failures: (result.attemptHistory && result.attemptHistory.entries
+          ? result.attemptHistory.entries.filter(function (e) { return e.outcome !== 'success' })
+          : []),
+        continuation: continuationSummary(result.continuationState),
+      })
+
       result.handoff = {
         from: 'extract',
         nextMode: 'tune',
         planDir,
         slices: result.extractQueue.map((s) => ({ id: s.id, name: s.name, planDir: s.planDir, status: s.status })),
+        segments: continuationSummary(result.continuationState),
+        budget: budgetSummary(result.budgetAccountant),
+        persistence: persistenceReport(result.persistenceTracker),
+        readiness: readinessSummary(result.statusProjection),
         message: multiSlice
           ? `Extraction complete: ${doneSlices.length} slice(s) documented under ${planDir}slices/ (overview: ${result.overviewPath || '(none)'})${blockedCount ? `; ${blockedCount} blocked` : ''}${skippedCount ? `; ${skippedCount} skipped — resume later with --slices` : ''}. Per slice: audit findings are in issues-and-improvements.md — run /tune-feature <sliceDir> to fix, or /design-feature --resume <sliceDir> to build on the baseline.`
           : `Extraction complete. As-is design docs are in ${planDir}. Audit findings (if any) are in issues-and-improvements.md — run /tune-feature ${planDir} to fix them, or /design-feature --resume ${planDir} to build on the baseline.`,
       }
       stateCheckpoint('Extract', 'done')
-      plog(`Extract: extractReady=true — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+      plog(`Extract: extractReady=${readiness.ready} (${readiness.reason}) — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+
+      // Phase 6: track the durable consolidate write through the persistence tracker.
+      result.persistenceTracker = recordAttemptedWrite(
+        result.persistenceTracker, 'extract:consolidate:' + planDir, 'project-index'
+      )
       await consolidate(slug, result, config)
+      result.persistenceTracker = verifyDurableWrite(
+        result.persistenceTracker, 'extract:consolidate:' + planDir
+      )
       return result
     }
 
@@ -1276,6 +1619,7 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
     plog('resume: skip Define (definitionPath set)')
   } else {
     plog('Producing task definition')
+    if (await designBudgetGate(result, 'Define')) return result
     definition = await flexibleAgent(
       `You are the task-definition-architect agent. Turn this raw task sketch into a rigorous
 task definition and write it to ${definitionPath}.
@@ -1371,6 +1715,7 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
     plog(`Define: definition written to ${definition.definitionPath}; recommendedPath=${definition.recommendedPath || 'full'}`)
   }
   stateCheckpoint('Define', 'done')
+    await checkpointDesign('define', 'definitionPath')
 
     }
 
@@ -1397,6 +1742,7 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
     } else {
       phase('Knowledge')
       plog('Consulting project knowledge')
+      if (await designBudgetGate(result, 'Knowledge')) return result
       try {
         const knowledge = await flexibleAgent(
           `You are the project-knowledge-consultant agent. Consult the project knowledge and findings
@@ -1419,6 +1765,7 @@ Return a concise brief the architecture + detailed-design agents can consume. Do
         plog('Knowledge Consult: failed (non-blocking) — ' + String(e))
       }
       stateCheckpoint('Knowledge', 'done')
+      await checkpointDesign('knowledge')
     }
 
     // Gate 0.2: Codebase Facts (Phase D2 — code-explorer routing) ---------
@@ -1434,6 +1781,7 @@ Return a concise brief the architecture + detailed-design agents can consume. Do
     } else {
       phase('Codebase Facts')
       plog('Gathering codebase facts via code-explorer')
+      if (await designBudgetGate(result, 'Codebase Facts')) return result
       try {
         const facts = await safeAgent(
           `You are the code-explorer agent. Explore the codebase to gather STRUCTURE FACTS for this task
@@ -1470,6 +1818,7 @@ or commit. Return the path + a concise summary of the most important facts.`,
         plog('Codebase Facts: failed (non-blocking) — ' + String(e))
       }
       stateCheckpoint('Codebase Facts', 'done')
+      await checkpointDesign('codebase-facts', 'factsPath')
     }
 
 
@@ -1484,6 +1833,7 @@ or commit. Return the path + a concise summary of the most important facts.`,
       phase('E2E Use Cases')
       const useCasePath = planDir + 'e2e-use-cases.md'
       plog('Extracting end-to-end use cases')
+      if (await designBudgetGate(result, 'E2E Use Cases')) return result
       const useCases = await flexibleAgent(
         `You are the e2e-usecase-extractor agent. Identify and define end-to-end use cases / test
 scenarios for this task and write them to ${useCasePath}. Consume the idea doc at
@@ -1526,6 +1876,7 @@ mem:conventions first. Do NOT commit.`,
         await writeOpenQuestions(planDir, useCases.openQuestions.map((q) => ({ gate: 'E2E Use Cases', text: q, severity: 'unspecified' })), result)
       }
       stateCheckpoint('E2E Use Cases', 'done')
+      await checkpointDesign('e2e-use-cases', 'useCasePath')
     }
 
     // Gate 0.75: Requirements (Phase C1) ---------------------------------
@@ -1542,6 +1893,7 @@ mem:conventions first. Do NOT commit.`,
       phase('Requirements')
       const requirementsPath = planDir + 'requirements.md'
       plog('Collecting FRs + NFRs')
+      if (await designBudgetGate(result, 'Requirements')) return result
       const requirements = await safeAgent(
         `You are the requirements-collector agent. Collect and structure the functional (FRs) and
 non-functional (NFRs) requirements for this task and write them to ${requirementsPath}. Consume the
@@ -1578,6 +1930,7 @@ Write the requirements doc to ${requirementsPath} and return requirementsPath se
         await writeOpenQuestions(planDir, requirements.openQuestions.map((q) => ({ gate: 'Requirements', text: q, severity: 'unspecified' })), result)
       }
       stateCheckpoint('Requirements', 'done')
+      await checkpointDesign('requirements', 'requirementsPath')
     }
 
     // Gate 0.75R: Requirements review loop (Phase C2) --------------------
@@ -1611,6 +1964,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       }
       plog(`Requirements Review: ${reqReview && reqReview.accepted ? 'accepted' : 'fail-forward'} after ${reqReview ? reqReview.iterations : 0} iteration(s)${reqReview && reqReview.failForward ? ' (fail-forward)' : ''}`)
       stateCheckpoint('Requirements Review', 'done')
+      await checkpointDesign('requirements-review')
     }
 
     // Gate 0.5: Architecture (adopted agent) -------------------------------
@@ -1622,6 +1976,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       } else {
         phase('Architecture')
         plog('Producing high-level architecture design')
+        if (await designBudgetGate(result, 'Architecture')) return result
         const arch = await flexibleAgent(
           `You are the arch-design-orchestrator agent. Produce a high-level architecture design for this task
 and write it to ${archPath}. Consume the idea doc at ${result.definitionPath}${requirementsContext ? ', the requirements at ' + result.requirementsPath : ''} (its NFRs are your input contract).
@@ -1674,8 +2029,10 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
         }
         plog(`Arch Review: ${archReview && archReview.accepted ? 'accepted' : 'fail-forward'} after ${archReview ? archReview.iterations : 0} iteration(s)${archReview && archReview.failForward ? ' (fail-forward)' : ''}`)
         stateCheckpoint('Arch Review', 'done')
+        await checkpointDesign('arch-review')
       }
       stateCheckpoint('Architecture', 'done')
+      await checkpointDesign('architecture', 'archPath')
     }
 
     // Gate 0.6: Detailed Design (adopted agent) ----------------------------
@@ -1687,6 +2044,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       } else {
         phase('Detailed Design')
         plog('Producing detailed design')
+        if (await designBudgetGate(result, 'Detailed Design')) return result
         const design = await flexibleAgent(
           `You are the detailed-design-architect agent. Produce an implementation-ready detailed design for this task
 and write it to ${designPath}. Consume the high-level architecture at ${result.archPath || '(none — infer from idea doc)'},
@@ -1714,6 +2072,7 @@ Do NOT commit.`,
         if ((design.openGaps || []).length) plog(`  design openGaps: ${(design.openGaps || []).join('; ')}`)
       }
       stateCheckpoint('Detailed Design', 'done')
+      await checkpointDesign('detailed-design', 'designPath')
     }
 
     // Gate 0.6R: Detailed-Design review loop (Phase C2) -------------------
@@ -1745,6 +2104,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       }
       plog(`Detailed Design Review: ${designReview && designReview.accepted ? 'accepted' : 'fail-forward'} after ${designReview ? designReview.iterations : 0} iteration(s)${designReview && designReview.failForward ? ' (fail-forward)' : ''}`)
       stateCheckpoint('Detailed Design Review', 'done')
+      await checkpointDesign('design-review')
     }
 
     // Gate 1: Plan ----------------------------------------------------------
@@ -1754,6 +2114,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
     } else {
       phase('Plan')
       plog('Producing plan')
+      if (await designBudgetGate(result, 'Plan')) return result
       plan = await flexibleAgent(
         `You are the plan-architect agent. Create (or update) the implementation plan at ${planPath}
 for this task. Consume the task definition at ${result.definitionPath} as the input contract.
@@ -1794,6 +2155,7 @@ single-lane execution). If the work is not cleanly separable, emit exactly ONE l
       plog(`Plan: plan written to ${plan.planPath}; lanes=${(plan.lanes || []).length}`)
     }
     stateCheckpoint('Plan', 'done')
+    await checkpointDesign('plan', 'planPath')
 
     // Gate 1.5: TDD Enforce (adopted agent) --------------------------------
     if (useTddEnforce) {
@@ -1802,6 +2164,7 @@ single-lane execution). If the work is not cleanly separable, emit exactly ONE l
       } else {
         phase('TDD Enforce')
         plog('Enforcing TDD + YAGNI on plan')
+        if (await designBudgetGate(result, 'TDD Enforce')) return result
         const tdd = await flexibleAgent(
           `You are the tdd-plan-enforcer agent. Harden the plan at ${planPath} IN PLACE with TDD and YAGNI discipline.
 Add TDD gates (RED: tests to write first and watch fail; GREEN: per-feature success criteria; integration;
@@ -1837,6 +2200,7 @@ mem:suggested_commands before enforcing. Do NOT commit.`,
         }
       }
       stateCheckpoint('TDD Enforce', 'done')
+      await checkpointDesign('tdd-enforce')
     }
 
     // Gate 1.7: Reconcile design vs plan (adopted agent, NON-BLOCKING) ------
@@ -1847,13 +2211,14 @@ mem:suggested_commands before enforcing. Do NOT commit.`,
     if (result.reconcile) {
       plog('resume: skip Reconcile (reconcile set)')
       reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-        ? `Reconcile conflicts to re-check: ${JSON.stringify(result.reconcile.conflicts)}\n`
+        ? `Reconcile conflicts to re-check: ${compactList(result.reconcile.conflicts, 8)}\n`
         : ''
     } else if (!useReconcile) {
       stateCheckpoint('Reconcile', 'skipped')
     } else {
       phase('Reconcile')
       plog('Reconciling plan against design artifacts')
+      if (await designBudgetGate(result, 'Reconcile')) return result
       const reconcile = await flexibleAgent(
         `You are the design-plan-reconciler agent. Compare the plan at ${planPath} against the design
 artifacts: architecture at ${result.archPath || '(none)'}, detailed design at ${result.designPath || '(none)'},
@@ -1871,7 +2236,7 @@ ${task}`,
       // self-reported flag (which could be true over live conflicts). Conflict count is truth.
       result.reconcile.consistent = (result.reconcile.conflicts || []).length === 0
       reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-        ? `Reconcile conflicts (address in review): ${JSON.stringify(result.reconcile.conflicts)}\n`
+        ? `Reconcile conflicts (address in review): ${compactList(result.reconcile.conflicts, 8)}\n`
         : ''
       plog(`Reconcile: consistent=${result.reconcile.consistent}; conflicts=${(result.reconcile.conflicts || []).length}; designAtFault=${!!result.reconcile.designAtFault}`)
 
@@ -1883,7 +2248,7 @@ ${task}`,
       // either limit the (still-conflicting) design is carried forward into review.
       let reconcileIterations = 0
       while (result.reconcile.designAtFault && (result.reconcile.designFixes || []).length
-             && reconcileIterations < reconcileSubcap && !budgetExhausted(retryBudget)) {
+             && reconcileIterations < reconcileSubcap && !loopBudgetExhausted(loopBudgets, 'reconcile')) {
         // Phase E2: once already looping (reconcileIterations >= 1), ask quick-decider whether
         // another design-fix cycle is worth it before spending budget. 'stop' carries the
         // still-conflicting design forward into review (reconcile never hard-blocks). null -> stop.
@@ -1895,7 +2260,7 @@ ${task}`,
               iterations: reconcileIterations,
               subcap: reconcileSubcap,
               retryBudget,
-              lastFailure: `Reconcile design-fix loop still flags the DESIGN at fault after ${reconcileIterations} fix iteration(s). Remaining design defects: ${JSON.stringify(result.reconcile.designFixes || []).slice(0, 800)}`,
+              lastFailure: `Reconcile design-fix loop still flags the DESIGN at fault after ${reconcileIterations} fix iteration(s). Remaining design defects: ${compactList(result.reconcile.designFixes || [], 8)}`,
             },
           })
           if (decide === 'stop') {
@@ -1903,9 +2268,9 @@ ${task}`,
             break
           }
         }
-        spendRetry(1)
+        loopBudgets = spendLoop(loopBudgets, 'reconcile')
         reconcileIterations += 1
-        plog(`Reconcile: design at fault — fixing architecture (${result.reconcile.designFixes.length} defect(s); fix ${reconcileIterations}/${reconcileSubcap}, retries used ${retryState.used}/${retryBudget})`)
+        plog(`Reconcile: design at fault — fixing architecture (${result.reconcile.designFixes.length} defect(s); fix ${reconcileIterations}/${reconcileSubcap}, loop budget ${loopBudgets.reconcile.used}/${loopBudgets.reconcile.cap})`)
         phase('Architecture')
         let archFixPrompt = `You are the arch-design-orchestrator agent. The design-plan-reconciler found the DESIGN
 (not the plan) is the source of conflict. Fix the architecture design at ${result.archPath || archPath}
@@ -1924,7 +2289,7 @@ Do NOT commit.`
           archFixPrompt = await enhancePrompt({
             gateKey: 'reconcile-archfix',
             basePrompt: archFixPrompt,
-            failureContext: `Reconcile design-fix iteration ${reconcileIterations}: prior architecture fix did not resolve conflicts. Remaining design defects: ${JSON.stringify(result.reconcile.designFixes).slice(0, 800)}`,
+            failureContext: `Reconcile design-fix iteration ${reconcileIterations}: prior architecture fix did not resolve conflicts. Remaining design defects: ${compactList(result.reconcile.designFixes, 8)}`,
             intent: 'improve-design',
             result, planDir, useEnhancer,
           })
@@ -1959,18 +2324,19 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
         // F7: re-derive consistent from conflict count after the design-fix re-reconcile.
         result.reconcile.consistent = (result.reconcile.conflicts || []).length === 0
         reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-          ? `Reconcile conflicts (address in review): ${JSON.stringify(result.reconcile.conflicts)}\n`
+          ? `Reconcile conflicts (address in review): ${compactList(result.reconcile.conflicts, 8)}\n`
           : ''
         plog(`Reconcile: re-check consistent=${result.reconcile.consistent}; designAtFault=${!!result.reconcile.designAtFault}`)
         if (result.reconcile.consistent) break
       }
       if (result.reconcile.designAtFault) {
-        const reason = budgetExhausted(retryBudget)
-          ? `retry budget exhausted (${retryState.used}/${retryBudget})`
+        const reason = loopBudgetExhausted(loopBudgets, 'reconcile')
+          ? `reconcile loop budget exhausted (${loopBudgets.reconcile.used}/${loopBudgets.reconcile.cap})`
           : `reconcile sub-cap reached (${reconcileIterations}/${reconcileSubcap})`
         plog(`Reconcile: design-fix loop stopped — ${reason}; carrying conflict forward`)
       }
       stateCheckpoint('Reconcile', 'done')
+      await checkpointDesign('reconcile')
     }
 
     // Gate 2: Review / Refine loop (global-budget-bounded, never terminal) --
@@ -1984,9 +2350,10 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
     } else {
       let reviewState = { accepted: false }
       let refineCount = 0
-      while (!reviewState.accepted && refineCount < refineSubcap && !budgetExhausted(retryBudget)) {
+      while (!reviewState.accepted && refineCount < refineSubcap && !loopBudgetExhausted(loopBudgets, 'refine')) {
         phase('Review/Refine')
-        plog(`Review iteration ${refineCount + 1} (retries used ${retryState.used}/${retryBudget})`)
+        plog(`Review iteration ${refineCount + 1} (refine loop budget ${loopBudgets.refine.used}/${loopBudgets.refine.cap})`)
+        if (await designBudgetGate(result, 'Review/Refine')) return result
         const review = await safeAgent(
           `You are the critical-reviewer agent. Review the plan at ${planPath} against the task
 definition at ${result.definitionPath}. Task:
@@ -2002,7 +2369,7 @@ for being implementable.
 Return accepted=true iff there are NO blocker-severity findings. List blockers otherwise.`,
           { label: 'critical-reviewer(plan)', phase: 'Review/Refine', schema: REVIEW_VERDICT, model: gm('review') }, result
         )
-        spendRetry(1)
+        loopBudgets = spendLoop(loopBudgets, 'refine')
         if (!review) {
           // Reviewer agent failure is a retryable condition, not terminal.
           refineCount += 1
@@ -2027,7 +2394,7 @@ Return accepted=true iff there are NO blocker-severity findings. List blockers o
               iterations: refineCount,
               subcap: refineSubcap,
               retryBudget,
-              lastFailure: `Plan review rejected after ${refineCount} refine iteration(s). Outstanding blockers: ${JSON.stringify(review.blockers || []).slice(0, 800)}`,
+              lastFailure: `Plan review rejected after ${refineCount} refine iteration(s). Outstanding blockers: ${compactList(review.blockers || [], 8)}`,
             },
           })
           if (decide === 'stop') {
@@ -2040,12 +2407,12 @@ Return accepted=true iff there are NO blocker-severity findings. List blockers o
         let refinePrompt = `You are the plan-refiner agent. Address the following review findings on the plan at ${planPath}.
 Do not reduce scope of the pass gates.
 Findings:
-${JSON.stringify(review.blockers, null, 2)}`
+${compactList(review.blockers, 8)}`
         if (refineCount > 0) {
           refinePrompt = await enhancePrompt({
             gateKey: 'plan-refine',
             basePrompt: refinePrompt,
-            failureContext: `Prior refine iteration still rejected; review blockers not fully addressed. Review blockers: ${JSON.stringify(review.blockers).slice(0, 800)}`,
+            failureContext: `Prior refine iteration still rejected; review blockers not fully addressed. Review blockers: ${compactList(review.blockers, 8)}`,
             intent: 'improve-design',
             result, planDir, useEnhancer,
           })
@@ -2066,7 +2433,7 @@ ${JSON.stringify(review.blockers, null, 2)}`
       // defects hard-block (resumable via --resume). Real residual issues surface
       // at Test + Code-Review.
       if (!reviewState.accepted) {
-        if (budgetExhausted(retryBudget)) {
+        if (loopBudgetExhausted(loopBudgets, 'escalation')) {
           result.blockedAt = 'review'
           result.retryUsed = retryState.used
           stateCheckpoint('Review/Refine', 'blocked')
@@ -2075,10 +2442,17 @@ ${JSON.stringify(review.blockers, null, 2)}`
         }
         phase('Review/Refine')
         plog('Refine sub-cap reached — escalating to final reviewer')
-        // Escalation agent: retry up to ESCALATION_RETRIES times with a hardened prompt before
+        // Escalation agent: retry up to escalationCap times with a hardened prompt before
         // giving up. A schema/JSON throw (safeAgent -> null) on the final plan-review gate must NOT
         // silently force-accept an unreviewed plan — exhaust retries, then hard-block (resumable).
-        const ESCALATION_RETRIES = 5
+        // DLOOP-01: escalationCap is configurable via args.maxEscalationRetries (was hardcoded 5).
+        // DYAGNI-01: ensure BLOCKER-severity YAGNI findings reach the escalation reviewer
+        // even when reconcile was disabled (TDD Enforce routes them into reconcile.conflicts).
+        var yagniBlockerContext = ''
+        if (result.reconcile && result.reconcile.conflicts) {
+          var yagniBlockers = result.reconcile.conflicts.filter(function (c) { return /\[YAGNI BLOCKER\]/.test(String(c)) })
+          if (yagniBlockers.length) yagniBlockerContext = `\nYAGNI BLOCKER findings (must be addressed):\n${compactList(yagniBlockers, 8)}\n`
+        }
         const escalatePrompt = (attempt) => `You are the FINAL escalation reviewer. Prior review rounds rejected this plan; the blockers they
 raised are below. Reclassify EACH: is it a TRUE plan defect (missing scope/spec/ordering/risk) or an
 IMPLEMENTATION-DETAIL (call-site wiring, individual yield/construction sites, mechanics that belong to
@@ -2090,21 +2464,21 @@ Definition: ${result.definitionPath}
 Task: ${task}
 
 Prior blockers:
-${JSON.stringify((reviewState && reviewState.blockers) || [], null, 2)}
+${compactList((reviewState && reviewState.blockers) || [], 8)}${yagniBlockerContext}
 
 Set accepted=true if no TRUE defects remain. Set forceAcceptable=true if every remaining blocker is
 implementation-detail. List trueDefects (genuine plan defects) and implNotes (implementer-detail) separately.${
           attempt > 1
             ? `
 
-IMPORTANT (retry ${attempt}/${ESCALATION_RETRIES}): A prior response failed JSON/schema validation.
+IMPORTANT (retry ${attempt}/${escalationCap}): A prior response failed JSON/schema validation.
 Respond with STRICT valid JSON ONLY — no markdown, no code fences, no commentary. Keep every array and
 object well-formed and within the schema. If unsure, return accepted=false with empty arrays rather than
 malformed output.`
             : ''
         }`
         let escalation = null
-        for (let attempt = 1; attempt <= ESCALATION_RETRIES; attempt++) {
+        for (let attempt = 1; attempt <= escalationCap; attempt++) {
           // Phase E2: on schema-recovery retries (attempt > 1, prior escalation returned null),
           // ask quick-decider whether more JSON-format retries are worth it. 'stop' bails to the
           // hard-block path below (escalation stays null). null -> stop.
@@ -2114,7 +2488,7 @@ malformed output.`
               opts: {
                 loopName: 'escalation',
                 iterations: attempt - 1,
-                subcap: ESCALATION_RETRIES,
+                subcap: escalationCap,
                 retryBudget,
                 lastFailure: `Escalation reviewer returned malformed JSON / null on ${attempt - 1} prior attempt(s) (schema-recovery loop).`,
               },
@@ -2131,7 +2505,7 @@ malformed output.`
             attemptPrompt = await enhancePrompt({
               gateKey: 'escalation',
               basePrompt: attemptPrompt,
-              failureContext: `Escalation agent returned malformed JSON / null on prior attempt (attempt ${attempt}/${ESCALATION_RETRIES}). Need strict valid JSON conforming to ESCALATION_REVIEW schema.`,
+              failureContext: `Escalation agent returned malformed JSON / null on prior attempt (attempt ${attempt}/${escalationCap}). Need strict valid JSON conforming to ESCALATION_REVIEW schema.`,
               intent: 'tighten-format',
               result, planDir, useEnhancer,
             })
@@ -2140,9 +2514,9 @@ malformed output.`
             attemptPrompt,
             { label: 'critical-reviewer(escalation)', phase: 'Review/Refine', schema: ESCALATION_REVIEW, model: gm('reviewEscalation') }, result
           )
-          spendRetry(1)
+          loopBudgets = spendLoop(loopBudgets, 'escalation')
           if (escalation != null) break
-          plog(`Escalation agent failed (attempt ${attempt}/${ESCALATION_RETRIES}) — retrying with hardened prompt`)
+          plog(`Escalation agent failed (attempt ${attempt}/${escalationCap}) — retrying with hardened prompt`)
         }
         if (escalation == null) {
           // All retries exhausted: hard-block rather than force-accept an unreviewed plan.
@@ -2153,7 +2527,7 @@ malformed output.`
           result.refineIterations = refineCount
           result._escalation = escalation
           stateCheckpoint('Review/Refine', 'blocked')
-          plog(`Escalation failed after ${ESCALATION_RETRIES} retries — hard-block (resumable via --resume)`)
+          plog(`Escalation failed after ${escalationCap} retries — hard-block (resumable via --resume)`)
           await consolidate(slug, result, config)
           return result
         } else if (escalation.accepted === true) {
@@ -2167,6 +2541,7 @@ malformed output.`
           result.carriedBlockers = (escalation.trueDefects || []).concat(escalation.implNotes || [])
           result.refineIterations = refineCount
           result._escalation = escalation
+          recordDegradationEvent(result, 'fail-forward', 'Review/Refine', 'escalation', 'force-accepted plan with ' + result.carriedBlockers.length + ' carried blocker(s)')
           plog(`Force-accepting plan — ${result.carriedBlockers.length} blocker(s) carried forward (impl-detail)`)
         } else {
           // Genuine TRUE plan defects → hard-block (resumable via --resume).
@@ -2186,6 +2561,7 @@ malformed output.`
       plog(`Review/Refine: plan accepted (iterations=${refineCount}, forceAccepted=${result.forceAccepted})`)
     }
     stateCheckpoint('Review/Refine', 'done')
+    await checkpointDesign('review-refine')
 
     // ===== Phase H: plan-chunker → stages (design tail) ===========================
     // In design mode the THINK section ends right after this. Plan-chunker splits plan.md into
@@ -2196,10 +2572,12 @@ malformed output.`
       if (useChunker) {
         phase('Chunk Plan')
         plog('Chunking plan into stages (design tail)')
+        if (await designBudgetGate(result, 'Chunk Plan')) return result
         const stages = await chunkPlanIntoStages({ planPath, planDir, task, result, lanes: result.lanes })
         result.stages = stages
         plog(`plan-chunker: ${stages.length} stage(s) — ${stages.map((s) => s.id).join(', ')}`)
         stateCheckpoint('Chunk Plan', 'done')
+        await checkpointDesign('chunk-plan')
       } else {
         // --no-chunker: single implicit stage covering the whole plan (single-executor behavior).
         result.stages = [{
@@ -2231,12 +2609,16 @@ malformed output.`
           phase('Publish')
           plog('Design mode: publishing plan + architecture before design-stop')
           await publishDesign(result, planPath, task)
+          // DTERM-01: distinguish attempted from durably verified publish outcome.
+          result._publishVerified = !!(result.published && result.published.published)
           stateCheckpoint('Publish', 'done')
         }
         if (useKnowledgePersist && !result.persist) {
           phase('Persist')
           plog('Design mode: persisting findings before design-stop')
           await persistFindings(result)
+          // DTERM-01: distinguish attempted from durably verified persist outcome.
+          result._persistVerified = !!(result.persist && result.persist.persisted)
           plog(`Persist: persisted=${result.persist && result.persist.persisted}`)
           stateCheckpoint('Persist', 'done')
         }
@@ -2296,6 +2678,8 @@ malformed output.`
       // No budget is spent on approval round-trips.
       if (useApproval && !(result.designApproved && result.designApproved.approved)) {
         phase('Design')
+        result._designBudget = designBudgetSummary(designBudget)
+        result._loopBudgets = loopBudgetSummary(loopBudgets)
         result.designReady = true // the artifacts ARE ready; only the human sign-off is pending
         result.approvalPending = true
         result.blockedAt = 'awaiting-approval'
@@ -2316,12 +2700,55 @@ malformed output.`
       }
 
       phase('Design')
+      // DREADY-01: truthful design readiness — designReady must reflect actual gate outcomes.
+      // Check for hidden degradation (fail-forwarded reviews, force-accepted blockers,
+      // unresolved reconcile conflicts) before advertising readiness.
+      var designReadiness = deriveDesignReadiness(result)
+      // DQUEST-01: unresolved open questions block completion unless explicitly deferred.
+      if (result.openQuestionsPath && !(result._openQuestionsDeferred || []).length) {
+        designReadiness = {
+          ready: false,
+          reason: 'unresolved-open-questions',
+          degradation: (designReadiness.degradation || []).concat([{ type: 'unresolved-open-questions', path: result.openQuestionsPath }]),
+        }
+      }
+      if (!designReadiness.ready) {
+        result.designReady = false
+        result.designReadinessBlocker = designReadiness.reason
+        result.designReadinessDegradation = designReadiness.degradation
+        var degrSummary = designReadiness.degradation.map(function (d) { return d.type }).join(', ')
+        result.handoff = {
+          from: 'design',
+          message: `Design NOT ready — degraded: ${degrSummary}. Resolve the flagged issues and re-run: /design-feature --resume ${planDir}`,
+          nextMode: 'design',
+          planDir,
+          degradationDetail: designReadiness.degradation,
+          degradationLog: result._degradationLog || [],
+        }
+        stateCheckpoint('Design', 'degraded')
+        plog(`Design mode: NOT ready — ${degrSummary}`)
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
       result.designReady = true
+      // DBUDGET-01 / DLOOP-01: record budget summaries for handoff/status inspection.
+      result._designBudget = designBudgetSummary(designBudget)
+      result._loopBudgets = loopBudgetSummary(loopBudgets)
+      // DCHUNK-01: surface chunker degradation as an explicit acknowledged outcome.
+      var chunkerWarning = result._chunkerDegraded && !result._chunkerDegradationAcknowledged
+        ? ' WARNING: plan chunker degraded to a single stage — stage-level parallelism and resumability are lost.'
+        : ''
+      // DHIST-01: include degradation log summary in handoff for inspection.
+      var degrLogSummary = degradationLogSummary(result._degradationLog)
+      var degrLine = degrLogSummary ? ` Degradation events: ${degrLogSummary}.` : ''
       result.handoff = {
         from: 'design',
-        message: `Design ready${result.designApproved && result.designApproved.approved ? ' (user-approved)' : ''}. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}`,
+        message: `Design ready${result.designApproved && result.designApproved.approved ? ' (user-approved)' : ''}. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}.${chunkerWarning}${degrLine}`,
         nextMode: 'implement',
         planDir,
+        degradationLog: result._degradationLog || [],
+        chunkerDegraded: !!result._chunkerDegraded,
       }
       stateCheckpoint('Design', 'done')
       plog(`Design mode: designReady=true — stopping pre-execute (stages=${result.stages.length})`)
@@ -2406,6 +2833,7 @@ tests were created or existing coverage was verified.`,
         plog(`Test Authoring: written=${authored.written}; files=${(authored.files || []).length}; summary=${authored.summary || '(none)'}`)
       }
       stateCheckpoint('Test Authoring', 'done')
+      await checkpointDesign('test-authoring')
     } else if (isImplementMode && !useTestWriter) {
       stateCheckpoint('Test Authoring', 'skipped')
     }
@@ -2618,6 +3046,7 @@ declaring completion. ${carriedBlockersLine}`,
       }
     }
     stateCheckpoint('Execute', 'done')
+    await checkpointDesign('execute')
 
   } // end full-path branch — Gate 4+ run at main() level for BOTH paths
 
@@ -2708,6 +3137,7 @@ resolves the failures, plus a change summary.`
     plog(`Test: PASSED — ${test.summary || '(no summary)'}`)
   }
   stateCheckpoint('Test', 'done')
+  await checkpointDesign('test')
 
   // Gate 5: Code review ---------------------------------------------------
   phase('Code Review')
@@ -2777,6 +3207,7 @@ Do NOT include formatting nits unless they change meaning.`,
     }
   }
   stateCheckpoint('Code Review', 'done')
+  await checkpointDesign('code-review')
 
   // Gate 5.1: Commit Goalkeeper (Phase E3 — complex-decision-analyst) ---------
   // After final code-review passes, an authoritative decision-agent decides COMMIT vs LOOP-BACK.
@@ -2872,6 +3303,8 @@ Do NOT include formatting nits unless they change meaning.`,
     phase('Publish')
     plog('Publishing plan + architecture to project docs')
     await publishDesign(result, planPath, task)
+    // DTERM-01: distinguish attempted from durably verified publish outcome.
+    result._publishVerified = !!(result.published && result.published.published)
     stateCheckpoint('Publish', 'done')
   }
 
@@ -2903,6 +3336,16 @@ Use a clear conventional-commit message. Return the commit hash.`,
     result.committed = !!(commit && commit.committed)
     result.commitHash = commit ? commit.commitHash : null
     plog(`Commit: committed=${result.committed}; hash=${result.commitHash || '(none)'}`)
+    // DTERM-01: a failed commit is never reported as terminal success.
+    if (!result.committed) {
+      result.blockedAt = 'commit-failed'
+      recordDegradationEvent(result, 'fail-forward', 'Commit', 'git-ops', 'commit attempt failed')
+      stateCheckpoint('Commit', 'blocked')
+      result.retryUsed = retryState.used
+      logTelemetrySummary()
+      await consolidate(slug, result, config)
+      return result
+    }
   }
 
     // Reflect the true terminal gate in the persisted state and flush once more

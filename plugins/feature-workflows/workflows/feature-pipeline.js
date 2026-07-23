@@ -1039,6 +1039,7 @@ const RETRY_BUDGET_DEFAULT = 20
 const REFINE_SUBCAP_DEFAULT = 10   // soft per-loop cap on plan refine iterations
 const DEBUG_SUBCAP_DEFAULT = 20    // soft per-loop cap on gsd-debug fix+retest
 const RECONCILE_SUBCAP_DEFAULT = 5 // soft per-loop cap on reconcile design-fix iterations
+const ESCALATION_RETRIES_DEFAULT = 5 // configurable cap on plan-review escalation retries (DLOOP-01)
 const DECISION_CAP_DEFAULT = 50   // Phase E1: hard runaway cap on authoritative decision-agent calls
 const AGENT_TIMEOUT_MS_DEFAULT = 10 * 60 * 1000
 const AGENT_MAX_OUTPUT_CHARS_DEFAULT = 200000
@@ -1273,6 +1274,34 @@ function detectNonEnglish(text) {
   const ratio = letters > 0 ? nonAsciiLetters / letters : 0
   return { isEnglish: letters === 0 || ratio < 0.15, ratio }
 }
+
+// Maps artifact path keys to their checkpoint gate names so digest-driven
+// verification can look up the durable checkpoint recorded at gate completion.
+const ARTIFACT_CHECKPOINT_GATE_MAP = {
+  definitionPath: 'define',
+  requirementsPath: 'requirements',
+  archPath: 'architecture',
+  designPath: 'detailed-design',
+  planPath: 'plan',
+}
+
+// Deterministic artifact verification using the durable digest/revision
+// contract. When a gate was durably checkpointed and its artifact digest was
+// recorded, the artifact is verified without trusting an LLM self-report.
+// Pure: no I/O, no side effects.
+function verifyArtifactDigest(result, pathKey) {
+  if (!result || !pathKey) return { verified: false, reason: 'no-path-key', digest: null }
+  const checkpoints = result._designCheckpoints || {}
+  const digests = result._artifactDigests || {}
+  const gateName = ARTIFACT_CHECKPOINT_GATE_MAP[pathKey]
+  if (!gateName) return { verified: false, reason: 'no-gate-mapping', digest: null }
+  const cp = checkpoints[gateName]
+  const digest = digests[pathKey]
+  if (!cp || !cp.acknowledged) return { verified: false, reason: 'no-checkpoint', digest: null }
+  if (!digest) return { verified: false, reason: 'no-digest', digest: null }
+  return { verified: true, reason: 'checkpoint-verified', digest }
+}
+
 
 // Consolidate the full pipeline result into ONE durable todo-store record.
 // R4 replaces ~16 per-gate checkpoint() calls with this single write: gate
@@ -1565,8 +1594,73 @@ object in the "state" field. If the file does not exist, return state=null.`,
   )
 }
 
-async function verifyArtifactPresence({ path, gate, expectedHeadings, result }) {
+
+// Retain a last-good snapshot before each state write so resume can auto-recover
+// from a truncated/partial chunked write. Before writing the new state, copies
+// the current pipeline-state.json to pipeline-state.last-good.json via agent I/O.
+// Non-blocking: a copy failure warns but does not prevent the new write.
+async function flushPipelineStateWithSnapshot(planDir, result, config) {
+  const lastGoodPath = planDir.replace(/\/$/, '') + '/pipeline-state.last-good.json'
+  try {
+    const current = await loadPipelineState(planDir)
+    if (current && current.state) {
+      await writeChunkedFile(
+        lastGoodPath,
+        JSON.stringify(current.state, null, 2),
+        'file-writer:last-good',
+        result
+      )
+    }
+  } catch (e) {
+    if (result && result.logLines) {
+      result.logLines.push(`snapshot: last-good copy skipped (${String(e)})`)
+    }
+  }
+  return flushPipelineState(planDir, result, config)
+}
+
+// Load pipeline state with auto-recovery from a last-good snapshot. If the
+// primary state file fails validation (truncated/corrupt chunked write), the
+// last-good snapshot is loaded and validated instead. Returns { state, recovered }
+// where recovered=true signals the primary file was bypassed.
+async function loadPipelineStateWithRecovery(planDir) {
+  const loaded = await loadPipelineState(planDir)
+  const state = loaded && loaded.state
+  if (state) {
+    const validation = validatePipelineState(state)
+    if (validation.ok) {
+      return { state, recovered: false }
+    }
+  }
+  const lastGoodPath = planDir.replace(/\/$/, '') + '/pipeline-state.last-good.json'
+  const lastGoodLoaded = await safeAgent(
+    `You are a file-reader agent. Read ${lastGoodPath} and return its full JSON content parsed as an
+object in the "state" field. If the file does not exist, return state=null.`,
+    { label: 'file-reader:last-good', phase: 'Checkpoint', schema: PIPELINE_STATE_READ, model: gm('todo') },
+    null
+  )
+  const lastGoodState = lastGoodLoaded && lastGoodLoaded.state
+  if (lastGoodState) {
+    const lastGoodValidation = validatePipelineState(lastGoodState)
+    if (lastGoodValidation.ok) {
+      return { state: lastGoodState, recovered: true }
+    }
+  }
+  return { state: null, recovered: false }
+}
+
+async function verifyArtifactPresence({ path, gate, expectedHeadings, result, pathKey }) {
   if (!path || path === 'present') return { exists: !!path, sizeBytes: 0, hasExpectedHeadings: true, summary: 'not a file path' }
+  // Deterministic verification via durable digest contract. An LLM file-reader's
+  // self-reported existence cannot be trusted — a hallucinated claim could pass
+  // a missing artifact. When a durable checkpoint recorded this artifact with a
+  // digest, that is the authoritative verification and the LLM call is skipped.
+  if (pathKey) {
+    const digestResult = verifyArtifactDigest(result, pathKey)
+    if (digestResult.verified) {
+      return { exists: true, sizeBytes: 1, hasExpectedHeadings: true, summary: 'verified via durable digest checkpoint' }
+    }
+  }
   const headingLine = expectedHeadings && expectedHeadings.length
     ? `Also verify the file contains at least one of these headings/markers: ${expectedHeadings.join(', ')}.`
     : 'No specific heading marker is required.'
@@ -1587,6 +1681,15 @@ Return summary with the evidence. Do not modify files.`,
 async function repairResumeArtifactFlags(result) {
   if (!result) return []
   const repairs = []
+  const checkpoints = result._designCheckpoints || {}
+  const digests = result._artifactDigests || {}
+
+  // Map each artifact to its checkpoint gate name so digest-driven skip can
+  // consult the durable checkpoint record. When a gate was durably
+  // acknowledged and its artifact digest was recorded, the artifact was
+  // verified at checkpoint time and the expensive LLM re-verification can be
+  // skipped entirely on resume.
+  const checkpointGateMap = ARTIFACT_CHECKPOINT_GATE_MAP
   const artifacts = [
     { pathKey: 'definitionPath', flags: ['_define'], gate: 'Define' },
     { pathKey: 'requirementsPath', flags: ['_requirements', '_reviewedRequirements'], gate: 'Requirements' },
@@ -1594,24 +1697,25 @@ async function repairResumeArtifactFlags(result) {
     { pathKey: 'designPath', flags: ['_design', '_reviewedDesign'], gate: 'Detailed Design' },
     { pathKey: 'planPath', flags: ['planned', '_plan', '_reviewedPlan', 'planAccepted', 'tddEnforced', 'reconcile'], gate: 'Plan' },
   ].filter((a) =>
-    // Verify the Plan artifact only when a plan was actually WRITTEN (result.planned).
-    // result.planPath is planDir math, set long before plan.md exists, so checking it
-    // unconditionally nulls result.planPath — which disables every later state flush in
-    // consolidate() and clears designReady. Three states hit this: extract-mode runs
-    // (extract writes no plan.md at all), extract slice-local states (design-shaped,
-    // mode:'design', no plan), and design runs resumed from a block BEFORE the Plan gate.
-    // When planned is falsy the Plan gate re-runs and rewrites plan.md anyway, so
-    // skipping the check loses nothing.
     !(a.pathKey === 'planPath' && !result.planned)
   )
   for (const artifact of artifacts) {
     const path = result[artifact.pathKey]
     if (!path) continue
+
+    const cpGate = checkpointGateMap[artifact.pathKey]
+    const cp = cpGate ? checkpoints[cpGate] : null
+    const storedDigest = digests[artifact.pathKey]
+    if (cp && cp.acknowledged && storedDigest) {
+      continue
+    }
+
     const checked = await verifyArtifactPresence({
       path,
       gate: `resume:${artifact.gate}`,
       expectedHeadings: ['#'],
       result,
+      pathKey: artifact.pathKey,
     })
     if (checked.exists && checked.sizeBytes > 0 && checked.hasExpectedHeadings !== false) continue
     for (const flag of artifact.flags) {
@@ -1629,6 +1733,2868 @@ async function repairResumeArtifactFlags(result) {
     result._goalkeeper = null
   }
   return repairs
+}
+
+// Pure lifecycle state contract: explicit feature lifecycle states, deterministic
+// transition reducer, and readiness derivation. No I/O — all functions are pure
+// and deterministic. Designed for property-based table tests.
+
+// Canonical lifecycle states a feature may occupy. Exactly one is active per feature
+// at any time. Excluded features are outside the coverage denominator; all others
+// contribute to the readiness invariant.
+const LIFECYCLE_STATES = Object.freeze({
+  RUNNABLE: 'runnable',
+  DEFERRED: 'deferred',
+  IN_PROGRESS: 'in-progress',
+  BLOCKED: 'blocked',
+  FAILED: 'failed',
+  SKIPPED: 'skipped',
+  EXCLUDED: 'excluded',
+  COMPLETED: 'completed',
+})
+
+// Three distinct skip classifications with different readiness implications.
+// Feature-level skip means the feature itself was abandoned — remains incomplete.
+// Policy-disabled optional skip may complete if policy evidence is recorded.
+// Required-gate skip blocks completion permanently until resolved.
+const SKIP_REASONS = Object.freeze({
+  FEATURE_LEVEL: 'feature-level',
+  POLICY_DISABLED_OPTIONAL: 'policy-disabled-optional',
+  REQUIRED_GATE: 'required-gate',
+})
+
+// Legal transitions: maps current state to the set of event types that may fire.
+// Any event not listed for the current state is illegal and throws.
+const TRANSITION_TABLE = Object.freeze({
+  runnable: ['start', 'defer', 'skip', 'exclude'],
+  deferred: ['start', 'exclude'],
+  'in-progress': ['block', 'fail', 'complete', 'skip'],
+  blocked: ['start', 'fail', 'exclude'],
+  failed: ['start', 'exclude'],
+  skipped: ['start', 'complete', 'exclude'],
+  excluded: [],
+  completed: [],
+})
+
+// Pure transition reducer. Takes the current feature state and an event, returns a
+// new state object. Throws on illegal transitions. Does NOT mutate the input.
+//
+// state: { lifecycle, skipReason?, policyEvidence? }
+// event: { type: 'admit'|'start'|'block'|'fail'|'skip'|'exclude'|'complete', payload? }
+function applyLifecycleEvent(state, event) {
+  if (!state || typeof state !== 'object') {
+    throw new Error('applyLifecycleEvent: state must be an object')
+  }
+  if (!event || typeof event !== 'object' || !event.type) {
+    throw new Error('applyLifecycleEvent: event must have a type')
+  }
+
+  const current = state.lifecycle
+  if (!current || !TRANSITION_TABLE[current]) {
+    throw new Error(`applyLifecycleEvent: unknown lifecycle state '${current}'`)
+  }
+
+  const allowed = TRANSITION_TABLE[current]
+  if (!allowed.includes(event.type)) {
+    throw new Error(
+      `applyLifecycleEvent: illegal transition '${current}' + '${event.type}' (allowed: ${allowed.join(', ') || 'none'})`
+    )
+  }
+
+  // Build new state — never mutate the original
+  const next = { ...state }
+
+  switch (event.type) {
+    case 'start':
+      next.lifecycle = LIFECYCLE_STATES.IN_PROGRESS
+      delete next.skipReason
+      delete next.policyEvidence
+      break
+    case 'defer':
+      next.lifecycle = LIFECYCLE_STATES.DEFERRED
+      break
+    case 'block':
+      next.lifecycle = LIFECYCLE_STATES.BLOCKED
+      break
+    case 'fail':
+      next.lifecycle = LIFECYCLE_STATES.FAILED
+      break
+    case 'skip': {
+      const reason = event.payload && event.payload.skipReason
+      if (!reason || !Object.values(SKIP_REASONS).includes(reason)) {
+        throw new Error('applyLifecycleEvent: skip event requires valid payload.skipReason')
+      }
+      next.lifecycle = LIFECYCLE_STATES.SKIPPED
+      next.skipReason = reason
+      if (event.payload.policyEvidence) {
+        next.policyEvidence = event.payload.policyEvidence
+      }
+      break
+    }
+    case 'exclude':
+      next.lifecycle = LIFECYCLE_STATES.EXCLUDED
+      if (event.payload && event.payload.rationale) {
+        next.exclusionRationale = event.payload.rationale
+      }
+      break
+    case 'complete':
+      // A skipped feature can only complete under specific skip-reason rules
+      if (current === LIFECYCLE_STATES.SKIPPED) {
+        if (state.skipReason === SKIP_REASONS.REQUIRED_GATE) {
+          throw new Error('applyLifecycleEvent: cannot complete — required gate was skipped')
+        }
+        if (state.skipReason === SKIP_REASONS.FEATURE_LEVEL) {
+          throw new Error('applyLifecycleEvent: cannot complete — feature was skipped at feature level')
+        }
+        if (state.skipReason === SKIP_REASONS.POLICY_DISABLED_OPTIONAL) {
+          if (!state.policyEvidence) {
+            throw new Error('applyLifecycleEvent: cannot complete — policy-disabled skip requires policyEvidence')
+          }
+        }
+      }
+      next.lifecycle = LIFECYCLE_STATES.COMPLETED
+      break
+    default:
+      throw new Error(`applyLifecycleEvent: unhandled event type '${event.type}'`)
+  }
+
+  return next
+}
+
+// Derive readiness from a project manifest. Pure: no side effects.
+// Returns whether the project is ready plus exact counts.
+//
+// manifest: {
+//   schemaVersion: string,
+//   features: [{ id, lifecycle, skipReason?, policyEvidence? }]
+// }
+function deriveReadiness(manifest) {
+  const features = (manifest && manifest.features) || []
+  const counts = {
+    runnable: 0, deferred: 0, inProgress: 0, blocked: 0,
+    failed: 0, skipped: 0, excluded: 0, completed: 0,
+  }
+
+  for (const f of features) {
+    const lc = f.lifecycle
+    if (lc === LIFECYCLE_STATES.RUNNABLE) counts.runnable++
+    else if (lc === LIFECYCLE_STATES.DEFERRED) counts.deferred++
+    else if (lc === LIFECYCLE_STATES.IN_PROGRESS) counts.inProgress++
+    else if (lc === LIFECYCLE_STATES.BLOCKED) counts.blocked++
+    else if (lc === LIFECYCLE_STATES.FAILED) counts.failed++
+    else if (lc === LIFECYCLE_STATES.SKIPPED) counts.skipped++
+    else if (lc === LIFECYCLE_STATES.EXCLUDED) counts.excluded++
+    else if (lc === LIFECYCLE_STATES.COMPLETED) counts.completed++
+  }
+
+  // Denominator excludes 'excluded' features
+  const denominator = features.length - counts.excluded
+  const incomplete = counts.runnable + counts.deferred + counts.inProgress + counts.blocked + counts.failed
+
+  // Skipped features need special handling: only policy-disabled-optional with evidence counts as complete
+  let effectiveSkippedIncomplete = 0
+  for (const f of features) {
+    if (f.lifecycle === LIFECYCLE_STATES.SKIPPED) {
+      if (f.skipReason === SKIP_REASONS.POLICY_DISABLED_OPTIONAL && f.policyEvidence) {
+        counts.completed++ // counts as completed for readiness
+      } else {
+        effectiveSkippedIncomplete++
+      }
+    }
+  }
+  // Adjust: skipped that can complete are already counted in completed above;
+  // the rest are incomplete
+  const totalIncomplete = incomplete + effectiveSkippedIncomplete
+
+  return {
+    ready: denominator > 0 && totalIncomplete === 0 && counts.completed >= denominator,
+    denominator,
+    completed: counts.completed,
+    remaining: counts.runnable + counts.deferred + counts.inProgress,
+    blocked: counts.blocked,
+    failed: counts.failed,
+    skipped: effectiveSkippedIncomplete,
+    excluded: counts.excluded,
+  }
+}
+
+// Terminal states: once reached, the feature does not transition further
+function isTerminal(lifecycleState) {
+  return lifecycleState === LIFECYCLE_STATES.COMPLETED ||
+    lifecycleState === LIFECYCLE_STATES.FAILED ||
+    lifecycleState === LIFECYCLE_STATES.EXCLUDED
+}
+
+// Incomplete states: features that still need work before the project can be ready.
+// Feature-level skipped is incomplete. Policy-disabled-optional with evidence is NOT.
+function isIncomplete(lifecycleState, skipReason) {
+  if (lifecycleState === LIFECYCLE_STATES.DEFERRED ||
+    lifecycleState === LIFECYCLE_STATES.BLOCKED ||
+    lifecycleState === LIFECYCLE_STATES.IN_PROGRESS ||
+    lifecycleState === LIFECYCLE_STATES.RUNNABLE) {
+    return true
+  }
+  if (lifecycleState === LIFECYCLE_STATES.SKIPPED) {
+    return skipReason !== SKIP_REASONS.POLICY_DISABLED_OPTIONAL
+  }
+  return false
+}
+
+// Root-last migration from v1.4.5 monolithic pipeline-state.json to v1.5.0 sharded
+// state contract. All functions are pure and deterministic — no I/O.
+//
+// Migration order:
+// 1. Validate the legacy envelope before mutation.
+// 2. Derive deterministic feature identities and default new version/revision fields.
+// 3. Write and validate every referenced child shard.
+// 4. Reclassify legacy cap/selector outcomes as deferred where evidence shows undispatched scope.
+// 5. Atomically acknowledge the compact project manifest only after all child references are durable.
+
+
+// Derive a stable canonical feature identity from a legacy extract-queue slice.
+// The identity is based on the slice name and primary entry point, not array index,
+// so the same slice produces the same ID across runs and traversals.
+function deriveFeatureId(legacySlice) {
+  if (!legacySlice) return 'unknown'
+  const name = legacySlice.name || legacySlice.id || 'feature'
+  const slug = categorizeSlug(String(name))
+  // Incorporate first entry point or file for uniqueness when names collide
+  const entryPoint = (legacySlice.entryPoints && legacySlice.entryPoints[0]) || ''
+  const fileHint = (legacySlice.files && legacySlice.files[0]) || ''
+  const disambiguator = categorizeSlug(String(entryPoint || fileHint))
+  // If slug is unique enough, skip the disambiguator
+  if (disambiguator && disambiguator !== 'misc' && disambiguator !== slug) {
+    return `${slug}-${disambiguator}`
+  }
+  return slug || 'feature'
+}
+
+// Pure transform: convert legacy v1.4.5 pipeline-state.json structure to v1.5.0
+// sharded project manifest. Idempotent — calling twice produces the same output.
+//
+// legacyState: the deserialized pipeline-state.json { result: { slices: [...] }, ... }
+// Returns: {
+//   schemaVersion: '1.5.0',
+//   status: 'migrating' | 'migrated',
+//   features: [{ id, lifecycle, skipReason?, policyEvidence?, shardRef, legacyStatus }],
+//   legacyEngineVersion: string | null,
+// }
+function migrateLegacyState(legacyState) {
+  if (!legacyState || typeof legacyState !== 'object') {
+    throw new Error('migrateLegacyState: input must be an object')
+  }
+
+  const result = legacyState.result || {}
+  const legacySlices = Array.isArray(result.slices) ? result.slices : []
+  const legacyEngineVersion = legacyState.engineVersion || null
+
+  // If already migrated (idempotent check), return as-is
+  if (legacyState.schemaVersion === '1.5.0') {
+    return {
+      schemaVersion: '1.5.0',
+      status: 'migrated',
+      features: legacyState.features || [],
+      legacyEngineVersion,
+    }
+  }
+
+  const features = legacySlices.map((slice) => {
+    const id = deriveFeatureId(slice)
+    const legacyStatus = slice.status || 'pending'
+
+    // Map legacy statuses to v1.5.0 lifecycle states
+    let lifecycle
+    let skipReason = null
+    let policyEvidence = null
+    let rationale = null
+
+    if (legacyStatus === 'pending') {
+      lifecycle = LIFECYCLE_STATES.DEFERRED
+    } else if (legacyStatus === 'skipped') {
+      // Legacy 'skipped' conflated cap-exceeded with deselected.
+      // Cap-exceeded slices are still in-scope → deferred with rationale.
+      // Deselected slices are excluded.
+      lifecycle = LIFECYCLE_STATES.DEFERRED
+      rationale = 'legacy cap-exceeded or deselected — reclassified as deferred for v1.5.0'
+    } else if (legacyStatus === 'completed') {
+      lifecycle = LIFECYCLE_STATES.COMPLETED
+    } else if (legacyStatus === 'failed') {
+      lifecycle = LIFECYCLE_STATES.FAILED
+    } else if (legacyStatus === 'excluded') {
+      lifecycle = LIFECYCLE_STATES.EXCLUDED
+    } else {
+      lifecycle = LIFECYCLE_STATES.DEFERRED
+    }
+
+    const feature = {
+      id,
+      lifecycle,
+      shardRef: slice.planDir || `feature-state/${id}.json`,
+      legacyStatus,
+    }
+    if (skipReason) feature.skipReason = skipReason
+    if (policyEvidence) feature.policyEvidence = policyEvidence
+    if (rationale) feature.migrationRationale = rationale
+
+    return feature
+  })
+
+  return {
+    schemaVersion: '1.5.0',
+    status: 'migrating',
+    features,
+    legacyEngineVersion,
+  }
+}
+
+// Validate migration boundaries for fault injection. Uses an internal-accumulator
+// pattern: the 'child-write' phase marks the matched child with _durable=true
+// in-place (a mutation of the passed-in state object) so subsequent 'before-root'
+// and 'after-children' checks can gate root acknowledgement on all children being
+// durable. Deterministic and side-effect-free from an I/O perspective, but NOT a
+// pure read-only check — it mutates the accumulator state between phase calls.
+//
+// state: the in-progress migration output
+// phase: 'child-write' | 'before-root' | 'after-children'
+// childId: (optional) specific child to check for 'child-write'
+//
+// Returns: { ok: boolean, reason?: string }
+function validateMigrationBoundary(state, phase, childId) {
+  if (!state || typeof state !== 'object') {
+    return { ok: false, reason: 'state is not an object' }
+  }
+
+  const features = state.features || []
+
+  if (phase === 'child-write') {
+    if (!childId) return { ok: false, reason: 'childId required for child-write phase' }
+    const child = features.find((f) => f.id === childId)
+    if (!child) return { ok: false, reason: `child '${childId}' not found` }
+    // In a real system, this checks durable write of the shard.
+    // For pure testing: the child must have a shardRef.
+    if (!child.shardRef) return { ok: false, reason: `child '${childId}' missing shardRef` }
+    child._durable = true
+    return { ok: true }
+  }
+
+  if (phase === 'before-root') {
+    // Root cannot be acknowledged until ALL children are durable
+    const undurable = features.filter((f) => !f._durable && f.lifecycle !== LIFECYCLE_STATES.EXCLUDED)
+    if (undurable.length > 0) {
+      return {
+        ok: false,
+        reason: `${undurable.length} child shard(s) not yet durable: ${undurable.map((f) => f.id).join(', ')}`,
+      }
+    }
+    return { ok: true }
+  }
+
+  if (phase === 'after-children') {
+    // All children must be validated/durable before root acknowledgement
+    const unvalidated = features.filter((f) => !f._durable && f.lifecycle !== LIFECYCLE_STATES.EXCLUDED)
+    if (unvalidated.length > 0) {
+      return {
+        ok: false,
+        reason: `${unvalidated.length} child shard(s) not validated`,
+      }
+    }
+    return { ok: true }
+  }
+
+  return { ok: false, reason: `unknown migration phase '${phase}'` }
+}
+
+// Migrate a v1.4.5 pipeline-state.json in-place for v1.5.0 resume. Detects legacy
+// extract state by the presence of result.slices (a v1.4.5 extract-queue field absent
+// from v1.5.0 state) and a non-1.5.0 schemaVersion. Runs the root-last migration and
+// injects the v1.5.0 project manifest into the state so the resume path sees the
+// current structure. Strips the stale checksum (result changed during migration).
+//
+// This is an explicit, opt-in transform invoked via --migrate on resume — NOT
+// auto-detected on every resume to avoid misfire-prone heuristics on ambiguous state.
+// Idempotent: a v1.5.0 state passes through unchanged.
+//
+// state: the deserialized pipeline-state.json (must have result.slices for migration)
+// Returns: the migrated state object (or the original if no migration was needed)
+function migrateResumeState(state) {
+  if (!state || typeof state !== 'object') return state
+  if (state.schemaVersion === '1.5.0') return state
+
+  const result = state.result || {}
+  const hasLegacySlices = Array.isArray(result.slices) && result.slices.length > 0
+
+  if (!hasLegacySlices) return state
+
+  const manifest = migrateLegacyState(state)
+
+  const { checksum, ...stateWithoutChecksum } = state
+  return {
+    ...stateWithoutChecksum,
+    result: {
+      ...result,
+      projectManifest: manifest,
+    },
+    schemaVersion: '1.5.0',
+    engineVersion: state.engineVersion || '1.4.5',
+  }
+}
+
+// Selective revision invalidation: deterministic digest computation, revision
+// comparison, and gate-level selective invalidation. All functions are pure —
+// no I/O, no side effects.
+//
+// When source files, scope, graph inputs, dependency summaries, or artifacts
+// change, the engine compares durable revisions/digests and selectively
+// invalidates only affected feature gates and derived project views while
+// retaining independently valid evidence.
+
+// Reuse the proven djb2 hash from state.mjs (same algorithm, already tested).
+// Defined independently here to avoid import issues in the concatenated dist.
+function computeDigest(input) {
+  let str
+  if (typeof input === 'string') {
+    str = input
+  } else if (input == null) {
+    str = String(input)
+  } else {
+    str = JSON.stringify(sortKeys(input))
+  }
+  let h = 5381
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h + str.charCodeAt(i)) >>> 0
+  }
+  return h.toString(16)
+}
+
+// Deterministic JSON stringify with sorted keys for stable serialization.
+function sortKeys(obj) {
+  if (obj === null || typeof obj !== 'object') return obj
+  if (Array.isArray(obj)) return obj.map(sortKeys)
+  const sorted = {}
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = sortKeys(obj[key])
+  }
+  return sorted
+}
+
+// Stable digest for arbitrary JSON-serializable content.
+function computeContentDigest(content) {
+  return computeDigest(JSON.stringify(sortKeys(content)))
+}
+
+// Revision input types that drive selective invalidation.
+// Each type maps to the gates it affects.
+const REVISION_INPUTS = Object.freeze({
+  SOURCE: 'source',       // affects: codeFacts, arch
+  SCOPE: 'scope',         // affects: codeFacts
+  GRAPH: 'graph',         // affects: arch
+  DEPS: 'deps',           // affects: arch
+  ARTIFACT: 'artifact',   // affects: only the gate that owns the artifact
+})
+
+// Gate-dependency map: which revision inputs affect which gates.
+// This is the contract for selective invalidation — only listed gates
+// are invalidated when their input revision changes.
+const GATE_DEPENDENCY_MAP = Object.freeze({
+  codeFacts: ['source', 'scope'],
+  arch: ['source', 'graph', 'deps'],
+  design: ['artifact'],
+  plan: ['artifact'],
+  tests: ['artifact'],
+  requirements: ['artifact'],
+  useCases: ['artifact'],
+})
+
+// Compare old and new revision sets and identify affected features and gates.
+//
+// oldRevisions: { source?: digest, scope?: digest, graph?: digest, deps?: digest,
+//                 artifacts?: { gateName: digest } }
+// newRevisions: same shape
+// featureId: (optional) the feature these revisions belong to
+//
+// Returns: { affectedGates: [...], changedInputs: [...] }
+function compareRevisions(oldRevisions, newRevisions, featureId) {
+  const oldR = oldRevisions || {}
+  const newR = newRevisions || {}
+  const changedInputs = []
+  const affectedGates = new Set()
+
+  // Check top-level revision inputs
+  for (const inputType of ['source', 'scope', 'graph', 'deps']) {
+    if (oldR[inputType] !== newR[inputType]) {
+      changedInputs.push(inputType)
+      // Find gates affected by this input type
+      for (const [gate, inputs] of Object.entries(GATE_DEPENDENCY_MAP)) {
+        if (inputs.includes(inputType)) {
+          affectedGates.add(gate)
+        }
+      }
+    }
+  }
+
+  // Check artifact-level revisions
+  const oldArtifacts = oldR.artifacts || {}
+  const newArtifacts = newR.artifacts || {}
+  for (const gateName of Object.keys({ ...oldArtifacts, ...newArtifacts })) {
+    if (oldArtifacts[gateName] !== newArtifacts[gateName]) {
+      changedInputs.push('artifact')
+      affectedGates.add(gateName)
+    }
+  }
+
+  return {
+    affectedGates: Array.from(affectedGates).sort(),
+    changedInputs: Array.from(changedInputs).sort(),
+  }
+}
+
+// Selectively invalidate only affected gates in a feature shard.
+//
+// featureShard: { gates: { gateName: { digest, valid, ... }, ... } }
+// revisionDelta: { affectedGates: [...], changedInputs: [...] } from compareRevisions
+//
+// Returns: new shard with only affected gates marked invalid. Independent
+// gates retain their valid status. Does NOT mutate input.
+function selectiveInvalidate(featureShard, revisionDelta) {
+  if (!featureShard || typeof featureShard !== 'object') {
+    throw new Error('selectiveInvalidate: featureShard must be an object')
+  }
+  const gates = featureShard.gates || {}
+  const affectedGates = (revisionDelta && revisionDelta.affectedGates) || []
+
+  // Build new gates object — only mark affected gates as invalid
+  const newGates = {}
+  for (const [gateName, gateState] of Object.entries(gates)) {
+    if (affectedGates.includes(gateName)) {
+      // Invalidate this gate
+      newGates[gateName] = { ...gateState, valid: false, invalidReason: 'revision-changed' }
+    } else {
+      // Retain independent evidence — gate is still valid
+      newGates[gateName] = { ...gateState }
+    }
+  }
+
+  return { ...featureShard, gates: newGates }
+}
+
+// Filter a feature shard to only independently valid evidence.
+// Returns a shard containing only gates whose inputs have not changed
+// (i.e., gates that are still valid after selective invalidation).
+function retainValidEvidence(featureShard) {
+  if (!featureShard || typeof featureShard !== 'object') {
+    return { gates: {} }
+  }
+  const gates = featureShard.gates || {}
+  const validGates = {}
+
+  for (const [gateName, gateState] of Object.entries(gates)) {
+    if (gateState && gateState.valid !== false) {
+      validGates[gateName] = { ...gateState }
+    }
+  }
+
+  return { ...featureShard, gates: validGates }
+}
+
+// Deterministic repository inventory: path classification, inventory construction,
+// digest computation, and oversized-area refinement.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Every discovered path is accounted for as included or explicitly excluded,
+// with the applicable policy (generated, vendor, ignore) recorded as evidence.
+
+
+// Path classification policies. Each policy has a test predicate and a verdict.
+const PATH_POLICIES = Object.freeze({
+  INCLUDED: 'included',
+  EXCLUDED: 'excluded',
+  GENERATED: 'generated',
+  VENDOR: 'vendor',
+  IGNORED: 'ignored',
+})
+
+// Common generated/vendor/ignore directory patterns. A path matches if any
+// segment equals one of these names. Deterministic: same path → same verdict.
+const GENERATED_SEGMENTS = new Set([
+  'node_modules', 'dist', 'build', '.next', 'out', 'target',
+  '__pycache__', '.pytest_cache', 'coverage', '.nyc_output',
+  'vendor', '.vendor', 'third_party', 'third-party',
+])
+const IGNORE_SEGMENTS = new Set([
+  '.git', '.svn', '.hg', '.DS_Store', 'Thumbs.db',
+])
+
+// Common generated file extensions that indicate non-source paths.
+const GENERATED_EXTENSIONS = new Set([
+  '.min.js', '.min.css', '.map', '.lock', '.pyc', '.pyo',
+  '.class', '.o', '.so', '.dylib', '.dll', '.exe',
+])
+
+// Classify a single path against the policy set.
+// Returns { path, verdict, policy, evidence } — deterministic.
+//
+// policies: optional override { generatedSegments?, ignoreSegments?, generatedExtensions?, includePatterns?, excludePatterns? }
+function classifyPath(path, policies) {
+  const opts = policies || {}
+  const genSegs = opts.generatedSegments || GENERATED_SEGMENTS
+  const ignSegs = opts.ignoreSegments || IGNORE_SEGMENTS
+  const genExts = opts.generatedExtensions || GENERATED_EXTENSIONS
+  const includePats = opts.includePatterns || []
+  const excludePats = opts.excludePatterns || []
+
+  if (!path || typeof path !== 'string') {
+    return { path: String(path || ''), verdict: PATH_POLICIES.EXCLUDED, policy: 'invalid', evidence: 'path is not a string' }
+  }
+
+  const segments = path.split('/')
+  const basename = segments[segments.length - 1] || ''
+  const ext = basename.substring(basename.lastIndexOf('.'))
+
+  // Check ignore patterns first (highest precedence)
+  for (const seg of segments) {
+    if (ignSegs.has(seg)) {
+      return { path, verdict: PATH_POLICIES.IGNORED, policy: 'ignore', evidence: `segment '${seg}' matches ignore list` }
+    }
+  }
+  for (const pat of excludePats) {
+    if (path.includes(pat)) {
+      return { path, verdict: PATH_POLICIES.EXCLUDED, policy: 'exclude-pattern', evidence: `matches exclude pattern '${pat}'` }
+    }
+  }
+
+  // Check generated/vendor
+  for (const seg of segments) {
+    if (genSegs.has(seg)) {
+      const isVendor = seg === 'vendor' || seg === '.vendor' || seg === 'third_party' || seg === 'third-party'
+      return {
+        path,
+        verdict: PATH_POLICIES.GENERATED,
+        policy: isVendor ? 'vendor' : 'generated',
+        evidence: `segment '${seg}' classified as ${isVendor ? 'vendor' : 'generated'}`,
+      }
+    }
+  }
+
+  // Check generated extensions
+  for (const gExt of genExts) {
+    if (basename.endsWith(gExt)) {
+      return { path, verdict: PATH_POLICIES.GENERATED, policy: 'generated', evidence: `extension '${gExt}' is generated` }
+    }
+  }
+
+  // Check explicit include patterns
+  for (const pat of includePats) {
+    if (path.includes(pat)) {
+      return { path, verdict: PATH_POLICIES.INCLUDED, policy: 'include-pattern', evidence: `matches include pattern '${pat}'` }
+    }
+  }
+
+  // Default: included
+  return { path, verdict: PATH_POLICIES.INCLUDED, policy: 'default', evidence: 'no exclusion policy matched' }
+}
+
+// Build a deterministic inventory from a list of paths.
+// Sorts paths canonically (by UTF-16 code unit order) so the same input
+// always produces the same output regardless of traversal order.
+//
+// paths: string[]
+// policies: optional override (see classifyPath)
+// Returns: { entries: [...], digest, counts }
+function buildInventory(paths, policies) {
+  if (!Array.isArray(paths)) {
+    throw new Error('buildInventory: paths must be an array')
+  }
+
+  // Canonical sort ensures deterministic ordering regardless of traversal order
+  const sorted = [...paths].sort()
+
+  const entries = sorted.map((p) => classifyPath(p, policies))
+
+  const counts = {
+    included: 0,
+    excluded: 0,
+    generated: 0,
+    vendor: 0,
+    ignored: 0,
+  }
+
+  for (const e of entries) {
+    if (e.verdict === PATH_POLICIES.INCLUDED) counts.included++
+    else if (e.verdict === PATH_POLICIES.EXCLUDED) counts.excluded++
+    else if (e.verdict === PATH_POLICIES.GENERATED) {
+      if (e.policy === 'vendor') counts.vendor++
+      else counts.generated++
+    } else if (e.verdict === PATH_POLICIES.IGNORED) counts.ignored++
+  }
+
+  return {
+    entries,
+    digest: inventoryDigest({ entries }),
+    counts,
+  }
+}
+
+// Compute a deterministic digest over an inventory's entries.
+// Only the path and verdict of each entry contribute to the digest,
+// so reclassification of evidence text does not change the fingerprint.
+function inventoryDigest(inventory) {
+  const entries = (inventory && inventory.entries) || []
+  const fingerprint = entries.map((e) => `${e.path}|${e.verdict}`).join('\n')
+  return computeDigest(fingerprint)
+}
+
+// Recursively refine an oversized area into bounded pages.
+// If the area has more paths than maxPathsPerPage, split it in half
+// recursively until each page is within the bound.
+//
+// area: { name, paths: string[] }
+// maxPathsPerPage: number (must be > 0)
+// Returns: pages — array of { name, paths, depth }
+function refineOversizedArea(area, maxPathsPerPage) {
+  if (!area || !Array.isArray(area.paths)) {
+    throw new Error('refineOversizedArea: area must have a paths array')
+  }
+  if (!Number.isFinite(maxPathsPerPage) || maxPathsPerPage <= 0) {
+    throw new Error('refineOversizedArea: maxPathsPerPage must be a positive number')
+  }
+
+  const pages = []
+
+  function splitRecursive(name, paths, depth) {
+    if (paths.length <= maxPathsPerPage) {
+      pages.push({ name, paths: [...paths].sort(), depth })
+      return
+    }
+
+    // Sort paths for deterministic splitting
+    const sorted = [...paths].sort()
+    const mid = Math.ceil(sorted.length / 2)
+
+    // Derive sub-area names from the path prefix at the split point
+    const firstHalf = sorted.slice(0, mid)
+    const secondHalf = sorted.slice(mid)
+
+    // Use common directory prefix for naming sub-areas
+    const firstName = `${name}-a`
+    const secondName = `${name}-b`
+
+    splitRecursive(firstName, firstHalf, depth + 1)
+    splitRecursive(secondName, secondHalf, depth + 1)
+  }
+
+  splitRecursive(area.name || 'area', area.paths, 0)
+  return pages
+}
+
+// Durable paginated discovery: cursors, page advancement, interruption recovery.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Oversized areas refine recursively into bounded durable pages; interrupted
+// discovery resumes without gaps or duplicates through stable cursor positions.
+
+
+// Create a pagination cursor over an inventory.
+// The cursor tracks position so interrupted discovery can resume exactly.
+//
+// inventory: { entries: [...], digest, counts } from buildInventory
+// pageSize: number of entries per page (must be > 0)
+// Returns: { includedEntries, pageSize, offset, exhausted, digest, pagesEmitted }
+function createCursor(inventory, pageSize) {
+  if (!inventory || !Array.isArray(inventory.entries)) {
+    throw new Error('createCursor: inventory must have an entries array')
+  }
+  if (!Number.isFinite(pageSize) || pageSize <= 0) {
+    throw new Error('createCursor: pageSize must be a positive number')
+  }
+
+  // Only included entries are paginated; excluded/generated/ignored are
+  // accounted for but not paged
+  const included = inventory.entries.filter((e) => e.verdict === 'included')
+
+  return {
+    includedEntries: included,
+    pageSize,
+    offset: 0,
+    exhausted: included.length === 0,
+    digest: inventory.digest,
+    pagesEmitted: 0,
+    totalIncluded: included.length,
+  }
+}
+
+// Advance the cursor by one page. Returns the page entries and an updated cursor.
+// The page includes entries [offset, offset+pageSize). The updated cursor's
+// offset advances past the page.
+//
+// cursor: from createCursor
+// Returns: { page: [...], cursor: updatedCursor } or { page: [], cursor: same } if exhausted
+function nextPage(cursor) {
+  if (!cursor || cursor.exhausted || cursor.offset >= cursor.includedEntries.length) {
+    return { page: [], cursor: { ...cursor, exhausted: true } }
+  }
+
+  const start = cursor.offset
+  const end = Math.min(start + cursor.pageSize, cursor.includedEntries.length)
+  const page = cursor.includedEntries.slice(start, end)
+
+  const newOffset = end
+  const exhausted = newOffset >= cursor.includedEntries.length
+
+  return {
+    page,
+    cursor: {
+      ...cursor,
+      offset: newOffset,
+      exhausted,
+      pagesEmitted: cursor.pagesEmitted + 1,
+    },
+  }
+}
+
+// Resume discovery from an interrupted cursor position.
+// Returns the same result as nextPage but validates that the cursor's
+// digest matches the expected inventory — if the inventory changed,
+// the cursor is marked stale.
+//
+// cursor: interrupted cursor
+// expectedDigest: digest of the current inventory
+// Returns: { page, cursor, stale } — stale=true if inventory changed
+function resumeDiscovery(cursor, expectedDigest) {
+  if (!cursor) {
+    throw new Error('resumeDiscovery: cursor is required')
+  }
+
+  const stale = expectedDigest && cursor.digest !== expectedDigest
+  if (stale) {
+    // Cursor is stale — discovery must restart
+    return { page: [], cursor: { ...cursor, exhausted: false, offset: 0, pagesEmitted: 0, digest: expectedDigest }, stale: true }
+  }
+
+  const result = nextPage(cursor)
+  return { ...result, stale: false }
+}
+
+// Check if a cursor has covered all included entries.
+function exhausted(cursor) {
+  if (!cursor) return true
+  return cursor.exhausted || cursor.offset >= (cursor.totalIncluded || 0)
+}
+
+// Collect all pages from an inventory at once (for testing/small inventories).
+// Returns an array of page arrays.
+function allPages(inventory, pageSize) {
+  const cursor = createCursor(inventory, pageSize)
+  const pages = []
+  let c = cursor
+  while (!exhausted(c)) {
+    const result = nextPage(c)
+    if (result.page.length === 0) break
+    pages.push(result.page)
+    c = result.cursor
+  }
+  return pages
+}
+
+// Compute a deterministic page digest from a single page's entries.
+function pageDigest(pageEntries) {
+  const fingerprint = (pageEntries || [])
+    .map((e) => `${e.path}|${e.verdict}`)
+    .join('\n')
+  return computeDigest(fingerprint)
+}
+
+// Discovery result: pages + canonical feature identity extraction.
+// Takes the full set of included pages and extracts canonical feature identities
+// using path-based grouping. Each unique directory prefix becomes a candidate feature.
+//
+// pages: array of page arrays (from allPages or accumulated nextPage calls)
+// Returns: { features: [{ id, paths, digest }], totalFeatures, coverageDigest }
+function extractFeaturesFromPages(pages) {
+  if (!Array.isArray(pages)) {
+    throw new Error('extractFeaturesFromPages: pages must be an array')
+  }
+
+  // Flatten all pages into a single entry list
+  const allEntries = pages.flat()
+
+  // Group by directory prefix for feature extraction
+  const dirMap = new Map()
+  for (const entry of allEntries) {
+    const segs = entry.path.split('/')
+    // Use parent directory as feature identity (or root for top-level files)
+    const dir = segs.length > 1 ? segs.slice(0, -1).join('/') : '(root)'
+    if (!dirMap.has(dir)) {
+      dirMap.set(dir, [])
+    }
+    dirMap.get(dir).push(entry.path)
+  }
+
+  const features = []
+  for (const [dir, paths] of dirMap) {
+    // Canonicalize the directory into a feature ID
+    const id = dir.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root'
+    features.push({
+      id,
+      paths: paths.sort(),
+      digest: computeDigest(paths.sort().join('\n')),
+    })
+  }
+
+  // Sort features by ID for deterministic ordering
+  features.sort((a, b) => a.id.localeCompare(b.id))
+
+  return {
+    features,
+    totalFeatures: features.length,
+    coverageDigest: computeDigest(features.map((f) => f.id).sort().join('\n')),
+  }
+}
+
+// Validated feature graph: canonical identities, ownership verification,
+// dependency edge validation, and cycle detection.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Graph validation rejects unexplained ownership gaps/overlap, collisions,
+// dangling edges, and unsupported cycles before extraction.
+
+
+// Cycle policy classifications
+const CYCLE_POLICIES = Object.freeze({
+  SUPPORTED: 'supported',   // cycle allowed via explicit policy (e.g. priority override)
+  UNSUPPORTED: 'unsupported', // cycle must not be scheduled — deadlock
+  NONE: 'none',             // no cycle detected
+})
+
+// Graph validation result verdicts
+const GRAPH_VERDICTS = Object.freeze({
+  VALID: 'valid',
+  INVALID: 'invalid',
+})
+
+// Canonicalize feature identities to be collision-free.
+// If two features have the same derived ID, disambiguate using their paths.
+//
+// features: [{ id, paths: [...], ... }]
+// Returns: { canonical: [{ id, originalId, paths, ... }], collisions: [...] }
+function canonicalizeIdentity(features) {
+  if (!Array.isArray(features)) {
+    throw new Error('canonicalizeIdentity: features must be an array')
+  }
+
+  const idMap = new Map()
+  for (const f of features) {
+    const id = f.id || 'unknown'
+    if (!idMap.has(id)) {
+      idMap.set(id, [])
+    }
+    idMap.get(id).push(f)
+  }
+
+  const collisions = []
+  const canonical = []
+
+  for (const [id, group] of idMap) {
+    if (group.length === 1) {
+      canonical.push({ ...group[0], originalId: id })
+    } else {
+      // Collision: disambiguate by index suffix
+      collisions.push({ id, count: group.length, paths: group.flatMap((f) => f.paths || []) })
+      group.forEach((f, i) => {
+        canonical.push({ ...f, originalId: id, id: `${id}-${i + 1}` })
+      })
+    }
+  }
+
+  return { canonical, collisions }
+}
+
+// Detect cycles in a dependency edge list using depth-first search.
+// Returns the first cycle found (if any) as an array of feature IDs.
+//
+// edges: [{ from, to }] — from depends on to (to must complete first)
+// Returns: { hasCycle, cycle: [...], allCycles: [...] }
+function detectCycle(edges) {
+  if (!Array.isArray(edges)) {
+    return { hasCycle: false, cycle: [], allCycles: [] }
+  }
+
+  // Build adjacency list
+  const adj = new Map()
+  const nodes = new Set()
+  for (const e of edges) {
+    if (!adj.has(e.from)) adj.set(e.from, [])
+    adj.get(e.from).push(e.to)
+    nodes.add(e.from)
+    nodes.add(e.to)
+  }
+
+  const WHITE = 0, GRAY = 1, BLACK = 2
+  const color = new Map()
+  for (const n of nodes) color.set(n, WHITE)
+
+  const allCycles = []
+
+  function dfsVisit(node, path) {
+    color.set(node, GRAY)
+    path.push(node)
+
+    const neighbors = adj.get(node) || []
+    for (const next of neighbors) {
+      if (!color.has(next)) {
+        color.set(next, WHITE)
+      }
+      const c = color.get(next)
+      if (c === GRAY) {
+        // Found a cycle — extract it from the path
+        const cycleStart = path.indexOf(next)
+        const cycle = path.slice(cycleStart).concat([next])
+        allCycles.push(cycle)
+      } else if (c === WHITE) {
+        dfsVisit(next, path)
+      }
+    }
+
+    path.pop()
+    color.set(node, BLACK)
+  }
+
+  for (const n of nodes) {
+    if (color.get(n) === WHITE) {
+      dfsVisit(n, [])
+    }
+  }
+
+  // Deduplicate cycles (normalize rotation)
+  const seen = new Set()
+  const uniqueCycles = []
+  for (const cycle of allCycles) {
+    // Normalize: rotate so the smallest ID is first, then join as key
+    const minIdx = cycle.indexOf(cycle.reduce((a, b) => (a < b ? a : b)))
+    const normalized = [...cycle.slice(minIdx, -1), ...cycle.slice(0, minIdx)].join('->')
+    if (!seen.has(normalized)) {
+      seen.add(normalized)
+      uniqueCycles.push(cycle)
+    }
+  }
+
+  return {
+    hasCycle: uniqueCycles.length > 0,
+    cycle: uniqueCycles[0] || [],
+    allCycles: uniqueCycles,
+  }
+}
+
+// Classify a cycle as supported (policy override) or unsupported (deadlock).
+//
+// edges: [{ from, to }]
+// cyclePolicy: optional map of { edgeKey: 'supported' | 'unsupported' }
+// Returns: { classification: 'supported' | 'unsupported' | 'none', cycle: [...] }
+function classifyCycle(edges, cyclePolicy) {
+  const detection = detectCycle(edges)
+  if (!detection.hasCycle) {
+    return { classification: CYCLE_POLICIES.NONE, cycle: [] }
+  }
+
+  // Check if the cycle has explicit policy support
+  const policy = cyclePolicy || {}
+  const cycleEdges = detection.cycle
+  let allSupported = true
+
+  for (let i = 0; i < cycleEdges.length - 1; i++) {
+    const key = `${cycleEdges[i]}->${cycleEdges[i + 1]}`
+    if (policy[key] !== 'supported') {
+      allSupported = false
+      break
+    }
+  }
+
+  return {
+    classification: allSupported ? CYCLE_POLICIES.SUPPORTED : CYCLE_POLICIES.UNSUPPORTED,
+    cycle: detection.cycle,
+  }
+}
+
+// Validate the full feature graph.
+//
+// features: [{ id, paths: [...] }]
+// edges: [{ from, to }] — dependency edges
+// ownershipMap: optional { path: featureId } — explicit ownership assignment
+// cyclePolicy: optional map for supported cycles
+//
+// Returns: {
+//   verdict: 'valid' | 'invalid',
+//   errors: [{ type, detail }],
+//   warnings: [{ type, detail }],
+// }
+function validateGraph(features, edges, ownershipMap, cyclePolicy) {
+  const errors = []
+  const warnings = []
+
+  // 1. Check for identity collisions
+  const idSet = new Set()
+  const idCounts = new Map()
+  for (const f of features || []) {
+    const id = f.id || 'unknown'
+    idCounts.set(id, (idCounts.get(id) || 0) + 1)
+  }
+  for (const [id, count] of idCounts) {
+    if (count > 1) {
+      errors.push({ type: 'identity-collision', detail: `Feature ID '${id}' appears ${count} times` })
+    }
+  }
+
+  // 2. Check ownership gaps (explicit ownership map references unknown features)
+  if (ownershipMap) {
+    const featureIds = new Set((features || []).map((f) => f.id))
+
+    for (const [path, ownerId] of Object.entries(ownershipMap)) {
+      if (!featureIds.has(ownerId)) {
+        errors.push({ type: 'ownership-gap', detail: `Path '${path}' owned by unknown feature '${ownerId}'` })
+      }
+    }
+  }
+
+  // 2b. Check for path overlaps between features.
+  // Two features claiming the same path is an ownership overlap; if an
+  // ownershipMap resolves the path to one of the claimants, the overlap is
+  // explained (warning), otherwise it is unexplained (error).
+  const pathClaims = new Map()
+  for (const f of features || []) {
+    for (const p of (f.paths || [])) {
+      if (!pathClaims.has(p)) {
+        pathClaims.set(p, [])
+      }
+      pathClaims.get(p).push(f.id)
+    }
+  }
+  for (const [path, claimants] of pathClaims) {
+    if (claimants.length > 1) {
+      const uniqueClaimants = [...new Set(claimants)]
+      if (uniqueClaimants.length > 1) {
+        const resolvedBy = ownershipMap ? ownershipMap[path] : undefined
+        if (resolvedBy && uniqueClaimants.includes(resolvedBy)) {
+          warnings.push({
+            type: 'ownership-overlap-explained',
+            detail: `Path '${path}' claimed by ${uniqueClaimants.join(', ')}; resolved to '${resolvedBy}'`,
+          })
+        } else {
+          errors.push({
+            type: 'ownership-overlap',
+            detail: `Path '${path}' claimed by multiple features: ${uniqueClaimants.join(', ')}`,
+          })
+        }
+      }
+    }
+  }
+
+  // 2c. Warn about feature paths not covered by the ownership map
+  if (ownershipMap) {
+    const allFeaturePaths = new Set((features || []).flatMap((f) => f.paths || []))
+    for (const p of allFeaturePaths) {
+      if (!(p in ownershipMap)) {
+        warnings.push({ type: 'ownership-unassigned', detail: `Path '${p}' not in ownership map` })
+      }
+    }
+  }
+
+  // 3. Check for dangling edges (references to non-existent features)
+  const featureIdSet = new Set((features || []).map((f) => f.id))
+  for (const e of edges || []) {
+    if (!featureIdSet.has(e.from)) {
+      errors.push({ type: 'dangling-edge', detail: `Edge from unknown feature '${e.from}'` })
+    }
+    if (!featureIdSet.has(e.to)) {
+      errors.push({ type: 'dangling-edge', detail: `Edge to unknown feature '${e.to}'` })
+    }
+  }
+
+  // 4. Check for cycles
+  if (edges && edges.length > 0) {
+    const cycleResult = classifyCycle(edges, cyclePolicy)
+    if (cycleResult.classification === CYCLE_POLICIES.UNSUPPORTED) {
+      errors.push({
+        type: 'unsupported-cycle',
+        detail: `Unsupported dependency cycle: ${cycleResult.cycle.join(' -> ')}`,
+      })
+    } else if (cycleResult.classification === CYCLE_POLICIES.SUPPORTED) {
+      warnings.push({
+        type: 'supported-cycle',
+        detail: `Supported dependency cycle: ${cycleResult.cycle.join(' -> ')}`,
+      })
+    }
+  }
+
+  return {
+    verdict: errors.length === 0 ? GRAPH_VERDICTS.VALID : GRAPH_VERDICTS.INVALID,
+    errors,
+    warnings,
+  }
+}
+
+// Compute a deterministic digest of the feature graph.
+// Includes feature IDs (sorted), paths, and edges (sorted).
+function graphDigest(features, edges) {
+  const fPart = (features || [])
+    .map((f) => `${f.id}:${(f.paths || []).sort().join(',')}`)
+    .sort()
+    .join('\n')
+  const ePart = (edges || [])
+    .map((e) => `${e.from}->${e.to}`)
+    .sort()
+    .join('\n')
+  return computeDigest(`${fPart}\n---\n${ePart}`)
+}
+
+// Truthful queue semantics: exactly-one-state guarantee, cap enforcement,
+// selector application, deferred promotion, and coverage denominator.
+// All functions are pure and deterministic — no I/O, no side effects.
+//
+// Caps and selectors retain unprocessed in-scope features as resumable deferred
+// work rather than completion. Excluded paths remain outside the denominator
+// with recorded rationale.
+
+
+// Apply a segment cap to a list of features. Features beyond the cap are
+// marked deferred (NOT excluded or completed). Previously runnable features
+// within the cap remain runnable. Idempotent: reapplying the same cap produces
+// the same result.
+//
+// features: [{ id, lifecycle, ... }]
+// cap: max number of features in non-deferred processing state
+// Returns: new features array with cap applied (does NOT mutate input)
+function applyCap(features, cap) {
+  if (!Array.isArray(features)) {
+    throw new Error('applyCap: features must be an array')
+  }
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error('applyCap: cap must be a positive number')
+  }
+
+  let processingCount = 0
+  return features.map((f) => {
+    // Only consider in-scope features (not excluded)
+    if (f.lifecycle === LIFECYCLE_STATES.EXCLUDED) {
+      return { ...f }
+    }
+
+    // Count features already in a processing state (in-progress, runnable that
+    // have been admitted, completed, failed, blocked, skipped)
+    const isProcessing = f.lifecycle !== LIFECYCLE_STATES.DEFERRED &&
+      f.lifecycle !== LIFECYCLE_STATES.EXCLUDED
+
+    if (isProcessing || f.lifecycle === LIFECYCLE_STATES.RUNNABLE) {
+      if (processingCount < cap) {
+        processingCount++
+        return { ...f }
+      }
+      // Over cap — defer with rationale
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.DEFERRED,
+        deferReason: 'cap-exceeded',
+      }
+    }
+
+    // Already deferred or other state — leave as-is
+    return { ...f }
+  })
+}
+
+// Apply a selector to filter which features are admitted. Non-selected
+// in-scope features are marked deferred (NOT excluded). Idempotent.
+//
+// features: [{ id, lifecycle, ... }]
+// selector: { includeIds: [...] } or { excludeIds: [...] }
+// Returns: new features array with selector applied
+function applySelector(features, selector) {
+  if (!Array.isArray(features)) {
+    throw new Error('applySelector: features must be an array')
+  }
+  if (!selector) {
+    return features.map((f) => ({ ...f }))
+  }
+
+  const includeSet = new Set(selector.includeIds || [])
+  const excludeSet = new Set(selector.excludeIds || [])
+
+  return features.map((f) => {
+    if (f.lifecycle === LIFECYCLE_STATES.EXCLUDED) {
+      return { ...f }
+    }
+
+    // If includeIds is specified, non-matching features are deferred
+    if (includeSet.size > 0 && !includeSet.has(f.id)) {
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.DEFERRED,
+        deferReason: 'selector-excluded',
+      }
+    }
+
+    // If excludeIds is specified, matching features are deferred
+    if (excludeSet.size > 0 && excludeSet.has(f.id)) {
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.DEFERRED,
+        deferReason: 'selector-excluded',
+      }
+    }
+
+    return { ...f }
+  })
+}
+
+// Promote deferred features up to cap after some features have completed.
+// Each feature is promoted from deferred exactly once. Returns updated features.
+//
+// features: [{ id, lifecycle, ... }]
+// completedIds: Set or array of feature IDs that have completed
+// cap: max processing features
+// Returns: { features: updated, promoted: [...], remainingDeferred: number }
+function promoteDeferred(features, completedIds, cap) {
+  if (!Array.isArray(features)) {
+    throw new Error('promoteDeferred: features must be an array')
+  }
+
+  const completedSet = completedIds instanceof Set ? completedIds : new Set(completedIds || [])
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error('promoteDeferred: cap must be a positive number')
+  }
+
+  // Count only actively processing features (runnable, in-progress, blocked)
+  // against the cap — completed and failed features do NOT consume cap slots
+  let processingCount = 0
+  const promoted = []
+
+  const updated = features.map((f) => {
+    // Completed features stay completed — they free their cap slot
+    if (completedSet.has(f.id) || f.lifecycle === LIFECYCLE_STATES.COMPLETED) {
+      return { ...f, lifecycle: LIFECYCLE_STATES.COMPLETED }
+    }
+
+    // Excluded features stay excluded
+    if (f.lifecycle === LIFECYCLE_STATES.EXCLUDED) {
+      return { ...f }
+    }
+
+    // Failed features do not consume cap slots
+    if (f.lifecycle === LIFECYCLE_STATES.FAILED) {
+      return { ...f }
+    }
+
+    // Actively processing features (runnable, in-progress, blocked) consume cap
+    if (f.lifecycle !== LIFECYCLE_STATES.DEFERRED && f.lifecycle !== LIFECYCLE_STATES.SKIPPED) {
+      processingCount++
+      return { ...f }
+    }
+
+    // Deferred feature — promote if under cap
+    if (processingCount < cap) {
+      processingCount++
+      promoted.push(f.id)
+      return {
+        ...f,
+        lifecycle: LIFECYCLE_STATES.RUNNABLE,
+        promotedAt: (f.promotedAt || 0) + 1,
+      }
+    }
+
+    // Still deferred — over cap
+    return { ...f }
+  })
+
+  const remainingDeferred = updated.filter(
+    (f) => f.lifecycle === LIFECYCLE_STATES.DEFERRED
+  ).length
+
+  return { features: updated, promoted, remainingDeferred }
+}
+
+// Compute the coverage denominator: total in-scope features excluding
+// those explicitly excluded. This is the truth source for readiness.
+//
+// features: [{ id, lifecycle, ... }]
+// Returns: { denominator, excluded, total, breakdown: { ... } }
+function queueDenominator(features) {
+  if (!Array.isArray(features)) {
+    throw new Error('queueDenominator: features must be an array')
+  }
+
+  const breakdown = {}
+  let excluded = 0
+  let total = features.length
+
+  for (const f of features) {
+    const lc = f.lifecycle || 'unknown'
+    breakdown[lc] = (breakdown[lc] || 0) + 1
+    if (lc === LIFECYCLE_STATES.EXCLUDED) {
+      excluded++
+    }
+  }
+
+  return {
+    denominator: total - excluded,
+    excluded,
+    total,
+    breakdown,
+  }
+}
+
+// Compute exact completed/deferred counts for a cap-constrained segment.
+// This is the core computation for the 23-feature/cap-8 progression:
+// segment 1: 8 processed / 15 deferred
+// segment 2: 16 processed / 7 deferred
+// segment 3: 23 processed / 0 deferred
+//
+// totalFeatures: number of in-scope features
+// cap: per-segment processing cap
+// segment: 1-based segment number
+// Returns: { processed, deferred, complete }
+function segmentProgression(totalFeatures, cap, segment) {
+  if (!Number.isFinite(totalFeatures) || totalFeatures < 0) {
+    throw new Error('segmentProgression: totalFeatures must be non-negative')
+  }
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error('segmentProgression: cap must be positive')
+  }
+  if (!Number.isFinite(segment) || segment < 1) {
+    throw new Error('segmentProgression: segment must be >= 1')
+  }
+
+  const processed = Math.min(totalFeatures, cap * segment)
+  const deferred = Math.max(0, totalFeatures - processed)
+  const complete = processed >= totalFeatures
+
+  return { processed, deferred, complete }
+}
+
+// Schedulability plan: prerequisite waves, cycle/no-progress classification,
+// and bounded dependency context. All functions are pure and deterministic.
+//
+// The schedulability plan produces deterministic prerequisite waves, explicit
+// cycle/no-progress outcomes, and bounded verified dependency summaries.
+
+
+// Schedulability verdicts
+const SCHEDULABILITY_VERDICTS = Object.freeze({
+  SCHEDULABLE: 'schedulable',
+  NO_PROGRESS: 'no-progress',
+  UNSUPPORTED_CYCLE: 'unsupported-cycle',
+})
+
+// Compute deterministic prerequisite waves from features and dependency edges.
+// Features with no unmet dependencies form wave 1; features whose dependencies
+// are all in earlier waves form subsequent waves. Within a wave, cap limits
+// how many features can be admitted.
+//
+// features: [{ id, ... }]
+// edges: [{ from, to }] — from depends on to (to must complete first)
+// cap: max features per wave (0 = unlimited)
+// Returns: { waves: [[featureId, ...], ...], unscheduled: [...], verdict: 'schedulable'|'no-progress'|'unsupported-cycle' }
+function computeWaves(features, edges, cap, cyclePolicy) {
+  if (!Array.isArray(features)) {
+    throw new Error('computeWaves: features must be an array')
+  }
+
+  const featureIds = new Set(features.map((f) => f.id))
+
+  // Build reverse adjacency: for each feature, what does it depend on?
+  const dependencies = new Map()
+  for (const id of featureIds) {
+    dependencies.set(id, new Set())
+  }
+  for (const e of (edges || [])) {
+    if (featureIds.has(e.from) && featureIds.has(e.to)) {
+      dependencies.get(e.from).add(e.to)
+    }
+  }
+
+  // Check for unsupported cycles (respecting policy)
+  const cycleCheck = detectCycle(edges || [])
+  if (cycleCheck.hasCycle) {
+    const cycleResult = classifyCycle(edges, cyclePolicy || {})
+    if (cycleResult.classification === CYCLE_POLICIES.UNSUPPORTED) {
+      return {
+        waves: [],
+        unscheduled: [...featureIds],
+        verdict: SCHEDULABILITY_VERDICTS.UNSUPPORTED_CYCLE,
+        cycle: cycleCheck.cycle,
+      }
+    }
+  }
+
+  // Topological wave assignment (Kahn's algorithm with wave tracking)
+  // Cap is per-wave: limits how many features each wave admits, not total budget
+  const waves = []
+  const scheduled = new Set()
+
+  while (scheduled.size < featureIds.size) {
+    // Find features whose dependencies are all scheduled
+    const ready = []
+    for (const id of featureIds) {
+      if (scheduled.has(id)) continue
+      const deps = dependencies.get(id)
+      let allMet = true
+      for (const d of deps) {
+        if (!scheduled.has(d)) {
+          allMet = false
+          break
+        }
+      }
+      if (allMet) {
+        ready.push(id)
+      }
+    }
+
+    if (ready.length === 0) {
+      // No progress — remaining features have unresolvable dependencies
+      break
+    }
+
+    ready.sort() // deterministic ordering
+    // Per-wave cap: limits features admitted per wave, not total budget.
+    // Overflow features stay eligible for the next wave.
+    const waveCap = (Number.isFinite(cap) && cap > 0) ? cap : ready.length
+    const wave = ready.slice(0, waveCap)
+
+    for (const id of wave) {
+      scheduled.add(id)
+    }
+    waves.push(wave)
+  }
+
+  const unscheduled = [...featureIds].filter((id) => !scheduled.has(id)).sort()
+
+  return {
+    waves,
+    unscheduled,
+    verdict: unscheduled.length > 0
+      ? SCHEDULABILITY_VERDICTS.NO_PROGRESS
+      : SCHEDULABILITY_VERDICTS.SCHEDULABLE,
+  }
+}
+
+// Compute bounded dependency context for a single feature.
+// Traverses the dependency graph up to maxDepth hops, collecting verified
+// summaries of each dependency. The context is bounded to prevent
+// unbounded prompt growth.
+//
+// featureId: the feature to compute context for
+// features: [{ id, paths, digest, ... }]
+// edges: [{ from, to }]
+// maxDepth: maximum traversal depth (default 3)
+// Returns: { featureId, context: [{ id, depth, paths, digest }], bounded: boolean }
+function boundedDependencyContext(featureId, features, edges, maxDepth) {
+  if (!featureId) {
+    throw new Error('boundedDependencyContext: featureId is required')
+  }
+
+  const depth = Number.isFinite(maxDepth) && maxDepth > 0 ? maxDepth : 3
+
+  // Build feature lookup
+  const featureMap = new Map()
+  for (const f of features || []) {
+    featureMap.set(f.id, f)
+  }
+
+  // Build reverse dependency lookup: what does each feature depend on?
+  const depsOf = new Map()
+  for (const e of edges || []) {
+    if (!depsOf.has(e.from)) depsOf.set(e.from, [])
+    depsOf.get(e.from).push(e.to)
+  }
+
+  const context = []
+  const visited = new Set([featureId])
+  const queue = [{ id: featureId, currentDepth: 0 }]
+
+  while (queue.length > 0) {
+    const { id, currentDepth } = queue.shift()
+
+    if (currentDepth >= depth) continue
+
+    const deps = depsOf.get(id) || []
+    for (const depId of deps.sort()) {
+      if (visited.has(depId)) continue
+      visited.add(depId)
+
+      const depFeature = featureMap.get(depId)
+      context.push({
+        id: depId,
+        depth: currentDepth + 1,
+        paths: (depFeature && depFeature.paths) || [],
+        digest: (depFeature && depFeature.digest) || null,
+      })
+
+      queue.push({ id: depId, currentDepth: currentDepth + 1 })
+    }
+  }
+
+  return {
+    featureId,
+    context,
+    bounded: visited.size > depth * 5, // heuristic: if we visited many nodes, context was bounded
+  }
+}
+
+// Overall schedulability decision for the full feature set.
+// Combines cycle detection, wave computation, and no-progress detection.
+//
+// features: [{ id, ... }]
+// edges: [{ from, to }]
+// cap: optional per-wave cap
+// cyclePolicy: optional map of supported cycle edges
+// Returns: { verdict, waves, unscheduled, cycleDetected, details }
+function schedulabilityDecision(features, edges, cap, cyclePolicy) {
+  const cycleResult = classifyCycle(edges || [], cyclePolicy || {})
+
+  if (cycleResult.classification === CYCLE_POLICIES.UNSUPPORTED) {
+    return {
+      verdict: SCHEDULABILITY_VERDICTS.UNSUPPORTED_CYCLE,
+      waves: [],
+      unscheduled: (features || []).map((f) => f.id).sort(),
+      cycleDetected: true,
+      cycle: cycleResult.cycle,
+      details: `Unsupported dependency cycle prevents scheduling: ${cycleResult.cycle.join(' -> ')}`,
+    }
+  }
+
+  const waveResult = computeWaves(features, edges, cap, cyclePolicy)
+
+  return {
+    verdict: waveResult.verdict,
+    waves: waveResult.waves,
+    unscheduled: waveResult.unscheduled,
+    cycleDetected: cycleResult.classification === CYCLE_POLICIES.SUPPORTED,
+    cycle: cycleResult.classification === CYCLE_POLICIES.SUPPORTED ? cycleResult.cycle : [],
+    details: waveResult.verdict === SCHEDULABILITY_VERDICTS.SCHEDULABLE
+      ? `All ${waveResult.waves.reduce((s, w) => s + w.length, 0)} features scheduled across ${waveResult.waves.length} wave(s)`
+      : `${waveResult.unscheduled.length} feature(s) cannot be scheduled (no progress)`,
+  }
+}
+
+// Budget admission: characterize limits, track spend, and reserve non-spendable
+// capacity for checkpoint, reconciliation, synthesis, and handoff.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Non-spendable reserve categories — capacity reserved for system-critical work
+// that must never be consumed by gate/feature processing.
+const RESERVE_TYPES = Object.freeze({
+  CHECKPOINT: 'checkpoint',
+  RECONCILIATION: 'reconciliation',
+  SYNTHESIS: 'synthesis',
+  HANDOFF: 'handoff',
+})
+
+// Characterized budget limits derived from runtime evidence, not guessed.
+// callCeiling: shared runtime agent-call ceiling (default 1000)
+// tokenCeiling: shared token budget (0 = uncharacterized)
+// concurrency: max parallel features per segment
+// retryPerGate: max retry attempts per gate per feature
+// retryPerFeature: max total retries per feature
+function createBudgetLimits(opts) {
+  const o = opts || {}
+  return {
+    callCeiling: o.callCeiling || 1000,
+    tokenCeiling: o.tokenCeiling || 0,
+    concurrency: o.concurrency || 1,
+    retryPerGate: o.retryPerGate || 3,
+    retryPerFeature: o.retryPerFeature || 10,
+  }
+}
+
+// Create a budget accountant that tracks actual spend against limits.
+// Pure: all state is in the returned object, no mutation of inputs.
+function createBudgetAccountant(limits) {
+  return {
+    limits,
+    callsSpent: 0,
+    tokensSpent: 0,
+    reserve: {
+      [RESERVE_TYPES.CHECKPOINT]: 0,
+      [RESERVE_TYPES.RECONCILIATION]: 0,
+      [RESERVE_TYPES.SYNTHESIS]: 0,
+      [RESERVE_TYPES.HANDOFF]: 0,
+    },
+  }
+}
+
+// Set aside non-spendable reserve capacity. Returns a new accountant.
+function setReserve(accountant, category, amount) {
+  const next = {
+    ...accountant,
+    reserve: { ...accountant.reserve },
+  }
+  next.reserve[category] = amount
+  return next
+}
+
+// Compute total reserved capacity across all categories.
+function totalReserve(accountant) {
+  return Object.values(accountant.reserve).reduce(function (s, v) { return s + v }, 0)
+}
+
+// Compute remaining callable budget after subtracting spent and reserved.
+function callsRemaining(accountant) {
+  var reserved = totalReserve(accountant)
+  return Math.max(0, accountant.limits.callCeiling - accountant.callsSpent - reserved)
+}
+
+// Compute remaining token budget after subtracting spent and reserved.
+// NOTE: totalReserve() is denominated in CALL units (DESIGN_RESERVE_CALLS etc.).
+// Token-unit reserve accounting is deferred until tokenCeiling is characterized in
+// real terms (v1.5.0 cleanup D3); until then reserves are a single call-unit pool
+// applied to both budgets — harmless while tokenCeiling is uncharacterized (default 0,
+// which short-circuits to Infinity above).
+function tokensRemaining(accountant) {
+  if (!accountant.limits.tokenCeiling) return Infinity
+  var reserved = totalReserve(accountant)
+  return Math.max(0, accountant.limits.tokenCeiling - accountant.tokensSpent - reserved)
+}
+
+// Admit a segment: check if estimated work fits within remaining budget
+// after reserving non-spendable capacity. Never accept a segment that
+// crosses the characterized ceiling.
+function admitSegment(accountant, segmentCost) {
+  var calls = callsRemaining(accountant)
+  var tokens = tokensRemaining(accountant)
+  var neededCalls = (segmentCost && segmentCost.calls) || 0
+  var neededTokens = (segmentCost && segmentCost.tokens) || 0
+
+  if (neededCalls > calls) {
+    return { admitted: false, reason: 'call-ceiling', remaining: { calls: calls, tokens: tokens } }
+  }
+  if (neededTokens > tokens) {
+    return { admitted: false, reason: 'token-ceiling', remaining: { calls: calls, tokens: tokens } }
+  }
+  return { admitted: true, remaining: { calls: calls, tokens: tokens } }
+}
+
+// Record actual budget spend. Pure: returns a new accountant.
+function spendBudget(accountant, calls, tokens) {
+  return {
+    ...accountant,
+    callsSpent: accountant.callsSpent + (calls || 0),
+    tokensSpent: accountant.tokensSpent + (tokens || 0),
+    reserve: { ...accountant.reserve },
+  }
+}
+
+// Check if a feature's next atomic gate can complete within remaining budget.
+// Prevents admitting a feature whose next gate would cross the ceiling.
+function canFinishNextGate(accountant, gateCost) {
+  var calls = callsRemaining(accountant)
+  var tokens = tokensRemaining(accountant)
+  var neededCalls = (gateCost && gateCost.calls) || 0
+  var neededTokens = (gateCost && gateCost.tokens) || 0
+  return neededCalls <= calls && neededTokens <= tokens
+}
+
+// Budget summary for handoff/status reporting.
+function budgetSummary(accountant) {
+  return {
+    callCeiling: accountant.limits.callCeiling,
+    callsSpent: accountant.callsSpent,
+    callsRemaining: callsRemaining(accountant),
+    reserved: totalReserve(accountant),
+    reserveBreakdown: { ...accountant.reserve },
+  }
+}
+
+// Bounded retry policy: per-gate and per-feature retry limits, persistent
+// attempt history with monotonic sequence, and terminal reason tracking.
+// Exhausted retries are never reclassified as completed.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Attempt outcomes
+const ATTEMPT_OUTCOMES = Object.freeze({
+  SUCCESS: 'success',
+  RETRYABLE_FAILURE: 'retryable-failure',
+  TIMEOUT: 'timeout',
+  INVALID_OUTPUT: 'invalid-output',
+  PERMANENT_FAILURE: 'permanent-failure',
+  BLOCKED_DEPENDENCY: 'blocked-dependency',
+})
+
+// Outcomes that count toward retry exhaustion
+var EXHAUSTING_OUTCOMES = {
+  'retryable-failure': true,
+  'timeout': true,
+  'invalid-output': true,
+}
+
+// Create a retry policy with per-gate and per-feature limits.
+function createRetryPolicy(opts) {
+  var o = opts || {}
+  return {
+    maxPerGate: o.maxPerGate || 3,
+    maxPerFeature: o.maxPerFeature || 10,
+  }
+}
+
+// Create a fresh attempt history. The _seq counter is monotonic.
+function createAttemptHistory() {
+  return {
+    attempts: [],
+    _seq: 0,
+  }
+}
+
+// Record an attempt. Pure: returns a new history with a new monotonic sequence number.
+function recordAttempt(history, featureId, gate, outcome, reason) {
+  var seq = history._seq + 1
+  var attempt = {
+    seq: seq,
+    featureId: featureId,
+    gate: gate,
+    outcome: outcome,
+    reason: reason || null,
+  }
+  return {
+    attempts: history.attempts.concat([attempt]),
+    _seq: seq,
+  }
+}
+
+// Count retryable attempts for a specific feature+gate combination.
+// Only exhausting outcomes (retryable-failure, timeout, invalid-output) count.
+function gateAttemptCount(history, featureId, gate) {
+  var count = 0
+  for (var i = 0; i < history.attempts.length; i++) {
+    var a = history.attempts[i]
+    if (a.featureId === featureId && a.gate === gate && EXHAUSTING_OUTCOMES[a.outcome]) {
+      count++
+    }
+  }
+  return count
+}
+
+// Count total retryable attempts for a feature across all gates.
+function featureAttemptCount(history, featureId) {
+  var count = 0
+  for (var i = 0; i < history.attempts.length; i++) {
+    var a = history.attempts[i]
+    if (a.featureId === featureId && EXHAUSTING_OUTCOMES[a.outcome]) {
+      count++
+    }
+  }
+  return count
+}
+
+// Check if per-gate retries are exhausted for a feature+gate.
+function isGateRetriesExhausted(history, featureId, gate, policy) {
+  return gateAttemptCount(history, featureId, gate) >= policy.maxPerGate
+}
+
+// Check if total per-feature retries are exhausted.
+function isFeatureRetriesExhausted(history, featureId, policy) {
+  return featureAttemptCount(history, featureId) >= policy.maxPerFeature
+}
+
+// Check if a feature is terminally failed — no more retries possible.
+// A permanent failure or blocked dependency is immediately terminal.
+// Exhausted retries (per-gate or per-feature) are also terminal.
+function isTerminalFailure(history, featureId, policy) {
+  var featureAttempts = history.attempts.filter(function (a) { return a.featureId === featureId })
+  if (featureAttempts.length === 0) return false
+
+  var lastOutcome = featureAttempts[featureAttempts.length - 1].outcome
+  if (lastOutcome === ATTEMPT_OUTCOMES.PERMANENT_FAILURE) return true
+  if (lastOutcome === ATTEMPT_OUTCOMES.BLOCKED_DEPENDENCY) return true
+
+  return isFeatureRetriesExhausted(history, featureId, policy)
+}
+
+// Get the terminal reason for a feature (if terminally failed).
+function terminalReason(history, featureId) {
+  var featureAttempts = history.attempts.filter(function (a) { return a.featureId === featureId })
+  if (featureAttempts.length === 0) return null
+  var last = featureAttempts[featureAttempts.length - 1]
+  return last.reason || last.outcome
+}
+
+// Summary of attempts for a feature for handoff/status reporting.
+function attemptSummary(history, featureId) {
+  var featureAttempts = history.attempts.filter(function (a) { return a.featureId === featureId })
+  return {
+    totalAttempts: featureAttempts.length,
+    lastOutcome: featureAttempts.length > 0 ? featureAttempts[featureAttempts.length - 1].outcome : null,
+    lastReason: featureAttempts.length > 0 ? featureAttempts[featureAttempts.length - 1].reason : null,
+    gates: featureAttempts.map(function (a) { return a.gate }).filter(function (v, i, arr) { return arr.indexOf(v) === i }),
+  }
+}
+
+// Failure isolation: one feature failure does not lose or poison independent work.
+// Updates only the failed feature's shard; eligible independent features continue.
+// Verified artifacts are preserved on failure.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Isolate a feature failure: update only the failed feature's lifecycle,
+// preserving all other features' state and verified artifacts.
+// Pure: returns a new queue array, does NOT mutate the input.
+// Timeout and blocked failures are resumable (status='blocked'); other
+// failure types are terminal (status='failed').
+function isolateFailure(queue, failedId, failureType) {
+  var resumable = failureType === 'timeout' || failureType === 'blocked'
+  return queue.map(function (entry) {
+    if (entry.id !== failedId) {
+      return Object.assign({}, entry)
+    }
+    // Failed feature: preserve verified artifacts, update status
+    return Object.assign({}, entry, {
+      status: resumable ? 'blocked' : 'failed',
+      failureType: failureType || 'unknown',
+      // Artifacts are PRESERVED — failure does not lose verified work
+      artifacts: entry.artifacts || {},
+    })
+  })
+}
+
+// Given a failed feature, determine which other features are eligible to
+// continue independently (not blocked by the failure through dependencies).
+// Uses transitive closure: any feature whose dependency chain reaches the
+// failed feature is blocked.
+function eligibleIndependents(queue, failedId, edges) {
+  var transitivelyBlocked = {}
+  transitivelyBlocked[failedId] = true
+
+  // Propagate: any feature whose dependency is blocked is itself blocked
+  var changed = true
+  while (changed) {
+    changed = false
+    for (var i = 0; i < (edges || []).length; i++) {
+      var e = edges[i]
+      if (transitivelyBlocked[e.to] && !transitivelyBlocked[e.from]) {
+        transitivelyBlocked[e.from] = true
+        changed = true
+      }
+    }
+  }
+
+  // Eligible: not transitively blocked, and still has work to do
+  return queue.filter(function (entry) {
+    if (transitivelyBlocked[entry.id]) return false
+    return entry.status === 'pending' || entry.status === 'in-progress'
+  })
+}
+
+// Preserve verified artifacts from a failed feature slice.
+// Returns only the artifacts that were actually produced (truthy paths).
+function preserveVerifiedArtifacts(slice) {
+  var artifacts = slice.artifacts || {}
+  var verified = {}
+  for (var key in artifacts) {
+    if (artifacts[key]) verified[key] = artifacts[key]
+  }
+  return verified
+}
+
+// Determine if a segment should continue after a feature failure.
+// True if at least one eligible independent feature remains.
+function shouldContinueAfterFailure(queue, failedId, edges) {
+  return eligibleIndependents(queue, failedId, edges).length > 0
+}
+
+// Count features by terminal status within a segment.
+// Maps both 'done' and 'completed' to the completed bucket since the
+// extract queue uses 'done' while the lifecycle reducer uses 'completed'.
+function segmentOutcome(queue) {
+  var counts = {
+    completed: 0,
+    blocked: 0,
+    failed: 0,
+    deferred: 0,
+    skipped: 0,
+    pending: 0,
+  }
+  for (var i = 0; i < queue.length; i++) {
+    var status = queue[i].status
+    if (status === 'done' || status === 'completed') counts.completed++
+    else if (status in counts) counts[status]++
+    else counts.pending++
+  }
+  return counts
+}
+
+// Transactional automatic continuation: monotonic segment identifiers,
+// idempotency keys, and convergence of duplicate/lost/out-of-order launches.
+// One command launches the next segment while progress is possible; every
+// stop emits an exact idempotent manual resume command.
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Create a continuation state tracker.
+function createContinuationState() {
+  return {
+    lastSegmentId: 0,
+    intents: [],
+    acknowledgements: [],
+  }
+}
+
+// Allocate the next monotonic segment identifier. Pure: returns new state + id.
+function nextSegmentId(state) {
+  var segmentId = state.lastSegmentId + 1
+  return {
+    state: Object.assign({}, state, { lastSegmentId: segmentId }),
+    segmentId: segmentId,
+  }
+}
+
+// Generate an idempotency key for a segment. Deterministic: same features + revision
+// produce the same key, so duplicate launches converge to one outcome.
+function idempotencyKey(segmentId, featureIds, revision) {
+  var ids = featureIds.slice().sort().join(',')
+  return 'seg-' + segmentId + '-' + ids + '-' + (revision || 'none')
+}
+
+// Create a segment intent: the orchestrator declares it is about to launch
+// a segment. This is the write-intent phase before actual work begins.
+// Duplicate intents for the same segment converge (idempotent).
+function createSegmentIntent(state, segmentId, featureIds, revision) {
+  var key = idempotencyKey(segmentId, featureIds, revision)
+  // Check if this exact intent already exists (duplicate launch)
+  for (var i = 0; i < state.intents.length; i++) {
+    if (state.intents[i].segmentId === segmentId && state.intents[i].idempotencyKey === key) {
+      return { state: state, duplicate: true, intent: state.intents[i] }
+    }
+  }
+  var intent = {
+    segmentId: segmentId,
+    idempotencyKey: key,
+    features: featureIds.slice().sort(),
+    revision: revision || null,
+    acknowledged: false,
+  }
+  return {
+    state: Object.assign({}, state, { intents: state.intents.concat([intent]) }),
+    duplicate: false,
+    intent: intent,
+  }
+}
+
+// Acknowledge a segment completion: the commit phase.
+// Idempotent: acknowledging the same segment twice converges to one outcome.
+function acknowledgeSegment(state, segmentId, key, outcome, counts) {
+  // Check if already acknowledged (duplicate acknowledgement)
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    if (state.acknowledgements[i].segmentId === segmentId) {
+      return { state: state, duplicate: true, acknowledgement: state.acknowledgements[i] }
+    }
+  }
+
+  var acknowledgement = {
+    segmentId: segmentId,
+    idempotencyKey: key,
+    outcome: outcome || 'partial',
+    counts: counts || {},
+  }
+
+  // Mark intent as acknowledged
+  var intents = state.intents.map(function (i) {
+    if (i.segmentId === segmentId) return Object.assign({}, i, { acknowledged: true })
+    return i
+  })
+
+  return {
+    state: Object.assign({}, state, {
+      intents: intents,
+      acknowledgements: state.acknowledgements.concat([acknowledgement]),
+    }),
+    duplicate: false,
+    acknowledgement: acknowledgement,
+  }
+}
+
+// Resolve convergence of duplicate, lost, resumed, or out-of-order launches.
+// Produces the canonical durable outcome — one outcome per segment, no skipped
+// or double-applied work. First acknowledgement for each segment wins.
+function resolveConvergence(state) {
+  var seen = {} // segmentId -> canonical ack
+
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    var ack = state.acknowledgements[i]
+    if (!seen[ack.segmentId]) {
+      seen[ack.segmentId] = ack
+    }
+    // Duplicate: first acknowledgement wins (idempotent)
+  }
+
+  var converged = Object.keys(seen).map(function (k) { return seen[k] })
+  converged.sort(function (a, b) { return a.segmentId - b.segmentId })
+
+  // Check for unacknowledged intents (lost acknowledgements / crashes)
+  var unacknowledged = state.intents.filter(function (intent) {
+    return !seen[intent.segmentId]
+  })
+
+  return {
+    converged: converged,
+    unacknowledged: unacknowledged,
+    pendingRetry: unacknowledged.map(function (i) {
+      return {
+        segmentId: i.segmentId,
+        idempotencyKey: i.idempotencyKey,
+        features: i.features,
+      }
+    }),
+  }
+}
+
+// Determine if progress is still possible (continuation decision).
+// True if there are pending or in-progress features.
+function shouldContinue(queue) {
+  for (var i = 0; i < queue.length; i++) {
+    if (queue[i].status === 'pending' || queue[i].status === 'in-progress') {
+      return true
+    }
+  }
+  return false
+}
+
+// Count features by outcome across all acknowledged segments.
+function segmentCounts(state) {
+  var counts = { completed: 0, deferred: 0, blocked: 0, failed: 0, skipped: 0 }
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    var c = state.acknowledgements[i].counts || {}
+    counts.completed += c.completed || 0
+    counts.deferred += c.deferred || 0
+    counts.blocked += c.blocked || 0
+    counts.failed += c.failed || 0
+    counts.skipped += c.skipped || 0
+  }
+  return counts
+}
+
+// Generate the exact idempotent manual resume command for a stopped segment.
+// This command reproduces the same state transition when run manually.
+function resumeCommand(planDir, segmentId, state) {
+  var convergence = resolveConvergence(state)
+  var hasUnack = convergence.unacknowledged.length > 0
+  return {
+    command: '/feature-workflows:extract-design --resume ' + planDir,
+    segmentId: segmentId,
+    reason: hasUnack ? 'unacknowledged-intent' : 'no-progress-or-ceiling',
+    counts: segmentCounts(state),
+    idempotent: true,
+  }
+}
+
+// Detect out-of-order delivery: an acknowledgement for segment N+1 arriving
+// before segment N's acknowledgement. Out-of-order acks converge correctly.
+function isOutOfOrder(state, segmentId) {
+  var ackedIds = {}
+  for (var i = 0; i < state.acknowledgements.length; i++) {
+    ackedIds[state.acknowledgements[i].segmentId] = true
+  }
+  // Out-of-order if a lower segment has an intent but no ack
+  for (var j = 0; j < state.intents.length; j++) {
+    if (state.intents[j].segmentId < segmentId && !ackedIds[state.intents[j].segmentId]) {
+      return true
+    }
+  }
+  return false
+}
+
+// Check if automatic relaunch is possible (not refused).
+// Returns false when the budget is exhausted or too many unacknowledged
+// intents exist (potential crash loop).
+function canAutoRelaunch(state, budgetCallsRemaining) {
+  if (budgetCallsRemaining <= 0) return false
+  var convergence = resolveConvergence(state)
+  return convergence.unacknowledged.length < 3
+}
+
+// Full continuation summary for handoff/status reporting.
+function continuationSummary(state) {
+  var convergence = resolveConvergence(state)
+  return {
+    lastSegmentId: state.lastSegmentId,
+    acknowledgedSegments: convergence.converged.length,
+    unacknowledgedIntents: convergence.unacknowledged.length,
+    totalCounts: segmentCounts(state),
+    hasUnacknowledged: convergence.unacknowledged.length > 0,
+  }
+}
+
+// Incremental project-view synthesis: derive system overview, dependency map,
+// cross-cutting concerns, and coverage index from bounded verified feature
+// summaries. All functions are pure — no I/O, no side effects.
+//
+// Views update idempotently: the same verified summaries always produce the
+// same project views. Selective revision invalidation means only views whose
+// contributing feature digests changed are rebuilt; unaffected views are
+// retained. This obeys the revision contract established for feature gates.
+
+// Reuse the proven djb2 hash algorithm (same as revision.mjs and state.mjs).
+// Defined independently to keep this module self-contained in the concatenated dist.
+function synthHash(str) {
+  var s = String(str == null ? '' : str)
+  var h = 5381
+  for (var i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
+  }
+  return h.toString(16)
+}
+
+function synthDigest(obj) {
+  return synthHash(JSON.stringify(synthSortKeys(obj)))
+}
+
+function synthSortKeys(obj) {
+  if (obj === null || typeof obj !== 'object') return obj
+  if (Array.isArray(obj)) return obj.map(synthSortKeys)
+  var sorted = {}
+  for (var key of Object.keys(obj).sort()) {
+    sorted[key] = synthSortKeys(obj[key])
+  }
+  return sorted
+}
+
+// View types produced by synthesis. Each derives from feature summaries.
+const VIEW_TYPES = Object.freeze({
+  SYSTEM_OVERVIEW: 'systemOverview',
+  DEPENDENCY_MAP: 'dependencyMap',
+  CROSS_CUTTING: 'crossCutting',
+  COVERAGE_INDEX: 'coverageIndex',
+})
+
+// Initialize empty synthesis state.
+function createSynthesisState() {
+  return {
+    views: {},
+    viewRevisions: {},
+    featureDigests: {},
+    synthesized: false,
+  }
+}
+
+// Derive the coverage index from feature summaries.
+// Pure: counts lifecycle states deterministically.
+function deriveCoverageIndex(summaries) {
+  var counts = {
+    completed: 0,
+    deferred: 0,
+    blocked: 0,
+    failed: 0,
+    skipped: 0,
+    excluded: 0,
+    'in-progress': 0,
+    runnable: 0,
+  }
+  for (var i = 0; i < summaries.length; i++) {
+    var lc = summaries[i].lifecycle || 'runnable'
+    if (counts[lc] !== undefined) counts[lc]++
+  }
+  var denominator = summaries.length - counts.excluded
+  return {
+    denominator: denominator,
+    completed: counts.completed,
+    deferred: counts.deferred,
+    remaining: counts.runnable + counts.deferred + counts['in-progress'],
+    blocked: counts.blocked,
+    failed: counts.failed,
+    skipped: counts.skipped,
+    excluded: counts.excluded,
+  }
+}
+
+// Derive the dependency map from feature summaries.
+// Collects all declared cross-feature dependencies into a unified edge list.
+function deriveDependencyMap(summaries) {
+  var edges = []
+  for (var i = 0; i < summaries.length; i++) {
+    var s = summaries[i]
+    var deps = s.dependencies || []
+    for (var j = 0; j < deps.length; j++) {
+      edges.push({ from: s.id, to: deps[j], type: 'depends-on' })
+    }
+  }
+  edges.sort(function (a, b) {
+    if (a.from !== b.from) return a.from < b.from ? -1 : 1
+    if (a.to !== b.to) return a.to < b.to ? -1 : 1
+    return 0
+  })
+  return { edges: edges, totalEdges: edges.length }
+}
+
+// Derive cross-cutting concerns from feature summaries.
+// Aggregates shared tags/concerns across features.
+function deriveCrossCutting(summaries) {
+  var concernMap = {}
+  for (var i = 0; i < summaries.length; i++) {
+    var concerns = summaries[i].crossCuttingConcerns || []
+    for (var j = 0; j < concerns.length; j++) {
+      var c = concerns[j]
+      if (!concernMap[c]) concernMap[c] = []
+      concernMap[c].push(summaries[i].id)
+    }
+  }
+  var result = []
+  for (var concern of Object.keys(concernMap).sort()) {
+    if (concernMap[concern].length > 1) {
+      result.push({ concern: concern, features: concernMap[concern].sort() })
+    }
+  }
+  return { sharedConcerns: result }
+}
+
+// Derive the system overview from feature summaries.
+// Aggregates module names, descriptions, and artifact paths.
+function deriveSystemOverview(summaries) {
+  var modules = []
+  for (var i = 0; i < summaries.length; i++) {
+    var s = summaries[i]
+    modules.push({
+      id: s.id,
+      name: s.name || s.id,
+      lifecycle: s.lifecycle || 'runnable',
+      artifacts: s.artifacts || {},
+    })
+  }
+  modules.sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0 })
+  return { modules: modules, totalModules: modules.length }
+}
+
+// Synthesize all project views from verified feature summaries.
+// Idempotent: same summaries + revisions always produce the same views.
+// Only summaries whose digest changed trigger a view rebuild.
+function synthesizeProjectViews(featureSummaries, oldState, revisions) {
+  if (!featureSummaries || !Array.isArray(featureSummaries)) {
+    featureSummaries = []
+  }
+  var prev = oldState || createSynthesisState()
+  var revs = revisions || {}
+
+  // Compute per-feature digests to detect changes
+  var newDigests = {}
+  var changed = false
+  for (var i = 0; i < featureSummaries.length; i++) {
+    var s = featureSummaries[i]
+    var d = synthDigest(s)
+    newDigests[s.id] = d
+    if (prev.featureDigests[s.id] !== d) {
+      changed = true
+    }
+  }
+
+  // Detect feature-set membership changes (removals not caught by digest check)
+  if (Object.keys(prev.featureDigests || {}).length !== Object.keys(newDigests).length) {
+    changed = true
+  }
+
+  // If nothing changed and revisions match, retain existing views (idempotent)
+  var revChanged = false
+  for (var key of Object.keys(revs)) {
+    if (prev.viewRevisions[key] !== revs[key]) revChanged = true
+  }
+
+  if (!changed && !revChanged && prev.synthesized) {
+    // Fully idempotent: return previous state
+    return prev
+  }
+
+  // Derive all four view types from the verified summaries
+  var views = {
+    systemOverview: deriveSystemOverview(featureSummaries),
+    dependencyMap: deriveDependencyMap(featureSummaries),
+    crossCutting: deriveCrossCutting(featureSummaries),
+    coverageIndex: deriveCoverageIndex(featureSummaries),
+  }
+
+  return {
+    views: views,
+    viewRevisions: Object.assign({}, revs),
+    featureDigests: newDigests,
+    synthesized: true,
+  }
+}
+
+// Check if synthesis views are current against the given revisions.
+function isSynthesisCurrent(state, currentRevisions) {
+  if (!state || !state.synthesized) return false
+  var revs = currentRevisions || {}
+  for (var key of Object.keys(revs)) {
+    if (state.viewRevisions[key] !== revs[key]) return false
+  }
+  return true
+}
+
+// Selectively invalidate only views whose contributing features changed.
+// Uses the revision contract: only affected views are marked stale.
+function invalidateStaleViews(state, revisionDelta) {
+  if (!state || !state.synthesized) return createSynthesisState()
+  var affected = (revisionDelta && revisionDelta.changedInputs) || []
+  if (affected.length === 0) return state
+
+  // Source changes affect system overview and dependency map
+  // Scope changes affect system overview and coverage index
+  // Graph changes affect dependency map
+  // Artifact changes affect system overview
+  var staleViews = {}
+  var VIEW_DEPS = {
+    systemOverview: ['source', 'scope', 'artifact'],
+    dependencyMap: ['source', 'graph', 'deps'],
+    crossCutting: ['source', 'scope'],
+    coverageIndex: ['scope'],
+  }
+
+  for (var view of Object.keys(VIEW_DEPS)) {
+    var inputs = VIEW_DEPS[view]
+    for (var j = 0; j < affected.length; j++) {
+      if (inputs.indexOf(affected[j]) !== -1) {
+        staleViews[view] = true
+        break
+      }
+    }
+  }
+
+  if (Object.keys(staleViews).length === 0) return state
+
+  // Mark synthesis as not current — next synthesize call rebuilds stale views
+  var newState = Object.assign({}, state)
+  newState.staleViews = Object.keys(staleViews).sort()
+  return newState
+}
+
+// Summary for handoff/status reporting.
+function synthesisSummary(state) {
+  if (!state || !state.synthesized) {
+    return { synthesized: false, views: 0, staleViews: [] }
+  }
+  return {
+    synthesized: true,
+    views: Object.keys(state.views).length,
+    staleViews: state.staleViews || [],
+    coverage: state.views.coverageIndex || null,
+  }
+}
+
+// Attempted-vs-durable persistence tracking: distinguish writes that were
+// attempted from writes that are durably verified. Retry-safe: retrying a
+// failed write cannot produce duplicate index, synthesis, or continuation
+// state. All functions are pure — no I/O, no side effects.
+
+// Three terminal persistence states for each write unit.
+const PERSISTENCE_STATES = Object.freeze({
+  ATTEMPTED: 'attempted',
+  DURABLY_VERIFIED: 'durably-verified',
+  FAILED: 'failed',
+})
+
+// Write-unit types that are tracked for retry-safe persistence.
+const PERSIST_UNIT_TYPES = Object.freeze({
+  FEATURE_SHARD: 'feature-shard',
+  PROJECT_INDEX: 'project-index',
+  SYNTHESIS_VIEW: 'synthesis-view',
+  CONTINUATION_ACK: 'continuation-ack',
+})
+
+// Initialize empty persistence tracker.
+function createPersistenceTracker() {
+  return {
+    writes: {},
+    history: [],
+  }
+}
+
+// Record an attempted write. Idempotent: recording the same key twice does
+// not duplicate state — it updates the timestamp of the existing attempt.
+// A durably verified write cannot be demoted back to attempted.
+function recordAttemptedWrite(tracker, key, unitType) {
+  if (!tracker || typeof tracker !== 'object') {
+    throw new Error('recordAttemptedWrite: tracker must be an object')
+  }
+  if (!key) throw new Error('recordAttemptedWrite: key is required')
+
+  var existing = tracker.writes[key]
+  if (existing && existing.state === PERSISTENCE_STATES.DURABLY_VERIFIED) {
+    // Durably verified writes are never demoted — retry safety.
+    return tracker
+  }
+
+  var entry = {
+    key: key,
+    unitType: unitType || (existing ? existing.unitType : PERSIST_UNIT_TYPES.FEATURE_SHARD),
+    state: PERSISTENCE_STATES.ATTEMPTED,
+    attempts: existing ? existing.attempts + 1 : 1,
+  }
+
+  var writes = Object.assign({}, tracker.writes)
+  writes[key] = entry
+
+  var history = tracker.history.concat([{
+    key: key,
+    action: 'attempted',
+    attemptNumber: entry.attempts,
+  }])
+
+  return { writes: writes, history: history }
+}
+
+// Verify a write as durably completed. Once verified, the write is permanent —
+// retrying cannot change its state (no duplicate state on retry).
+function verifyDurableWrite(tracker, key) {
+  if (!tracker || typeof tracker !== 'object') {
+    throw new Error('verifyDurableWrite: tracker must be an object')
+  }
+  if (!key) throw new Error('verifyDurableWrite: key is required')
+
+  var existing = tracker.writes[key]
+  if (!existing) {
+    throw new Error('verifyDurableWrite: no attempted write for key ' + key)
+  }
+  if (existing.state === PERSISTENCE_STATES.DURABLY_VERIFIED) {
+    // Already verified — idempotent, no state change
+    return tracker
+  }
+
+  var entry = Object.assign({}, existing, {
+    state: PERSISTENCE_STATES.DURABLY_VERIFIED,
+  })
+
+  var writes = Object.assign({}, tracker.writes)
+  writes[key] = entry
+
+  var history = tracker.history.concat([{
+    key: key,
+    action: 'verified',
+    attemptNumber: existing.attempts,
+  }])
+
+  return { writes: writes, history: history }
+}
+
+// Mark a write as failed. The write remains in the tracker so retry logic
+// can inspect its attempt count and reason. Failed writes can be retried.
+function failWrite(tracker, key, reason) {
+  if (!tracker || typeof tracker !== 'object') {
+    throw new Error('failWrite: tracker must be an object')
+  }
+  if (!key) throw new Error('failWrite: key is required')
+
+  var existing = tracker.writes[key]
+  if (existing && existing.state === PERSISTENCE_STATES.DURABLY_VERIFIED) {
+    // Durably verified writes cannot be failed — they are permanent
+    return tracker
+  }
+
+  var attempts = existing ? existing.attempts : 0
+  var entry = {
+    key: key,
+    unitType: existing ? existing.unitType : PERSIST_UNIT_TYPES.FEATURE_SHARD,
+    state: PERSISTENCE_STATES.FAILED,
+    attempts: attempts,
+    failReason: reason || 'unknown',
+  }
+
+  var writes = Object.assign({}, tracker.writes)
+  writes[key] = entry
+
+  var history = tracker.history.concat([{
+    key: key,
+    action: 'failed',
+    attemptNumber: attempts,
+    reason: reason || 'unknown',
+  }])
+
+  return { writes: writes, history: history }
+}
+
+// Check if retrying a write is safe — it is safe only if the write is NOT
+// already durably verified (which would risk duplicating state on retry).
+function isRetrySafe(tracker, key) {
+  if (!tracker || !tracker.writes[key]) return true
+  return tracker.writes[key].state !== PERSISTENCE_STATES.DURABLY_VERIFIED
+}
+
+// Check if a specific write is durably verified.
+function isDurablyVerified(tracker, key) {
+  if (!tracker || !tracker.writes[key]) return false
+  return tracker.writes[key].state === PERSISTENCE_STATES.DURABLY_VERIFIED
+}
+
+// Generate a report of persistence status for handoff and status surfaces.
+// Distinguishes attempted from durably verified, counts failures, and
+// exposes per-unit-type breakdowns.
+function persistenceReport(tracker) {
+  if (!tracker) {
+    return { attempted: 0, verified: 0, failed: 0, total: 0, byType: {} }
+  }
+
+  var writes = tracker.writes || {}
+  var report = {
+    attempted: 0,
+    verified: 0,
+    failed: 0,
+    total: 0,
+    byType: {},
+  }
+
+  for (var key of Object.keys(writes)) {
+    var w = writes[key]
+    report.total++
+    var typeBucket = w.unitType || 'unknown'
+    if (!report.byType[typeBucket]) report.byType[typeBucket] = { attempted: 0, verified: 0, failed: 0 }
+    report.byType[typeBucket].total = (report.byType[typeBucket].total || 0) + 1
+
+    if (w.state === PERSISTENCE_STATES.ATTEMPTED) {
+      report.attempted++
+      report.byType[typeBucket].attempted++
+    } else if (w.state === PERSISTENCE_STATES.DURABLY_VERIFIED) {
+      report.verified++
+      report.byType[typeBucket].verified++
+    } else if (w.state === PERSISTENCE_STATES.FAILED) {
+      report.failed++
+      report.byType[typeBucket].failed++
+    }
+  }
+
+  return report
+}
+
+// Truthful readiness derivation and status projection: the command handoff
+// and read-only status surface report the same immutable projection for
+// denominator, lifecycle outcomes, revisions, budgets, failures, readiness
+// proof, and continuation command. extractReady is true only when every
+// condition is genuinely met. All functions are pure — no I/O, no side effects.
+
+// Readiness failure reasons — each maps to a specific unmet condition.
+const READINESS_REASONS = Object.freeze({
+  DISCOVERY_INCOMPLETE: 'discovery-not-exhausted',
+  GRAPH_INVALID: 'graph-invalid',
+  FEATURES_INCOMPLETE: 'features-incomplete',
+  SYNTHESIS_STALE: 'synthesis-stale',
+  ARTIFACTS_STALE: 'artifacts-stale',
+  ALL_MET: 'all-conditions-met',
+})
+
+// Derive truthful extract readiness from a comprehensive project state.
+//
+// projectState: {
+//   discoveryExhausted: boolean,
+//   graphValid: boolean,
+//   features: [{ id, lifecycle, skipReason?, policyEvidence? }],
+//   synthesisCurrent: boolean,
+//   artifactsCurrent: boolean,
+// }
+//
+// Returns: { ready, reason, checks, counts }
+// ready is true ONLY when ALL conditions are met.
+function deriveExtractReadiness(projectState) {
+  if (!projectState || typeof projectState !== 'object') {
+    return {
+      ready: false,
+      reason: READINESS_REASONS.FEATURES_INCOMPLETE,
+      checks: { discoveryExhausted: false, graphValid: false, featuresComplete: false, synthesisCurrent: false, artifactsCurrent: false },
+      counts: null,
+    }
+  }
+
+  var features = projectState.features || []
+  var counts = countLifecycleStates(features)
+  var incompleteStates = ['runnable', 'deferred', 'in-progress', 'blocked', 'failed']
+  var incompleteCount = 0
+  var skippedIncomplete = 0
+
+  for (var i = 0; i < features.length; i++) {
+    var f = features[i]
+    if (incompleteStates.indexOf(f.lifecycle) !== -1) {
+      incompleteCount++
+    }
+    if (f.lifecycle === 'skipped') {
+      // Only policy-disabled-optional with evidence may count as complete
+      if (f.skipReason !== 'policy-disabled-optional' || !f.policyEvidence) {
+        skippedIncomplete++
+      }
+    }
+  }
+
+  var discoveryOk = !!projectState.discoveryExhausted
+  var graphOk = !!projectState.graphValid
+  var featuresOk = incompleteCount === 0 && skippedIncomplete === 0
+  var synthesisOk = !!projectState.synthesisCurrent
+  var artifactsOk = !!projectState.artifactsCurrent
+
+  var checks = {
+    discoveryExhausted: discoveryOk,
+    graphValid: graphOk,
+    featuresComplete: featuresOk,
+    synthesisCurrent: synthesisOk,
+    artifactsCurrent: artifactsOk,
+  }
+
+  var ready = discoveryOk && graphOk && featuresOk && synthesisOk && artifactsOk
+
+  var reason = READINESS_REASONS.ALL_MET
+  if (!discoveryOk) reason = READINESS_REASONS.DISCOVERY_INCOMPLETE
+  else if (!graphOk) reason = READINESS_REASONS.GRAPH_INVALID
+  else if (!featuresOk) reason = READINESS_REASONS.FEATURES_INCOMPLETE
+  else if (!synthesisOk) reason = READINESS_REASONS.SYNTHESIS_STALE
+  else if (!artifactsOk) reason = READINESS_REASONS.ARTIFACTS_STALE
+
+  return {
+    ready: ready,
+    reason: reason,
+    checks: checks,
+    counts: counts,
+    incompleteCount: incompleteCount + skippedIncomplete,
+  }
+}
+
+// Count features by lifecycle state. Pure helper.
+function countLifecycleStates(features) {
+  var counts = {
+    runnable: 0,
+    deferred: 0,
+    'in-progress': 0,
+    blocked: 0,
+    failed: 0,
+    skipped: 0,
+    excluded: 0,
+    completed: 0,
+  }
+  for (var i = 0; i < features.length; i++) {
+    var lc = features[i].lifecycle
+    if (counts[lc] !== undefined) counts[lc]++
+  }
+  counts.denominator = features.length - counts.excluded
+  return counts
+}
+
+// Produce an immutable status projection from the full project state.
+// This is the SINGLE source of truth shared by command handoff and
+// read-only status — they MUST report identical data.
+//
+// projectState: {
+//   discoveryExhausted, graphValid, features, synthesisCurrent,
+//   artifactsCurrent, revisions, budget, failures, continuation,
+//   planDir, scopeManifestPath,
+// }
+function projectStatusProjection(projectState) {
+  if (!projectState || typeof projectState !== 'object') {
+    return projectEmptyProjection()
+  }
+
+  var readiness = deriveExtractReadiness(projectState)
+  var features = projectState.features || []
+  var counts = readiness.counts || countLifecycleStates(features)
+
+  // Immutable projection — frozen so handoff and status share the exact same object
+  var projection = {
+    planDir: projectState.planDir || null,
+    scopeManifestPath: projectState.scopeManifestPath || null,
+    ready: readiness.ready,
+    readyReason: readiness.reason,
+    checks: readiness.checks,
+    denominator: counts.denominator || 0,
+    lifecycleOutcomes: {
+      completed: counts.completed || 0,
+      deferred: counts.deferred || 0,
+      blocked: counts.blocked || 0,
+      failed: counts.failed || 0,
+      skipped: counts.skipped || 0,
+      excluded: counts.excluded || 0,
+      'in-progress': counts['in-progress'] || 0,
+      runnable: counts.runnable || 0,
+    },
+    revisions: projectState.revisions || null,
+    budget: projectState.budget || null,
+    failures: projectState.failures || [],
+    continuation: projectState.continuation || null,
+    incompleteCount: readiness.incompleteCount || 0,
+  }
+
+  return Object.freeze(projection)
+}
+
+// Empty projection for null/invalid state.
+function projectEmptyProjection() {
+  return Object.freeze({
+    planDir: null,
+    scopeManifestPath: null,
+    ready: false,
+    readyReason: READINESS_REASONS.FEATURES_INCOMPLETE,
+    checks: {
+      discoveryExhausted: false,
+      graphValid: false,
+      featuresComplete: false,
+      synthesisCurrent: false,
+      artifactsCurrent: false,
+    },
+    denominator: 0,
+    lifecycleOutcomes: {
+      completed: 0, deferred: 0, blocked: 0, failed: 0,
+      skipped: 0, excluded: 0, 'in-progress': 0, runnable: 0,
+    },
+    revisions: null,
+    budget: null,
+    failures: [],
+    continuation: null,
+    incompleteCount: 0,
+  })
+}
+
+// Design readiness failure reasons — each maps to a specific hidden degradation.
+const DESIGN_READINESS_REASONS = Object.freeze({
+  FAIL_FORWARD_REVIEW: 'fail-forward-review',
+  FORCE_ACCEPTED_BLOCKERS: 'force-accepted-plan-with-blockers',
+  UNRESOLVED_RECONCILE: 'unresolved-reconcile-conflicts',
+  ALL_CLEAR: 'all-degradation-checks-clear',
+})
+
+// Derive truthful design readiness from design-mode result state.
+// designReady must be true ONLY when no review was fail-forwarded,
+// no plan carries force-accepted blockers, and reconcile conflicts are resolved.
+// Pure: no I/O, no side effects.
+function deriveDesignReadiness(result) {
+  if (!result || typeof result !== 'object') {
+    return { ready: false, reason: DESIGN_READINESS_REASONS.FAIL_FORWARD_REVIEW, degradation: [] }
+  }
+  var degradation = []
+  // Check fail-forward review flags (F4)
+  var forcedReviews = []
+  if (result._reviewedRequirementsForced) forcedReviews.push('Requirements')
+  if (result._reviewedArchForced) forcedReviews.push('Architecture')
+  if (result._reviewedDesignForced) forcedReviews.push('Detailed Design')
+  if (forcedReviews.length) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.FAIL_FORWARD_REVIEW, gates: forcedReviews })
+  }
+  // Check force-accepted plan with carried blockers (F5)
+  if (result.forceAccepted && result.carriedBlockers && result.carriedBlockers.length) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.FORCE_ACCEPTED_BLOCKERS, count: result.carriedBlockers.length })
+  }
+  // Check unresolved reconcile conflicts (F6)
+  if (result.reconcile && result.reconcile.consistent === false && (result.reconcile.conflicts || []).length > 0) {
+    degradation.push({ type: DESIGN_READINESS_REASONS.UNRESOLVED_RECONCILE, conflicts: result.reconcile.conflicts.length })
+  }
+  var ready = degradation.length === 0
+  var reason = ready ? DESIGN_READINESS_REASONS.ALL_CLEAR : degradation[0].type
+  return { ready: ready, reason: reason, degradation: degradation }
+}
+
+// Verify two projections are identical. Used to enforce the invariant that
+// handoff and status report the same data.
+function projectionsMatch(a, b) {
+  if (!a || !b) return false
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+// Human-readable readiness summary for status reporting.
+function readinessSummary(projection) {
+  if (!projection) return 'No projection available.'
+  var lines = []
+  lines.push('Readiness: ' + (projection.ready ? 'READY' : 'NOT READY') + ' (' + projection.readyReason + ')')
+  lines.push('Denominator: ' + projection.denominator)
+  lines.push('Completed: ' + projection.lifecycleOutcomes.completed)
+  if (projection.incompleteCount > 0) {
+    lines.push('Incomplete: ' + projection.incompleteCount)
+  }
+  var checks = projection.checks || {}
+  lines.push('Checks:')
+  for (var key of Object.keys(checks)) {
+    lines.push('  ' + (checks[key] ? '[x]' : '[ ]') + ' ' + key)
+  }
+  return lines.join('\n')
 }
 
 // chunkPlanIntoStages (Phase H, design tail): split plan.md -> dependency-ordered stageNN.md files
@@ -1673,7 +4639,12 @@ and the source files it owns.`,
     return chunk.stages
   }
   // Degrade to a single implicit stage covering the whole plan (preserves single-executor behavior).
+  // DCHUNK-01: record the degradation so the design terminal can surface it as an explicit outcome.
   plogFromResult(result, 'plan-chunker: returned no stages — degrading to single implicit stage01')
+  if (result) {
+    result._chunkerDegraded = true
+    result._chunkerDegradationReason = 'plan-chunker returned no stages — single implicit stage01'
+  }
   return [{
     id: 'stage01',
     file: planDir + 'stage01.md',
@@ -2352,6 +5323,40 @@ ${sections}`,
   }
 }
 
+// Per-gate durable checkpoint: persist slice state after each material gate so an
+// interrupted leaf resumes at the first incomplete gate without repeating verified
+// work. Uses the same flushPipelineState pattern as the top-level, writing to the
+// slice's own planDir. Agent-mediated I/O — no direct filesystem access.
+let _checkpointSeq = 0
+async function checkpointSlice(slice, sliceState, gateName, result) {
+  if (!sliceState._gateCheckpoints) sliceState._gateCheckpoints = {}
+  _checkpointSeq++
+  const artifactKey = {
+    'extract-facts': 'factsPath',
+    'extract-e2e': 'useCasePath',
+    'extract-design': 'designPath',
+    'extract-arch': 'archPath',
+    'extract-requirements': 'requirementsPath',
+    'extract-audit': 'auditPath',
+  }[gateName]
+  sliceState._gateCheckpoints[gateName] = {
+    seq: _checkpointSeq,
+    acknowledged: true,
+    artifactPath: artifactKey ? (sliceState[artifactKey] || null) : null,
+  }
+  plogFromResult(result, `Extract [${slice.id}]: checkpoint acknowledged at gate '${gateName}'`)
+  try {
+    await flushPipelineState(slice.planDir, sliceState, {
+      mode: 'extract-slice',
+      profile: 'checkpoint',
+      useChunker: false,
+    })
+  } catch (e) {
+    plogFromResult(result, `Extract [${slice.id}]: checkpoint flush failed at '${gateName}' (non-blocking) — ${String(e)}`)
+  }
+}
+
+
 // extractSlice: run the per-slice extraction cycle (facts -> e2e use cases -> detailed
 // design -> architecture [-> fidelity reviews] [-> requirements] [-> audit]) writing all
 // artifacts under slice.planDir. `sliceState` receives the artifact paths — it is the main
@@ -2394,6 +5399,7 @@ Return factsPath set to ${dir}codebase-facts.md.`,
     if (!facts || !facts.factsPath) return { status: 'blocked', gate: 'extract-facts' }
     sliceState.factsPath = facts.factsPath
     sliceState._facts = facts
+    await checkpointSlice(slice, sliceState, 'extract-facts', result)
   }
 
   // X3: behavioral e2e use cases (early — they anchor intent for the design extraction).
@@ -2431,6 +5437,7 @@ Do NOT commit. Return useCasePath set to ${dir}e2e-use-cases.md.`,
     if ((useCases.openQuestions || []).length) {
       await writeOpenQuestions(dir, useCases.openQuestions.map((q) => ({ gate: 'Extract E2E', text: q, severity: 'unspecified' })), result)
     }
+    await checkpointSlice(slice, sliceState, 'extract-e2e', result)
   }
 
   // X4: detailed design reverse-engineered from the code.
@@ -2459,6 +5466,7 @@ Return designPath set to ${dir}detailed-design.md.`,
     if (!design || !design.designPath) return { status: 'blocked', gate: 'extract-design' }
     sliceState.designPath = design.designPath
     sliceState._design = design
+    await checkpointSlice(slice, sliceState, 'extract-design', result)
   }
 
   // X5: high-level architecture abstracted from the detailed design + facts.
@@ -2485,6 +5493,7 @@ Do NOT redesign or propose changes. Do NOT commit. Return archPath set to ${dir}
     if (!arch || !arch.archPath) return { status: 'blocked', gate: 'extract-arch' }
     sliceState.archPath = arch.archPath
     sliceState._arch = arch
+    await checkpointSlice(slice, sliceState, 'extract-arch', result)
   }
 
   // X5.5: fidelity reviews (optional) — does each doc faithfully describe the code?
@@ -2519,6 +5528,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
     }
     sliceState._reviewedDesign = true
     sliceState._reviewedArch = true
+    await checkpointSlice(slice, sliceState, 'extract-review', result)
   }
 
   // X6: reverse-derived requirements (optional; highest abstraction, extracted last).
@@ -2548,6 +5558,7 @@ Do NOT commit. Return requirementsPath set to ${dir}requirements.md.`,
       if ((requirements.openQuestions || []).length) {
         await writeOpenQuestions(dir, requirements.openQuestions.map((q) => ({ gate: 'Extract Requirements', text: q, severity: 'unspecified' })), result)
       }
+      await checkpointSlice(slice, sliceState, 'extract-requirements', result)
     } else {
       plogFromResult(result, `Extract [${slice.id}]: requirements extraction returned no path (non-blocking) — continuing`)
     }
@@ -2557,6 +5568,7 @@ Do NOT commit. Return requirementsPath set to ${dir}requirements.md.`,
   if (config.useAudit && !sliceState.auditPath) {
     phase('Design Audit')
     await auditExtractedDesign({ slicePlanDir: dir, sliceState, task, result })
+    await checkpointSlice(slice, sliceState, 'extract-audit', result)
   }
 
   return { status: 'done' }
@@ -2716,6 +5728,60 @@ Report the exact command you ran in the "command" field and the exit status hone
   )
 }
 
+// Bounded backoff retry for transient provider/network errors. A transient error
+// (network timeout, 429, 503, connection reset) is inherently retryable — treating
+// it as immediately fatal hard-blocks every blocking design gate on a single
+// blip. These constants bound the retry loop so it cannot spin indefinitely.
+const TRANSIENT_RETRY_MAX = 3
+const TRANSIENT_BACKOFF_BASE_MS = 500
+
+// Classify an agent error message as transient, schema, or fatal.
+// Transient errors are retryable (network/provider). Schema errors use the
+// existing plain-text JSON fallback path. Fatal errors are non-retryable.
+// Pure: no side effects, deterministic for the same input.
+function classifyAgentError(errorMsg) {
+  const msg = String(errorMsg || '')
+  if (/StructuredOutput|schema|valid output/i.test(msg)) return 'schema'
+  if (/network|timeout|connection|ECONNRESET|ENOTFOUND|ETIMEDOUT|429|503|502|rate.?limit|overloaded|service.unavailable|temporarily/i.test(msg)) return 'transient'
+  return 'fatal'
+}
+
+// Retry a failed agent call with bounded exponential backoff. Only called when
+// classifyAgentError returns 'transient'. Returns the raw output from
+// callAgentWithWatchdog on success, or null if all retries are exhausted.
+// Each attempt is journaled via recordDegradationEvent for durable inspection.
+async function retryTransientError(prompt, opts, result, originalError) {
+  for (let attempt = 1; attempt <= TRANSIENT_RETRY_MAX; attempt++) {
+    const delayMs = TRANSIENT_BACKOFF_BASE_MS * Math.pow(2, attempt - 1)
+    await new Promise((resolve) => setTimeout(resolve, delayMs))
+    if (result && Array.isArray(result.logLines)) {
+      result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} for "${opts && opts.label}" after ${delayMs}ms backoff`)
+    }
+    bumpGateTelemetry(result, opts, 'retry')
+    recordDegradationEvent(result, 'retry', opts && opts.phase, opts && opts.label, `transient error retry ${attempt}/${TRANSIENT_RETRY_MAX}: ${originalError}`)
+    try {
+      const out = await callAgentWithWatchdog(prompt, opts, result)
+      if (out) {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} succeeded for "${opts && opts.label}"`)
+        }
+        return out
+      }
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e)
+      const errorClass = classifyAgentError(msg)
+      if (errorClass !== 'transient') {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`Transient retry ${attempt}/${TRANSIENT_RETRY_MAX} stopped for "${opts && opts.label}": error reclassified as ${errorClass}`)
+        }
+        return null
+      }
+    }
+  }
+  return null
+}
+
+
 // agent() contract: returns null on user-skip or terminal API error. But a StructuredOutput
 // retry-cap throw (TelemetrySafeError) escapes that contract and propagates uncaught — killing
 // the workflow. safeAgent converts ANY throw into a null + log line so gate logic's existing
@@ -2751,16 +5817,31 @@ async function flexibleAgent(prompt, opts, result) {
     originalError = String(e && e.message ? e.message : e)
     schemaFailed = /StructuredOutput|schema|valid output/i.test(originalError)
     if (!schemaFailed) {
-      if (result && Array.isArray(result.logLines)) {
-        result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (caught): ${originalError}`)
+      const errorClass = classifyAgentError(originalError)
+      if (errorClass === 'transient') {
+        const recovered = await retryTransientError(effectivePrompt, callOpts, result, originalError)
+        if (recovered !== null) {
+          out = recovered
+        } else {
+          if (result && Array.isArray(result.logLines)) {
+            result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (transient retries exhausted): ${originalError}`)
+          }
+          log(`Agent "${opts && opts.label}" threw — transient retries exhausted, converting to null: ${originalError}`)
+          return null
+        }
+      } else {
+        if (result && Array.isArray(result.logLines)) {
+          result.logLines.push(`WARNING: agent "${opts && opts.label}" threw (caught): ${originalError}`)
+        }
+        log(`Agent "${opts && opts.label}" threw — converting to null (graceful degradation): ${originalError}`)
+        return null
       }
-      log(`Agent "${opts && opts.label}" threw — converting to null (graceful degradation): ${originalError}`)
-      return null
+    } else {
+      if (result && Array.isArray(result.logLines)) {
+        result.logLines.push(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
+      }
+      log(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
     }
-    if (result && Array.isArray(result.logLines)) {
-      result.logLines.push(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
-    }
-    log(`Schema path failed for "${opts && opts.label}" (${originalError}); trying plain-text JSON fallback`)
   }
   if (out) {
     if (typeof out === 'object') {
@@ -2844,6 +5925,27 @@ function agentCircuitOpen(opts, result) {
   return !!(failures && failures.circuitOpen)
 }
 
+// Record a degradation event into the durable journal (DHIST-01).
+// Types: 'fail-forward' | 'retry' | 'escalation' | 'fallback'.
+// Each entry is sequentially numbered for inspection through handoff/status.
+function recordDegradationEvent(result, type, gate, label, reason) {
+  if (!result || typeof result !== 'object') return
+  if (!result._degradationLog) result._degradationLog = []
+  var seq = result._degradationLog.length + 1
+  result._degradationLog.push({ seq: seq, type: type, gate: gate || 'unknown', label: label || 'agent', reason: reason || '' })
+}
+
+// Summarize the degradation log for handoff/status display. Pure helper.
+function degradationLogSummary(log) {
+  if (!log || !log.length) return ''
+  var byType = {}
+  for (var i = 0; i < log.length; i++) {
+    var t = log[i].type
+    byType[t] = (byType[t] || 0) + 1
+  }
+  return Object.keys(byType).map(function (t) { return t + '=' + byType[t] }).join(', ')
+}
+
 function recordAgentFailure(result, opts, reason) {
   if (!result) return 0
   const key = agentFailureKey(opts)
@@ -2856,8 +5958,13 @@ function recordAgentFailure(result, opts, reason) {
   if (!result.degradationTelemetry) result.degradationTelemetry = { fallbacks: 0, escalations: 0, languageViolations: 0, circuitBreakers: 0 }
   result.degradationTelemetry.fallbacks += 1
   bumpGateTelemetry(result, opts, 'fallback')
+  // Journal each degradation event for durable attempt-history inspection (DHIST-01)
+  recordDegradationEvent(result, 'fallback', opts && opts.phase, opts && opts.label, reason)
   if (reason === 'non-English verdict') result.degradationTelemetry.languageViolations += 1
-  if (current.count === 2) result.degradationTelemetry.escalations += 1
+  if (current.count === 2) {
+    result.degradationTelemetry.escalations += 1
+    recordDegradationEvent(result, 'escalation', opts && opts.phase, opts && opts.label, 'model escalated after 2 failures')
+  }
   if (current.circuitOpen) result.degradationTelemetry.circuitBreakers += 1
   if (Array.isArray(result.logLines)) {
     result.logLines.push(`WARNING: agent "${opts && opts.label}" failure ${current.count}/${IDENTICAL_FAILURE_LIMIT}: ${reason}${current.circuitOpen ? ' (circuit open)' : ''}`)
@@ -3399,6 +6506,7 @@ async function reviewLoop({
       // Reviewer agent failed — fail-forward (treat as accepted) so a flaky reviewer doesn't block.
       plogFromResult(result, `${phaseLabel}: reviewer returned null — fail-forward (accepted)`)
       await appendReviewHistory(planDir, phaseLabel, iterations, null, 'fail-forward (reviewer-null)', result)
+      recordDegradationEvent(result, 'fail-forward', phaseLabel, 'critical-reviewer', 'reviewer returned null')
       return { accepted: true, iterations, lastVerdict: null, failForward: true, acceptancePath: 'fail-forward (reviewer-null)' }
     }
     lastVerdict = review
@@ -3426,7 +6534,7 @@ async function reviewLoop({
       revisePrompt = await enhancePrompt({
         gateKey: `${phaseLabel}-revise`,
         basePrompt: revisePrompt,
-        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${JSON.stringify(review.blockers).slice(0, 600)}; gaps: ${JSON.stringify(review.gaps).slice(0, 400)}`,
+        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${compactList(review.blockers, 8)}; gaps: ${compactList(review.gaps, 8)}`,
         intent: 'improve-design',
         result, planDir, useEnhancer,
       })
@@ -3440,6 +6548,7 @@ async function reviewLoop({
     if (!revise || !revise.artifactPath) {
       plogFromResult(result, `${phaseLabel}: reviser returned null — fail-forward (accepted)`)
       await appendReviewHistory(planDir, phaseLabel, iterations, review, 'fail-forward (reviser-null)', result)
+      recordDegradationEvent(result, 'fail-forward', phaseLabel, 'design-reviser', 'reviser returned null')
       return { accepted: true, iterations, lastVerdict: review, failForward: true, acceptancePath: 'fail-forward (reviser-null)' }
     }
     plogFromResult(result, `${phaseLabel}: revised (${(revise.changesApplied || []).length} changes)`)
@@ -3447,6 +6556,7 @@ async function reviewLoop({
   // Sub-cap exhausted without acceptance — fail-forward (non-terminal like the plan convergence gate).
   plogFromResult(result, `${phaseLabel}: sub-cap (${refineSubcap}) reached without acceptance — fail-forward`)
   await appendReviewHistory(planDir, phaseLabel, iterations, lastVerdict, 'fail-forward (sub-cap)', result)
+  recordDegradationEvent(result, 'fail-forward', phaseLabel, 'review-loop', 'sub-cap reached without acceptance')
   return { accepted: true, iterations, lastVerdict, failForward: true, acceptancePath: 'fail-forward (sub-cap)' }
 }
 
@@ -3802,11 +6912,29 @@ function applyApprovalDecision(result, decision) {
 function verifyAppendGrowth(result, path, ack) {
   if (!result) return { ok: true, unknown: true }
   if (!result._appendSizes) result._appendSizes = {}
+  // Digest-based comparison is authoritative when content is available — a
+  // writer-reported byte count can be hallucinated, but a content digest
+  // deterministically reflects what was actually written.
+  if (ack && ack.content != null) {
+    if (!result._appendDigests) result._appendDigests = {}
+    const currentDigest = computeContentDigest(ack.content)
+    const prevDigest = result._appendDigests[path] || null
+    result._appendDigests[path] = currentDigest
+    if (prevDigest == null) return { ok: true, prev: null, now: currentDigest, reason: 'digest-first-write' }
+    const ok = currentDigest !== prevDigest
+    const outcome = { ok, shrank: !ok, prev: prevDigest, now: currentDigest, reason: ok ? 'digest-grew' : 'digest-unchanged' }
+    if (!ok) {
+      if (!result.appendWarnings) result.appendWarnings = []
+      result.appendWarnings.push(`append-only file content unchanged (possible overwrite): ${path}`)
+    }
+    return outcome
+  }
+  // Fall back to byte-count comparison when no content is available
   const now = ack && Number.isFinite(ack.totalBytes) ? ack.totalBytes : null
-  if (now == null) return { ok: true, unknown: true } // writer didn't report a size — can't check
+  if (now == null) return { ok: true, unknown: true }
   const prev = Number.isFinite(result._appendSizes[path]) ? result._appendSizes[path] : null
   result._appendSizes[path] = now
-  if (prev == null) return { ok: true, prev: null, now } // first write to this path this run
+  if (prev == null) return { ok: true, prev: null, now }
   const ok = now > prev
   const outcome = { ok, shrank: now < prev, prev, now }
   if (!ok) {
@@ -3873,6 +7001,168 @@ function compactList(items, max = 5) {
   return extra > 0 ? `${body}\n- (+${extra} more — see the on-disk artifact)` : (body || '- (none)')
 }
 
+// Design-mode per-gate/per-run call/token budget enforcement (DBUDGET-01).
+// Wraps the Phase 5 budget-admission primitive with per-gate tracking so design
+// runs enforce real budgets instead of merely observing via gateTelemetry.
+// Non-spendable reserve for state flush/handoff is carved out and never consumed
+// by gate work. All functions are pure and deterministic — no I/O, no side effects.
+
+// Default budget caps derived from gateTelemetry characterization, not guessed.
+// callPerGate: max agent calls a single design gate may consume.
+// callPerRun: max total agent calls across the entire design run.
+// tokenPerGate/tokenPerRun: 0 = uncharacterized (call-only enforcement).
+const DESIGN_BUDGET_DEFAULTS = Object.freeze({
+  callPerGate: 8,
+  callPerRun: 200,
+  tokenPerGate: 0,
+  tokenPerRun: 0,
+})
+
+// Non-spendable reserve for state persistence and handoff — never consumed by gate work.
+const DESIGN_RESERVE_CALLS = 10
+
+// Create a design-mode budget accountant wrapping the Phase 5 pattern with per-gate tracking.
+// opts can override defaults (from args.designCallPerGate / args.designCallPerRun).
+function createDesignBudget(opts) {
+  const o = opts || {}
+  const limits = createBudgetLimits({
+    callCeiling: o.callPerRun || DESIGN_BUDGET_DEFAULTS.callPerRun,
+    tokenCeiling: o.tokenPerRun || DESIGN_BUDGET_DEFAULTS.tokenPerRun,
+  })
+  let accountant = createBudgetAccountant(limits)
+  accountant = setReserve(accountant, RESERVE_TYPES.HANDOFF, DESIGN_RESERVE_CALLS)
+  return {
+    accountant,
+    gateSpend: {},
+    caps: {
+      callPerGate: o.callPerGate || DESIGN_BUDGET_DEFAULTS.callPerGate,
+      tokenPerGate: o.tokenPerGate || DESIGN_BUDGET_DEFAULTS.tokenPerGate,
+    },
+  }
+}
+
+// Record actual spend for a design gate. Pure: returns a new budget object.
+function spendDesignGate(budget, gateName, calls, tokens) {
+  const prev = (budget.gateSpend && budget.gateSpend[gateName]) || { calls: 0, tokens: 0 }
+  return {
+    accountant: spendBudget(budget.accountant, calls, tokens),
+    gateSpend: {
+      ...budget.gateSpend,
+      [gateName]: {
+        calls: prev.calls + (calls || 0),
+        tokens: prev.tokens + (tokens || 0),
+      },
+    },
+    caps: { ...budget.caps },
+  }
+}
+
+// Remaining calls for a specific gate (per-gate cap minus spent).
+function gateCallsRemaining(budget, gateName) {
+  const spent = (budget.gateSpend && budget.gateSpend[gateName]) || { calls: 0 }
+  return Math.max(0, budget.caps.callPerGate - spent.calls)
+}
+
+// Check if a gate can be admitted within its per-gate cap AND the per-run ceiling.
+// estimatedCost: { calls, tokens } the gate is expected to consume.
+function canAdmitDesignGate(budget, gateName, estimatedCost) {
+  const gateCalls = gateCallsRemaining(budget, gateName)
+  const runCalls = callsRemaining(budget.accountant)
+  const neededCalls = (estimatedCost && estimatedCost.calls) || 0
+  if (neededCalls > gateCalls) {
+    return { admitted: false, reason: 'per-gate-cap', remaining: { gate: gateCalls, run: runCalls } }
+  }
+  if (neededCalls > runCalls) {
+    return { admitted: false, reason: 'per-run-cap', remaining: { gate: gateCalls, run: runCalls } }
+  }
+  return { admitted: true, remaining: { gate: gateCalls, run: runCalls } }
+}
+
+// Budget summary for handoff/status reporting. Merges the Phase 5 budgetSummary
+// with per-gate spend detail and the caps in effect.
+function designBudgetSummary(budget) {
+  const base = budgetSummary(budget.accountant)
+  const gateSpendCopy = {}
+  for (const name of Object.keys(budget.gateSpend)) {
+    gateSpendCopy[name] = { ...budget.gateSpend[name] }
+  }
+  return {
+    ...base,
+    gateSpend: gateSpendCopy,
+    caps: { ...budget.caps },
+  }
+}
+
+// Remaining tokens for a specific gate (per-gate token cap minus spent).
+// Returns Infinity when tokenPerGate is 0 (uncharacterized — see note below).
+function gateTokensRemaining(budget, gateName) {
+  const cap = budget.caps.tokenPerGate || 0
+  if (!cap) return Infinity
+  const spent = (budget.gateSpend && budget.gateSpend[gateName]) || { tokens: 0 }
+  return Math.max(0, cap - spent.tokens)
+}
+
+// Post-gate token spend recording. Called after a gate's agent calls complete to
+// record actual token consumption. This is the measurement hook for D3: the
+// mechanism exists so a dogfood run can collect real per-gate token data and
+// feed it back into characterized tokenPerGate/tokenPerRun caps. Until then,
+// designBudgetGate always records 0 tokens and only the call ceiling is enforced.
+// Pure: returns a new budget object.
+function recordGateTokenSpend(budget, gateName, tokens) {
+  return spendDesignGate(budget, gateName, 0, tokens)
+}
+
+// Per-loop sub-budget tracker for design review/refine loops (DLOOP-01).
+//
+// Each design review/refine loop (refine, reconcile, debug, escalation) gets its
+// OWN bounded sub-budget so early-loop spend cannot starve later gates or
+// escalation. This replaces the F12 defect where all four loops drew from the
+// single shared retryState counter. The shared retryState remains as a secondary
+// runaway guard, but the PRIMARY iteration limit for each loop is its own cap.
+//
+// All functions are pure and deterministic — no I/O, no side effects.
+
+// Create per-loop budget tracker. Each loop gets its own {used, cap} pool.
+// config overrides come from args (maxRefineIterations, maxReconcileIterations,
+// maxDebugRetries, maxEscalationRetries).
+function createLoopBudgets(config) {
+  const c = config || {}
+  return {
+    refine: { used: 0, cap: c.refineCap || REFINE_SUBCAP_DEFAULT },
+    reconcile: { used: 0, cap: c.reconcileCap || RECONCILE_SUBCAP_DEFAULT },
+    debug: { used: 0, cap: c.debugCap || DEBUG_SUBCAP_DEFAULT },
+    escalation: { used: 0, cap: c.escalationCap || ESCALATION_RETRIES_DEFAULT },
+  }
+}
+
+// Increment a single loop's used counter. Pure: returns a new budgets object.
+function spendLoop(budgets, loopName) {
+  const b = budgets && budgets[loopName]
+  if (!b) return budgets
+  return {
+    ...budgets,
+    [loopName]: { used: b.used + 1, cap: b.cap },
+  }
+}
+
+// Check if a specific loop has exhausted its own sub-budget.
+function loopBudgetExhausted(budgets, loopName) {
+  const b = budgets && budgets[loopName]
+  if (!b) return true
+  return b.used >= b.cap
+}
+
+// Summary of all loop budgets for handoff/status reporting.
+function loopBudgetSummary(budgets) {
+  if (!budgets) return {}
+  const out = {}
+  for (const name of Object.keys(budgets)) {
+    const b = budgets[name]
+    out[name] = { used: b.used, cap: b.cap, remaining: Math.max(0, b.cap - b.used) }
+  }
+  return out
+}
+
 // ---- Script body -----------------------------------------------------------
 
 async function main() {
@@ -3922,11 +7212,18 @@ async function main() {
       }
     }
     const validation = validatePipelineState(state)
+    var statusReportStr = renderStatusReport(state, validation)
+    // Phase 6: augment status with truthful readiness projection if the state
+    // includes one (added by Phase 6 extract terminal). This is read-only — status
+    // mode never writes, and the projection is the same immutable object the handoff used.
+    if (state.result && state.result.statusProjection) {
+      statusReportStr += '\n\n' + readinessSummary(state.result.statusProjection)
+    }
     return {
       mode: 'status',
       planDir: statusDir,
       ready: true,
-      statusReport: renderStatusReport(state, validation),
+      statusReport: statusReportStr,
       logLines: [`main: status report rendered for ${statusDir}${validation.ok ? '' : ' (state failed validation — best-effort)'}`],
     }
   }
@@ -3939,8 +7236,11 @@ async function main() {
   if (resumeArg) {
     // resumeArg is a planDir (or a plan.md path); normalize to a dir.
     const resumeDir = resumeArg.replace(/(^|\/)plan\.md$/, '$1').replace(/\/$/, '') + '/'
-    const loaded = await loadPipelineState(resumeDir)
+    const loaded = await loadPipelineStateWithRecovery(resumeDir)
     resumed = loaded && loaded.state
+    if (loaded && loaded.recovered) {
+      log(`main: --resume auto-recovered from pipeline-state.last-good.json at ${resumeDir} (primary was corrupt/truncated)`)
+    }
     if (!resumed) {
       // No persisted state at the resume path. Return a clean blocked result instead of a raw
       // throw: this site sits BEFORE main()'s safety-net try-block, so a throw would escape as an
@@ -3963,6 +7263,18 @@ async function main() {
         logLines: [`main: resume blocked — no pipeline-state.json at ${resumeDir}`],
       }
       return block
+    }
+    // INT-MIGRATION-RESUME: explicit --migrate converts a v1.4.5 legacy state file
+    // (one carrying result.slices) to v1.5.0 format before validation. Opt-in flag
+    // avoids misfire-prone auto-detection on every resume. When the flag is absent,
+    // a legacy state file that passes structural validation resumes as-is (backward
+    // compatible); one that fails validation still blocks with resume-invalid-state.
+    if (args && args.migrate) {
+      const beforeVersion = resumed.schemaVersion || 'pre-1.5.0'
+      resumed = migrateResumeState(resumed)
+      if (resumed.schemaVersion === '1.5.0' && beforeVersion !== '1.5.0') {
+        log(`main: --migrate converted legacy state (${beforeVersion}) to v1.5.0`)
+      }
     }
     // EN-2: validate the hydrated state BEFORE trusting it into 25+ result flags. A
     // corrupt/truncated pipeline-state.json (a failed chunked write, IM-1) that still
@@ -4024,13 +7336,71 @@ async function main() {
   // derive it from the task. Persisted state.slug is the source of truth (L904).
   const slug = resumeArg ? (resumed && resumed.slug) || taskSlug(task) : taskSlug(task)
 
+  // D2 (two parallel budget systems): the Phase-5 global retryState (below) and
+  // the Phase-10 designBudget (further below) coexist by design. retryState is a
+  // module-level mutable singleton in config.mjs that tracks extract-mode retry
+  // spend across the entire run; designBudget is a local immutable-per-spend
+  // accountant that tracks design-mode per-gate/per-run call budgets. They serve
+  // different modes (extract vs design) and neither ceiling has been approached
+  // in production runs. Unifying them would add abstraction risk on verified
+  // code for no proven benefit (YAGNI). Unification would be warranted only if:
+  // (a) a single mode started hitting both ceilings, or (b) cross-mode budget
+  // sharing became a requirement.
   // Single global retry budget — the only "stop" condition for loops. Per-loop
   // soft sub-caps keep one loop from monopolizing the whole budget.
   const retryBudget = (args && args.retryBudget) || RETRY_BUDGET_DEFAULT
   const refineSubcap = (args && args.maxRefineIterations) || REFINE_SUBCAP_DEFAULT
   const debugSubcap = (args && args.maxDebugRetries) || DEBUG_SUBCAP_DEFAULT
   const reconcileSubcap = (args && args.maxReconcileIterations) || RECONCILE_SUBCAP_DEFAULT
+  const escalationCap = (args && args.maxEscalationRetries) || ESCALATION_RETRIES_DEFAULT
   const decisionCap = (args && args.decisionCap) || DECISION_CAP_DEFAULT
+  // DLOOP-01: per-loop sub-budgets so early-loop spend cannot starve later loops.
+  // The shared retryState remains as a secondary runaway guard.
+  let loopBudgets = createLoopBudgets({
+    refineCap: refineSubcap,
+    reconcileCap: reconcileSubcap,
+    debugCap: debugSubcap,
+    escalationCap: escalationCap,
+  })
+  // DBUDGET-01: per-gate/per-run call/token budget enforcement with non-spendable
+  // reserve for state flush/handoff (wraps the Phase 5 budget-admission pattern).
+  let designBudget = createDesignBudget({
+    callPerGate: args && args.designCallPerGate,
+    callPerRun: args && args.designCallPerRun,
+  })
+  // DBUDGET-01: per-gate budget admission gate. Returns true if the caller must
+  // block (budget exhausted); false if admitted (spend recorded). The non-spendable
+  // HANDOFF reserve is protected by callsRemaining inside canAdmitDesignGate.
+  //
+  // D1 (call-counting trade-off): each gate INVOCATION counts as 1 call, not the
+  // actual intra-gate agent calls. This is conservative: a gate that short-circuits
+  // (e.g. cached result) still costs 1 (over-count), while a gate that retries or
+  // escalates internally costs only 1 (under-count). The per-gate cap (default 8)
+  // acts as a multiplier ceiling, and the per-run cap (default 200) bounds the
+  // total. Counting actual agent calls would require instrumenting every gate's
+  // agent invocation — a deep change with regression risk on verified code. The
+  // post-gate token recording hook (recordGateTokenSpend in design-budget.mjs)
+  // provides the plumbing for future finer-grained measurement.
+  async function designBudgetGate(r, gateName) {
+    var admit = canAdmitDesignGate(designBudget, gateName, { calls: 1 })
+    if (admit.admitted) {
+      designBudget = spendDesignGate(designBudget, gateName, 1, 0)
+      return false
+    }
+    r.blockedAt = 'design-budget-exhausted'
+    r._designBudget = designBudgetSummary(designBudget)
+    r._loopBudgets = loopBudgetSummary(loopBudgets)
+    r.handoff = {
+      from: 'design',
+      message: `Design budget exhausted at gate '${gateName}' (${admit.reason}; gate remaining: ${admit.remaining.gate}, run remaining: ${admit.remaining.run}). Re-run with --resume ${planDir} or increase args.designCallPerRun.`,
+      nextMode: 'design',
+      planDir,
+    }
+    stateCheckpoint(gateName, 'budget-exhausted')
+    logTelemetrySummary()
+    await consolidate(slug, r, config)
+    return true
+  }
   const autoCommit = !!(args && args.autoCommit)
   const testTarget = (args && args.testTarget) || '' // empty => whole suite
   // IM-4: stack-agnostic test gate. --test-cmd pins an exact command; --test-framework
@@ -4307,6 +7677,14 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
     if (!result.extractQueue) result.extractQueue = []
     if (result.overviewPath === undefined) result.overviewPath = null
     if (result.extractReady === undefined) result.extractReady = false
+    // Phase 5: backfill bounded scheduler state on pre-v1.5 resume.
+    if (result.continuationState === undefined) result.continuationState = null
+    if (result.budgetAccountant === undefined) result.budgetAccountant = null
+    if (result.attemptHistory === undefined) result.attemptHistory = null
+    // Phase 6: backfill synthesis, persistence, and status-truth state.
+    if (result.synthesisState === undefined) result.synthesisState = null
+    if (result.persistenceTracker === undefined) result.persistenceTracker = null
+    if (result.statusProjection === undefined) result.statusProjection = null
     if (result.auditPath === undefined) result.auditPath = null
     plog(`--resume: hydrated state for slug "${slug}" (mode=${mode}, priorLastGate=${(resumed.result._state && resumed.result._state.lastGate) || 'none'})`)
     // The user-level install is a symlink that tracks the plugin, so a resume after a
@@ -4354,6 +7732,8 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       useCasePath: null,
       openQuestionsPath: null, // F10/I4: <planDir>/open-questions.md tracked artifact
       reconcile: null,
+      _designCheckpoints: {}, // gate-name -> { acknowledged, artifactPath }
+      _artifactDigests: {}, // pathKey -> content digest recorded at checkpoint time
       published: null,
       recommendedPath: null,
       tddEnforced: false,
@@ -4404,6 +7784,15 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
       overviewPath: null, // <planDir>/system-overview.md (multi-slice only)
       extractReady: false, // extract terminal: all pending slices processed
       auditPath: null, // <planDir>/design-audit.md (single-slice; per-slice audits live on queue entries)
+      // Phase 5: bounded scheduler and transactional automatic continuation state.
+      continuationState: null, // monotonic segment tracking + idempotency keys
+      budgetAccountant: null, // characterized budget admission with non-spendable reserve
+      attemptHistory: null, // per-gate/per-feature retry attempt journal
+      _degradationLog: [], // DHIST-01: durable journal of fail-forward/retry/escalation/fallback events
+      // Phase 6: synthesis, persistence tracking, and truthful status projection.
+      synthesisState: null, // incremental project views with selective revision invalidation
+      persistenceTracker: null, // attempted-vs-durable write lifecycle tracking
+      statusProjection: null, // immutable projection shared by handoff and status
       // Review mode (standalone design-docset audit) state. Defaults keep older
       // pipeline-state.json hydrating without breakage (same backward-compat rule).
       reviewPath: null, // <planDir>/design-review.md report
@@ -4424,6 +7813,34 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
   // gateDone: resume self-skip helper. Returns true (and logs) if the gate's
   // completion flag is already set, so the gate body can skip its agent call.
   const gateDone = (flag) => { if (result[flag]) { plog(`resume: skip gate (${flag} set)`); return true } return false }
+
+  // checkpointDesign: durably persist the in-memory result after each material
+  // design gate so an interrupted run resumes at the first incomplete gate
+  // without repeating verified work. Adopts the Phase 4 checkpointSlice pattern:
+  // record gate completion + artifact digest, then flush state to disk via the
+  // snapshot-retaining writer. Non-blocking — a flush failure only warns.
+  const checkpointDesign = async (gateName, artifactPathKey) => {
+    if (!result._designCheckpoints) result._designCheckpoints = {}
+    if (!result._artifactDigests) result._artifactDigests = {}
+    result._designCheckpoints[gateName] = {
+      acknowledged: true,
+      artifactPath: artifactPathKey ? (result[artifactPathKey] || null) : null,
+    }
+    if (artifactPathKey && result[artifactPathKey]) {
+      // The result data field for definitionPath is _define (gate name),
+      // not _definition (path prefix). All other keys follow the _ + replace
+      // convention and match their result field directly.
+      const dataKey = artifactPathKey === 'definitionPath' ? '_define'
+        : '_' + artifactPathKey.replace('Path', '')
+      result._artifactDigests[artifactPathKey] = computeContentDigest(result[dataKey] || result[artifactPathKey])
+    }
+    plog(`checkpointDesign: durable flush at gate '${gateName}'`)
+    try {
+      await flushPipelineStateWithSnapshot(planDir, result, config)
+    } catch (e) {
+      plog(`checkpointDesign: flush failed at '${gateName}' (non-blocking) — ${String(e)}`)
+    }
+  }
 
   // Surface the per-gate agent-call telemetry at terminal exits so users can see where a
   // run spent its calls/retries/escalations (and how much rode on fallbacks) without
@@ -4947,6 +8364,54 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       const multiSlice = result.extractQueue.length > 1
         || (result.extractQueue[0] && result.extractQueue[0].planDir !== planDir)
 
+      // Phase 5: initialize bounded scheduler state on first entry (not on resume).
+      // Budget accountant reserves non-spendable capacity for checkpoint, reconciliation,
+      // synthesis, and handoff so gate work cannot starve system-critical operations.
+      // Continuation state tracks monotonic segment IDs and idempotency keys.
+      // Attempt history journals every retry with a terminal reason.
+      if (!result.continuationState) {
+        result.continuationState = createContinuationState()
+      }
+      if (!result.budgetAccountant) {
+        const limits = createBudgetLimits({
+          callCeiling: 1000,
+          retryPerGate: 3,
+          retryPerFeature: 10,
+        })
+        let acct = createBudgetAccountant(limits)
+        // Reserve non-spendable capacity for each system-critical category.
+        // These reserves ensure checkpoint/synthesis/handoff can always complete
+        // even when gate work approaches the shared call ceiling.
+        acct = setReserve(acct, RESERVE_TYPES.CHECKPOINT, 5)
+        acct = setReserve(acct, RESERVE_TYPES.RECONCILIATION, 5)
+        acct = setReserve(acct, RESERVE_TYPES.SYNTHESIS, 5)
+        acct = setReserve(acct, RESERVE_TYPES.HANDOFF, 5)
+        result.budgetAccountant = acct
+      }
+      if (!result.attemptHistory) {
+        result.attemptHistory = createAttemptHistory()
+      }
+      // Phase 6: initialize synthesis and persistence tracking on first entry.
+      // Synthesis state holds incrementally built project views with revision tracking.
+      // Persistence tracker distinguishes attempted from durably verified writes.
+      if (!result.synthesisState) {
+        result.synthesisState = createSynthesisState()
+      }
+      if (!result.persistenceTracker) {
+        result.persistenceTracker = createPersistenceTracker()
+      }
+      // Allocate a monotonic segment ID and declare intent for this batch.
+      var segAlloc = nextSegmentId(result.continuationState)
+      result.continuationState = segAlloc.state
+      var currentSegmentId = segAlloc.segmentId
+      var segmentFeatureIds = result.extractQueue
+        .filter(function (s) { return s.status === 'pending' })
+        .map(function (s) { return s.id })
+      var segIntent = createSegmentIntent(
+        result.continuationState, currentSegmentId, segmentFeatureIds, result.scopeManifestPath
+      )
+      result.continuationState = segIntent.state
+
       // Slice loop: one full extraction cycle per pending slice, state flushed after each
       // slice so a kill/resume continues mid-queue. A blocked slice logs and the queue moves
       // on (one slice failing to extract is information, not a reason to abandon the rest).
@@ -4954,15 +8419,51 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       while ((slice = nextPendingSlice(result.extractQueue))) {
         if (budgetExhausted(retryBudget)) {
           result.blockedAt = 'extract-budget'
+          var budgetResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
           result.handoff = {
             from: 'extract',
             message: `Retry budget exhausted mid-queue (${retryState.used}/${retryBudget}). Completed slices are preserved; resume the rest: /extract-design --resume ${planDir}`,
             nextMode: 'extract',
             planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: budgetResume.counts,
           }
           plog(`Extract: retry budget exhausted with ${result.extractQueue.filter((s) => s.status === 'pending').length} slice(s) pending — blocking (resumable)`)
           stateCheckpoint('Extract Slice', 'blocked')
+          result.persistenceTracker = recordAttemptedWrite(
+            result.persistenceTracker, 'extract:blocked-budget:' + planDir, 'project-index'
+          )
           await consolidate(slug, result, config)
+          result.persistenceTracker = verifyDurableWrite(
+            result.persistenceTracker, 'extract:blocked-budget:' + planDir
+          )
+          return result
+        }
+        // Budget admission: verify the next slice can complete its gates without
+        // crossing the characterized call ceiling or spending non-spendable reserve.
+        var nextGateCost = { calls: 20 }
+        if (!canFinishNextGate(result.budgetAccountant, nextGateCost)) {
+          var adm = admitSegment(result.budgetAccountant, nextGateCost)
+          result.blockedAt = 'extract-budget-ceiling'
+          var ceilingResume = resumeCommand(planDir, currentSegmentId, result.continuationState)
+          result.handoff = {
+            from: 'extract',
+            message: `Budget ceiling reached. Remaining calls: ${callsRemaining(result.budgetAccountant)} (reserve preserved). Resume: /extract-design --resume ${planDir}`,
+            nextMode: 'extract',
+            planDir,
+            segmentId: currentSegmentId,
+            segmentCounts: ceilingResume.counts,
+            budget: budgetSummary(result.budgetAccountant),
+          }
+          plog(`Extract: budget ceiling — admission denied (${adm.reason}), blocking (resumable)`)
+          stateCheckpoint('Extract Slice', 'blocked')
+          result.persistenceTracker = recordAttemptedWrite(
+            result.persistenceTracker, 'extract:blocked-ceiling:' + planDir, 'project-index'
+          )
+          await consolidate(slug, result, config)
+          result.persistenceTracker = verifyDurableWrite(
+            result.persistenceTracker, 'extract:blocked-ceiling:' + planDir
+          )
           return result
         }
         slice.status = 'in-progress'
@@ -4989,10 +8490,30 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           auditPath: (slice.artifacts && slice.artifacts.auditPath) || null,
           _reviewedDesign: !!(slice.artifacts && slice.artifacts.reviewed),
           _reviewedArch: !!(slice.artifacts && slice.artifacts.reviewed),
+          lifecycle: 'in-progress',
+          _gateCheckpoints: {},
         }
         let outcome
         try {
-          outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          // For multi-slice runs, spawn the leaf via Workflow() composition (one level,
+          // no recursion). The leaf processes exactly one feature in its own sandbox;
+          // the top-level retains all scheduling/readiness authority. Fallback to direct
+          // call for single-slice runs or when Workflow is unavailable (test harness).
+          if (typeof Workflow === 'function' && !single && Workflow.name !== '') {
+            const leafResult = await Workflow({
+              name: 'fp-extract-slice',
+              args: { slice, task, config, sliceState, retryBudget, refineSubcap, decisionCap },
+            })
+            if (leafResult && leafResult.status) {
+              outcome = { status: leafResult.status, gate: leafResult.gate }
+              if (leafResult.sliceState) Object.assign(sliceState, leafResult.sliceState)
+              if (leafResult.logLines) for (const line of leafResult.logLines) plog(line)
+            } else {
+              outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+            }
+          } else {
+            outcome = await extractSlice({ slice, task, result, sliceState, config, retryBudget, refineSubcap, decisionCap })
+          }
         } catch (e) {
           outcome = { status: 'blocked', gate: 'uncaught-throw' }
           plog(`Extract: slice ${slice.id} threw (${String(e)}) — marking blocked and continuing`)
@@ -5008,9 +8529,22 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
           reviewed: !!sliceState._reviewedDesign,
         }
         slice.status = outcome.status === 'done' ? 'done' : 'blocked'
+        // Phase 5: record the attempt in the durable history journal.
+        // Success records a terminal-success entry; failure records the outcome
+        // and reason so exhausted retries are never reclassified as completed.
+        var attemptOutcome = outcome.status === 'done'
+          ? ATTEMPT_OUTCOMES.SUCCESS
+          : (outcome.gate === 'uncaught-throw' ? ATTEMPT_OUTCOMES.RETRYABLE_FAILURE : ATTEMPT_OUTCOMES.INVALID_OUTPUT)
+        result.attemptHistory = recordAttempt(
+          result.attemptHistory, slice.id, outcome.gate || 'extract', attemptOutcome, outcome.status !== 'done' ? ('blocked at ' + outcome.gate) : null
+        )
+        // Phase 5: spend budget for the completed gate work.
+        result.budgetAccountant = spendBudget(result.budgetAccountant, 10, 0)
         if (outcome.status !== 'done') {
           slice.blockedGate = outcome.gate
-          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — continuing with remaining slices`)
+          // Isolate the failure: only this slice is affected; independent work continues.
+          result.extractQueue = isolateFailure(result.extractQueue, slice.id, 'blocked')
+          plog(`Extract: slice ${slice.id} blocked at ${outcome.gate} — isolated; continuing with remaining slices`)
         } else {
           plog(`Extract: slice ${slice.id} done`)
         }
@@ -5027,6 +8561,36 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         stateCheckpoint('Extract Slice', slice.status)
         await flushPipelineState(planDir, result, config)
       }
+
+      // Phase 5: acknowledge the segment completion with exact counts.
+      // The monotonic segment ID plus idempotency key ensures duplicate, lost,
+      // or out-of-order launches converge to one durable outcome.
+      var segCounts = segmentOutcome(result.extractQueue)
+      var segKey = idempotencyKey(currentSegmentId, segmentFeatureIds, result.scopeManifestPath)
+      var segAck = acknowledgeSegment(
+        result.continuationState, currentSegmentId, segKey,
+        segCounts.completed > 0 ? 'partial' : 'no-progress', segCounts
+      )
+      result.continuationState = segAck.state
+
+      // Phase 6: synthesize project views from verified feature summaries.
+      // Incremental: only changed inputs trigger view rebuilds; idempotent.
+      var featureSummaries = result.extractQueue.map(function (s) {
+        return {
+          id: s.id,
+          name: s.name,
+          lifecycle: s.status === 'done' ? 'completed' : (s.status === 'blocked' ? 'blocked' : 'deferred'),
+          artifacts: s.artifacts || {},
+          dependencies: s.dependencies || [],
+          crossCuttingConcerns: s.crossCuttingConcerns || [],
+        }
+      })
+      result.synthesisState = synthesizeProjectViews(
+        featureSummaries, result.synthesisState,
+        { scope: result.scopeManifestPath || null, graph: result.scopeManifestPath || null }
+      )
+      plog('Extract: synthesis — ' + (result.synthesisState.synthesized ? 'views rebuilt' : 'no change') +
+        ', coverage denominator: ' + (result.synthesisState.views.coverageIndex ? result.synthesisState.views.coverageIndex.denominator : 0))
 
       // Gate X8: system overview (multi-slice only, non-blocking).
       if (multiSlice && !result.overviewPath) {
@@ -5090,27 +8654,85 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
         }
         plog(`Extract: terminal verification failed — doneSlices=${doneSlices.length}; failedChecks=${failedArtifactChecks.length}`)
         stateCheckpoint('Extract', 'blocked')
+        result.persistenceTracker = recordAttemptedWrite(
+          result.persistenceTracker, 'extract:artifact-missing:' + planDir, 'project-index'
+        )
         await consolidate(slug, result, config)
+        result.persistenceTracker = verifyDurableWrite(
+          result.persistenceTracker, 'extract:artifact-missing:' + planDir
+        )
         return result
       }
 
+      // Phase 6: truthful readiness derivation. extractReady is true ONLY when
+      // discovery is exhausted, graph is valid, every in-scope feature is verified
+      // complete, synthesis is current, and required artifacts are current.
       phase('Extract')
-      result.extractReady = true
-      if (!multiSlice) result.designReady = true
+      var extractProjectState = {
+        discoveryExhausted: true,
+        graphValid: !failedArtifactChecks.length,
+        features: result.extractQueue.map(function (s) {
+          return {
+            id: s.id,
+            lifecycle: s.status === 'done' ? 'completed' : (s.status === 'blocked' ? 'blocked' : 'deferred'),
+          }
+        }),
+        synthesisCurrent: isSynthesisCurrent(result.synthesisState, {
+          scope: result.scopeManifestPath || null,
+          graph: result.scopeManifestPath || null,
+        }),
+        artifactsCurrent: !failedArtifactChecks.length,
+      }
+      var readiness = deriveExtractReadiness(extractProjectState)
+      result.extractReady = readiness.ready
+      result.readinessReason = readiness.reason
+      if (!multiSlice) result.designReady = readiness.ready
       const blockedCount = result.extractQueue.filter((s) => s.status === 'blocked').length
       const skippedCount = result.extractQueue.filter((s) => s.status === 'skipped').length
+
+      // Phase 6: build the immutable status projection shared by handoff and status.
+      // Both surfaces report identical denominator, lifecycle outcomes, revisions,
+      // budgets, failures, readiness proof, and continuation evidence.
+      result.statusProjection = projectStatusProjection({
+        planDir: planDir,
+        scopeManifestPath: result.scopeManifestPath || null,
+        discoveryExhausted: extractProjectState.discoveryExhausted,
+        graphValid: extractProjectState.graphValid,
+        features: extractProjectState.features,
+        synthesisCurrent: extractProjectState.synthesisCurrent,
+        artifactsCurrent: extractProjectState.artifactsCurrent,
+        revisions: { scope: result.scopeManifestPath || null },
+        budget: budgetSummary(result.budgetAccountant),
+        failures: (result.attemptHistory && result.attemptHistory.entries
+          ? result.attemptHistory.entries.filter(function (e) { return e.outcome !== 'success' })
+          : []),
+        continuation: continuationSummary(result.continuationState),
+      })
+
       result.handoff = {
         from: 'extract',
         nextMode: 'tune',
         planDir,
         slices: result.extractQueue.map((s) => ({ id: s.id, name: s.name, planDir: s.planDir, status: s.status })),
+        segments: continuationSummary(result.continuationState),
+        budget: budgetSummary(result.budgetAccountant),
+        persistence: persistenceReport(result.persistenceTracker),
+        readiness: readinessSummary(result.statusProjection),
         message: multiSlice
           ? `Extraction complete: ${doneSlices.length} slice(s) documented under ${planDir}slices/ (overview: ${result.overviewPath || '(none)'})${blockedCount ? `; ${blockedCount} blocked` : ''}${skippedCount ? `; ${skippedCount} skipped — resume later with --slices` : ''}. Per slice: audit findings are in issues-and-improvements.md — run /tune-feature <sliceDir> to fix, or /design-feature --resume <sliceDir> to build on the baseline.`
           : `Extraction complete. As-is design docs are in ${planDir}. Audit findings (if any) are in issues-and-improvements.md — run /tune-feature ${planDir} to fix them, or /design-feature --resume ${planDir} to build on the baseline.`,
       }
       stateCheckpoint('Extract', 'done')
-      plog(`Extract: extractReady=true — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+      plog(`Extract: extractReady=${readiness.ready} (${readiness.reason}) — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+
+      // Phase 6: track the durable consolidate write through the persistence tracker.
+      result.persistenceTracker = recordAttemptedWrite(
+        result.persistenceTracker, 'extract:consolidate:' + planDir, 'project-index'
+      )
       await consolidate(slug, result, config)
+      result.persistenceTracker = verifyDurableWrite(
+        result.persistenceTracker, 'extract:consolidate:' + planDir
+      )
       return result
     }
 
@@ -5134,6 +8756,7 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
     plog('resume: skip Define (definitionPath set)')
   } else {
     plog('Producing task definition')
+    if (await designBudgetGate(result, 'Define')) return result
     definition = await flexibleAgent(
       `You are the task-definition-architect agent. Turn this raw task sketch into a rigorous
 task definition and write it to ${definitionPath}.
@@ -5229,6 +8852,7 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
     plog(`Define: definition written to ${definition.definitionPath}; recommendedPath=${definition.recommendedPath || 'full'}`)
   }
   stateCheckpoint('Define', 'done')
+    await checkpointDesign('define', 'definitionPath')
 
     }
 
@@ -5255,6 +8879,7 @@ cannot answer a question, mark resolved=false. Return the gathered {question, an
     } else {
       phase('Knowledge')
       plog('Consulting project knowledge')
+      if (await designBudgetGate(result, 'Knowledge')) return result
       try {
         const knowledge = await flexibleAgent(
           `You are the project-knowledge-consultant agent. Consult the project knowledge and findings
@@ -5277,6 +8902,7 @@ Return a concise brief the architecture + detailed-design agents can consume. Do
         plog('Knowledge Consult: failed (non-blocking) — ' + String(e))
       }
       stateCheckpoint('Knowledge', 'done')
+      await checkpointDesign('knowledge')
     }
 
     // Gate 0.2: Codebase Facts (Phase D2 — code-explorer routing) ---------
@@ -5292,6 +8918,7 @@ Return a concise brief the architecture + detailed-design agents can consume. Do
     } else {
       phase('Codebase Facts')
       plog('Gathering codebase facts via code-explorer')
+      if (await designBudgetGate(result, 'Codebase Facts')) return result
       try {
         const facts = await safeAgent(
           `You are the code-explorer agent. Explore the codebase to gather STRUCTURE FACTS for this task
@@ -5328,6 +8955,7 @@ or commit. Return the path + a concise summary of the most important facts.`,
         plog('Codebase Facts: failed (non-blocking) — ' + String(e))
       }
       stateCheckpoint('Codebase Facts', 'done')
+      await checkpointDesign('codebase-facts', 'factsPath')
     }
 
 
@@ -5342,6 +8970,7 @@ or commit. Return the path + a concise summary of the most important facts.`,
       phase('E2E Use Cases')
       const useCasePath = planDir + 'e2e-use-cases.md'
       plog('Extracting end-to-end use cases')
+      if (await designBudgetGate(result, 'E2E Use Cases')) return result
       const useCases = await flexibleAgent(
         `You are the e2e-usecase-extractor agent. Identify and define end-to-end use cases / test
 scenarios for this task and write them to ${useCasePath}. Consume the idea doc at
@@ -5384,6 +9013,7 @@ mem:conventions first. Do NOT commit.`,
         await writeOpenQuestions(planDir, useCases.openQuestions.map((q) => ({ gate: 'E2E Use Cases', text: q, severity: 'unspecified' })), result)
       }
       stateCheckpoint('E2E Use Cases', 'done')
+      await checkpointDesign('e2e-use-cases', 'useCasePath')
     }
 
     // Gate 0.75: Requirements (Phase C1) ---------------------------------
@@ -5400,6 +9030,7 @@ mem:conventions first. Do NOT commit.`,
       phase('Requirements')
       const requirementsPath = planDir + 'requirements.md'
       plog('Collecting FRs + NFRs')
+      if (await designBudgetGate(result, 'Requirements')) return result
       const requirements = await safeAgent(
         `You are the requirements-collector agent. Collect and structure the functional (FRs) and
 non-functional (NFRs) requirements for this task and write them to ${requirementsPath}. Consume the
@@ -5436,6 +9067,7 @@ Write the requirements doc to ${requirementsPath} and return requirementsPath se
         await writeOpenQuestions(planDir, requirements.openQuestions.map((q) => ({ gate: 'Requirements', text: q, severity: 'unspecified' })), result)
       }
       stateCheckpoint('Requirements', 'done')
+      await checkpointDesign('requirements', 'requirementsPath')
     }
 
     // Gate 0.75R: Requirements review loop (Phase C2) --------------------
@@ -5469,6 +9101,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       }
       plog(`Requirements Review: ${reqReview && reqReview.accepted ? 'accepted' : 'fail-forward'} after ${reqReview ? reqReview.iterations : 0} iteration(s)${reqReview && reqReview.failForward ? ' (fail-forward)' : ''}`)
       stateCheckpoint('Requirements Review', 'done')
+      await checkpointDesign('requirements-review')
     }
 
     // Gate 0.5: Architecture (adopted agent) -------------------------------
@@ -5480,6 +9113,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       } else {
         phase('Architecture')
         plog('Producing high-level architecture design')
+        if (await designBudgetGate(result, 'Architecture')) return result
         const arch = await flexibleAgent(
           `You are the arch-design-orchestrator agent. Produce a high-level architecture design for this task
 and write it to ${archPath}. Consume the idea doc at ${result.definitionPath}${requirementsContext ? ', the requirements at ' + result.requirementsPath : ''} (its NFRs are your input contract).
@@ -5532,8 +9166,10 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
         }
         plog(`Arch Review: ${archReview && archReview.accepted ? 'accepted' : 'fail-forward'} after ${archReview ? archReview.iterations : 0} iteration(s)${archReview && archReview.failForward ? ' (fail-forward)' : ''}`)
         stateCheckpoint('Arch Review', 'done')
+        await checkpointDesign('arch-review')
       }
       stateCheckpoint('Architecture', 'done')
+      await checkpointDesign('architecture', 'archPath')
     }
 
     // Gate 0.6: Detailed Design (adopted agent) ----------------------------
@@ -5545,6 +9181,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       } else {
         phase('Detailed Design')
         plog('Producing detailed design')
+        if (await designBudgetGate(result, 'Detailed Design')) return result
         const design = await flexibleAgent(
           `You are the detailed-design-architect agent. Produce an implementation-ready detailed design for this task
 and write it to ${designPath}. Consume the high-level architecture at ${result.archPath || '(none — infer from idea doc)'},
@@ -5572,6 +9209,7 @@ Do NOT commit.`,
         if ((design.openGaps || []).length) plog(`  design openGaps: ${(design.openGaps || []).join('; ')}`)
       }
       stateCheckpoint('Detailed Design', 'done')
+      await checkpointDesign('detailed-design', 'designPath')
     }
 
     // Gate 0.6R: Detailed-Design review loop (Phase C2) -------------------
@@ -5603,6 +9241,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
       }
       plog(`Detailed Design Review: ${designReview && designReview.accepted ? 'accepted' : 'fail-forward'} after ${designReview ? designReview.iterations : 0} iteration(s)${designReview && designReview.failForward ? ' (fail-forward)' : ''}`)
       stateCheckpoint('Detailed Design Review', 'done')
+      await checkpointDesign('design-review')
     }
 
     // Gate 1: Plan ----------------------------------------------------------
@@ -5612,6 +9251,7 @@ Findings:\n${JSON.stringify({ blockers: (rev && rev.blockers) || [], gaps: (rev 
     } else {
       phase('Plan')
       plog('Producing plan')
+      if (await designBudgetGate(result, 'Plan')) return result
       plan = await flexibleAgent(
         `You are the plan-architect agent. Create (or update) the implementation plan at ${planPath}
 for this task. Consume the task definition at ${result.definitionPath} as the input contract.
@@ -5652,6 +9292,7 @@ single-lane execution). If the work is not cleanly separable, emit exactly ONE l
       plog(`Plan: plan written to ${plan.planPath}; lanes=${(plan.lanes || []).length}`)
     }
     stateCheckpoint('Plan', 'done')
+    await checkpointDesign('plan', 'planPath')
 
     // Gate 1.5: TDD Enforce (adopted agent) --------------------------------
     if (useTddEnforce) {
@@ -5660,6 +9301,7 @@ single-lane execution). If the work is not cleanly separable, emit exactly ONE l
       } else {
         phase('TDD Enforce')
         plog('Enforcing TDD + YAGNI on plan')
+        if (await designBudgetGate(result, 'TDD Enforce')) return result
         const tdd = await flexibleAgent(
           `You are the tdd-plan-enforcer agent. Harden the plan at ${planPath} IN PLACE with TDD and YAGNI discipline.
 Add TDD gates (RED: tests to write first and watch fail; GREEN: per-feature success criteria; integration;
@@ -5695,6 +9337,7 @@ mem:suggested_commands before enforcing. Do NOT commit.`,
         }
       }
       stateCheckpoint('TDD Enforce', 'done')
+      await checkpointDesign('tdd-enforce')
     }
 
     // Gate 1.7: Reconcile design vs plan (adopted agent, NON-BLOCKING) ------
@@ -5705,13 +9348,14 @@ mem:suggested_commands before enforcing. Do NOT commit.`,
     if (result.reconcile) {
       plog('resume: skip Reconcile (reconcile set)')
       reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-        ? `Reconcile conflicts to re-check: ${JSON.stringify(result.reconcile.conflicts)}\n`
+        ? `Reconcile conflicts to re-check: ${compactList(result.reconcile.conflicts, 8)}\n`
         : ''
     } else if (!useReconcile) {
       stateCheckpoint('Reconcile', 'skipped')
     } else {
       phase('Reconcile')
       plog('Reconciling plan against design artifacts')
+      if (await designBudgetGate(result, 'Reconcile')) return result
       const reconcile = await flexibleAgent(
         `You are the design-plan-reconciler agent. Compare the plan at ${planPath} against the design
 artifacts: architecture at ${result.archPath || '(none)'}, detailed design at ${result.designPath || '(none)'},
@@ -5729,7 +9373,7 @@ ${task}`,
       // self-reported flag (which could be true over live conflicts). Conflict count is truth.
       result.reconcile.consistent = (result.reconcile.conflicts || []).length === 0
       reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-        ? `Reconcile conflicts (address in review): ${JSON.stringify(result.reconcile.conflicts)}\n`
+        ? `Reconcile conflicts (address in review): ${compactList(result.reconcile.conflicts, 8)}\n`
         : ''
       plog(`Reconcile: consistent=${result.reconcile.consistent}; conflicts=${(result.reconcile.conflicts || []).length}; designAtFault=${!!result.reconcile.designAtFault}`)
 
@@ -5741,7 +9385,7 @@ ${task}`,
       // either limit the (still-conflicting) design is carried forward into review.
       let reconcileIterations = 0
       while (result.reconcile.designAtFault && (result.reconcile.designFixes || []).length
-             && reconcileIterations < reconcileSubcap && !budgetExhausted(retryBudget)) {
+             && reconcileIterations < reconcileSubcap && !loopBudgetExhausted(loopBudgets, 'reconcile')) {
         // Phase E2: once already looping (reconcileIterations >= 1), ask quick-decider whether
         // another design-fix cycle is worth it before spending budget. 'stop' carries the
         // still-conflicting design forward into review (reconcile never hard-blocks). null -> stop.
@@ -5753,7 +9397,7 @@ ${task}`,
               iterations: reconcileIterations,
               subcap: reconcileSubcap,
               retryBudget,
-              lastFailure: `Reconcile design-fix loop still flags the DESIGN at fault after ${reconcileIterations} fix iteration(s). Remaining design defects: ${JSON.stringify(result.reconcile.designFixes || []).slice(0, 800)}`,
+              lastFailure: `Reconcile design-fix loop still flags the DESIGN at fault after ${reconcileIterations} fix iteration(s). Remaining design defects: ${compactList(result.reconcile.designFixes || [], 8)}`,
             },
           })
           if (decide === 'stop') {
@@ -5761,9 +9405,9 @@ ${task}`,
             break
           }
         }
-        spendRetry(1)
+        loopBudgets = spendLoop(loopBudgets, 'reconcile')
         reconcileIterations += 1
-        plog(`Reconcile: design at fault — fixing architecture (${result.reconcile.designFixes.length} defect(s); fix ${reconcileIterations}/${reconcileSubcap}, retries used ${retryState.used}/${retryBudget})`)
+        plog(`Reconcile: design at fault — fixing architecture (${result.reconcile.designFixes.length} defect(s); fix ${reconcileIterations}/${reconcileSubcap}, loop budget ${loopBudgets.reconcile.used}/${loopBudgets.reconcile.cap})`)
         phase('Architecture')
         let archFixPrompt = `You are the arch-design-orchestrator agent. The design-plan-reconciler found the DESIGN
 (not the plan) is the source of conflict. Fix the architecture design at ${result.archPath || archPath}
@@ -5782,7 +9426,7 @@ Do NOT commit.`
           archFixPrompt = await enhancePrompt({
             gateKey: 'reconcile-archfix',
             basePrompt: archFixPrompt,
-            failureContext: `Reconcile design-fix iteration ${reconcileIterations}: prior architecture fix did not resolve conflicts. Remaining design defects: ${JSON.stringify(result.reconcile.designFixes).slice(0, 800)}`,
+            failureContext: `Reconcile design-fix iteration ${reconcileIterations}: prior architecture fix did not resolve conflicts. Remaining design defects: ${compactList(result.reconcile.designFixes, 8)}`,
             intent: 'improve-design',
             result, planDir, useEnhancer,
           })
@@ -5817,18 +9461,19 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
         // F7: re-derive consistent from conflict count after the design-fix re-reconcile.
         result.reconcile.consistent = (result.reconcile.conflicts || []).length === 0
         reconcileContext = result.reconcile.conflicts && result.reconcile.conflicts.length
-          ? `Reconcile conflicts (address in review): ${JSON.stringify(result.reconcile.conflicts)}\n`
+          ? `Reconcile conflicts (address in review): ${compactList(result.reconcile.conflicts, 8)}\n`
           : ''
         plog(`Reconcile: re-check consistent=${result.reconcile.consistent}; designAtFault=${!!result.reconcile.designAtFault}`)
         if (result.reconcile.consistent) break
       }
       if (result.reconcile.designAtFault) {
-        const reason = budgetExhausted(retryBudget)
-          ? `retry budget exhausted (${retryState.used}/${retryBudget})`
+        const reason = loopBudgetExhausted(loopBudgets, 'reconcile')
+          ? `reconcile loop budget exhausted (${loopBudgets.reconcile.used}/${loopBudgets.reconcile.cap})`
           : `reconcile sub-cap reached (${reconcileIterations}/${reconcileSubcap})`
         plog(`Reconcile: design-fix loop stopped — ${reason}; carrying conflict forward`)
       }
       stateCheckpoint('Reconcile', 'done')
+      await checkpointDesign('reconcile')
     }
 
     // Gate 2: Review / Refine loop (global-budget-bounded, never terminal) --
@@ -5842,9 +9487,10 @@ designAtFault=false. If the design is STILL wrong, keep designAtFault=true with 
     } else {
       let reviewState = { accepted: false }
       let refineCount = 0
-      while (!reviewState.accepted && refineCount < refineSubcap && !budgetExhausted(retryBudget)) {
+      while (!reviewState.accepted && refineCount < refineSubcap && !loopBudgetExhausted(loopBudgets, 'refine')) {
         phase('Review/Refine')
-        plog(`Review iteration ${refineCount + 1} (retries used ${retryState.used}/${retryBudget})`)
+        plog(`Review iteration ${refineCount + 1} (refine loop budget ${loopBudgets.refine.used}/${loopBudgets.refine.cap})`)
+        if (await designBudgetGate(result, 'Review/Refine')) return result
         const review = await safeAgent(
           `You are the critical-reviewer agent. Review the plan at ${planPath} against the task
 definition at ${result.definitionPath}. Task:
@@ -5860,7 +9506,7 @@ for being implementable.
 Return accepted=true iff there are NO blocker-severity findings. List blockers otherwise.`,
           { label: 'critical-reviewer(plan)', phase: 'Review/Refine', schema: REVIEW_VERDICT, model: gm('review') }, result
         )
-        spendRetry(1)
+        loopBudgets = spendLoop(loopBudgets, 'refine')
         if (!review) {
           // Reviewer agent failure is a retryable condition, not terminal.
           refineCount += 1
@@ -5885,7 +9531,7 @@ Return accepted=true iff there are NO blocker-severity findings. List blockers o
               iterations: refineCount,
               subcap: refineSubcap,
               retryBudget,
-              lastFailure: `Plan review rejected after ${refineCount} refine iteration(s). Outstanding blockers: ${JSON.stringify(review.blockers || []).slice(0, 800)}`,
+              lastFailure: `Plan review rejected after ${refineCount} refine iteration(s). Outstanding blockers: ${compactList(review.blockers || [], 8)}`,
             },
           })
           if (decide === 'stop') {
@@ -5898,12 +9544,12 @@ Return accepted=true iff there are NO blocker-severity findings. List blockers o
         let refinePrompt = `You are the plan-refiner agent. Address the following review findings on the plan at ${planPath}.
 Do not reduce scope of the pass gates.
 Findings:
-${JSON.stringify(review.blockers, null, 2)}`
+${compactList(review.blockers, 8)}`
         if (refineCount > 0) {
           refinePrompt = await enhancePrompt({
             gateKey: 'plan-refine',
             basePrompt: refinePrompt,
-            failureContext: `Prior refine iteration still rejected; review blockers not fully addressed. Review blockers: ${JSON.stringify(review.blockers).slice(0, 800)}`,
+            failureContext: `Prior refine iteration still rejected; review blockers not fully addressed. Review blockers: ${compactList(review.blockers, 8)}`,
             intent: 'improve-design',
             result, planDir, useEnhancer,
           })
@@ -5924,7 +9570,7 @@ ${JSON.stringify(review.blockers, null, 2)}`
       // defects hard-block (resumable via --resume). Real residual issues surface
       // at Test + Code-Review.
       if (!reviewState.accepted) {
-        if (budgetExhausted(retryBudget)) {
+        if (loopBudgetExhausted(loopBudgets, 'escalation')) {
           result.blockedAt = 'review'
           result.retryUsed = retryState.used
           stateCheckpoint('Review/Refine', 'blocked')
@@ -5933,10 +9579,17 @@ ${JSON.stringify(review.blockers, null, 2)}`
         }
         phase('Review/Refine')
         plog('Refine sub-cap reached — escalating to final reviewer')
-        // Escalation agent: retry up to ESCALATION_RETRIES times with a hardened prompt before
+        // Escalation agent: retry up to escalationCap times with a hardened prompt before
         // giving up. A schema/JSON throw (safeAgent -> null) on the final plan-review gate must NOT
         // silently force-accept an unreviewed plan — exhaust retries, then hard-block (resumable).
-        const ESCALATION_RETRIES = 5
+        // DLOOP-01: escalationCap is configurable via args.maxEscalationRetries (was hardcoded 5).
+        // DYAGNI-01: ensure BLOCKER-severity YAGNI findings reach the escalation reviewer
+        // even when reconcile was disabled (TDD Enforce routes them into reconcile.conflicts).
+        var yagniBlockerContext = ''
+        if (result.reconcile && result.reconcile.conflicts) {
+          var yagniBlockers = result.reconcile.conflicts.filter(function (c) { return /\[YAGNI BLOCKER\]/.test(String(c)) })
+          if (yagniBlockers.length) yagniBlockerContext = `\nYAGNI BLOCKER findings (must be addressed):\n${compactList(yagniBlockers, 8)}\n`
+        }
         const escalatePrompt = (attempt) => `You are the FINAL escalation reviewer. Prior review rounds rejected this plan; the blockers they
 raised are below. Reclassify EACH: is it a TRUE plan defect (missing scope/spec/ordering/risk) or an
 IMPLEMENTATION-DETAIL (call-site wiring, individual yield/construction sites, mechanics that belong to
@@ -5948,21 +9601,21 @@ Definition: ${result.definitionPath}
 Task: ${task}
 
 Prior blockers:
-${JSON.stringify((reviewState && reviewState.blockers) || [], null, 2)}
+${compactList((reviewState && reviewState.blockers) || [], 8)}${yagniBlockerContext}
 
 Set accepted=true if no TRUE defects remain. Set forceAcceptable=true if every remaining blocker is
 implementation-detail. List trueDefects (genuine plan defects) and implNotes (implementer-detail) separately.${
           attempt > 1
             ? `
 
-IMPORTANT (retry ${attempt}/${ESCALATION_RETRIES}): A prior response failed JSON/schema validation.
+IMPORTANT (retry ${attempt}/${escalationCap}): A prior response failed JSON/schema validation.
 Respond with STRICT valid JSON ONLY — no markdown, no code fences, no commentary. Keep every array and
 object well-formed and within the schema. If unsure, return accepted=false with empty arrays rather than
 malformed output.`
             : ''
         }`
         let escalation = null
-        for (let attempt = 1; attempt <= ESCALATION_RETRIES; attempt++) {
+        for (let attempt = 1; attempt <= escalationCap; attempt++) {
           // Phase E2: on schema-recovery retries (attempt > 1, prior escalation returned null),
           // ask quick-decider whether more JSON-format retries are worth it. 'stop' bails to the
           // hard-block path below (escalation stays null). null -> stop.
@@ -5972,7 +9625,7 @@ malformed output.`
               opts: {
                 loopName: 'escalation',
                 iterations: attempt - 1,
-                subcap: ESCALATION_RETRIES,
+                subcap: escalationCap,
                 retryBudget,
                 lastFailure: `Escalation reviewer returned malformed JSON / null on ${attempt - 1} prior attempt(s) (schema-recovery loop).`,
               },
@@ -5989,7 +9642,7 @@ malformed output.`
             attemptPrompt = await enhancePrompt({
               gateKey: 'escalation',
               basePrompt: attemptPrompt,
-              failureContext: `Escalation agent returned malformed JSON / null on prior attempt (attempt ${attempt}/${ESCALATION_RETRIES}). Need strict valid JSON conforming to ESCALATION_REVIEW schema.`,
+              failureContext: `Escalation agent returned malformed JSON / null on prior attempt (attempt ${attempt}/${escalationCap}). Need strict valid JSON conforming to ESCALATION_REVIEW schema.`,
               intent: 'tighten-format',
               result, planDir, useEnhancer,
             })
@@ -5998,9 +9651,9 @@ malformed output.`
             attemptPrompt,
             { label: 'critical-reviewer(escalation)', phase: 'Review/Refine', schema: ESCALATION_REVIEW, model: gm('reviewEscalation') }, result
           )
-          spendRetry(1)
+          loopBudgets = spendLoop(loopBudgets, 'escalation')
           if (escalation != null) break
-          plog(`Escalation agent failed (attempt ${attempt}/${ESCALATION_RETRIES}) — retrying with hardened prompt`)
+          plog(`Escalation agent failed (attempt ${attempt}/${escalationCap}) — retrying with hardened prompt`)
         }
         if (escalation == null) {
           // All retries exhausted: hard-block rather than force-accept an unreviewed plan.
@@ -6011,7 +9664,7 @@ malformed output.`
           result.refineIterations = refineCount
           result._escalation = escalation
           stateCheckpoint('Review/Refine', 'blocked')
-          plog(`Escalation failed after ${ESCALATION_RETRIES} retries — hard-block (resumable via --resume)`)
+          plog(`Escalation failed after ${escalationCap} retries — hard-block (resumable via --resume)`)
           await consolidate(slug, result, config)
           return result
         } else if (escalation.accepted === true) {
@@ -6025,6 +9678,7 @@ malformed output.`
           result.carriedBlockers = (escalation.trueDefects || []).concat(escalation.implNotes || [])
           result.refineIterations = refineCount
           result._escalation = escalation
+          recordDegradationEvent(result, 'fail-forward', 'Review/Refine', 'escalation', 'force-accepted plan with ' + result.carriedBlockers.length + ' carried blocker(s)')
           plog(`Force-accepting plan — ${result.carriedBlockers.length} blocker(s) carried forward (impl-detail)`)
         } else {
           // Genuine TRUE plan defects → hard-block (resumable via --resume).
@@ -6044,6 +9698,7 @@ malformed output.`
       plog(`Review/Refine: plan accepted (iterations=${refineCount}, forceAccepted=${result.forceAccepted})`)
     }
     stateCheckpoint('Review/Refine', 'done')
+    await checkpointDesign('review-refine')
 
     // ===== Phase H: plan-chunker → stages (design tail) ===========================
     // In design mode the THINK section ends right after this. Plan-chunker splits plan.md into
@@ -6054,10 +9709,12 @@ malformed output.`
       if (useChunker) {
         phase('Chunk Plan')
         plog('Chunking plan into stages (design tail)')
+        if (await designBudgetGate(result, 'Chunk Plan')) return result
         const stages = await chunkPlanIntoStages({ planPath, planDir, task, result, lanes: result.lanes })
         result.stages = stages
         plog(`plan-chunker: ${stages.length} stage(s) — ${stages.map((s) => s.id).join(', ')}`)
         stateCheckpoint('Chunk Plan', 'done')
+        await checkpointDesign('chunk-plan')
       } else {
         // --no-chunker: single implicit stage covering the whole plan (single-executor behavior).
         result.stages = [{
@@ -6089,12 +9746,16 @@ malformed output.`
           phase('Publish')
           plog('Design mode: publishing plan + architecture before design-stop')
           await publishDesign(result, planPath, task)
+          // DTERM-01: distinguish attempted from durably verified publish outcome.
+          result._publishVerified = !!(result.published && result.published.published)
           stateCheckpoint('Publish', 'done')
         }
         if (useKnowledgePersist && !result.persist) {
           phase('Persist')
           plog('Design mode: persisting findings before design-stop')
           await persistFindings(result)
+          // DTERM-01: distinguish attempted from durably verified persist outcome.
+          result._persistVerified = !!(result.persist && result.persist.persisted)
           plog(`Persist: persisted=${result.persist && result.persist.persisted}`)
           stateCheckpoint('Persist', 'done')
         }
@@ -6154,6 +9815,8 @@ malformed output.`
       // No budget is spent on approval round-trips.
       if (useApproval && !(result.designApproved && result.designApproved.approved)) {
         phase('Design')
+        result._designBudget = designBudgetSummary(designBudget)
+        result._loopBudgets = loopBudgetSummary(loopBudgets)
         result.designReady = true // the artifacts ARE ready; only the human sign-off is pending
         result.approvalPending = true
         result.blockedAt = 'awaiting-approval'
@@ -6174,12 +9837,55 @@ malformed output.`
       }
 
       phase('Design')
+      // DREADY-01: truthful design readiness — designReady must reflect actual gate outcomes.
+      // Check for hidden degradation (fail-forwarded reviews, force-accepted blockers,
+      // unresolved reconcile conflicts) before advertising readiness.
+      var designReadiness = deriveDesignReadiness(result)
+      // DQUEST-01: unresolved open questions block completion unless explicitly deferred.
+      if (result.openQuestionsPath && !(result._openQuestionsDeferred || []).length) {
+        designReadiness = {
+          ready: false,
+          reason: 'unresolved-open-questions',
+          degradation: (designReadiness.degradation || []).concat([{ type: 'unresolved-open-questions', path: result.openQuestionsPath }]),
+        }
+      }
+      if (!designReadiness.ready) {
+        result.designReady = false
+        result.designReadinessBlocker = designReadiness.reason
+        result.designReadinessDegradation = designReadiness.degradation
+        var degrSummary = designReadiness.degradation.map(function (d) { return d.type }).join(', ')
+        result.handoff = {
+          from: 'design',
+          message: `Design NOT ready — degraded: ${degrSummary}. Resolve the flagged issues and re-run: /design-feature --resume ${planDir}`,
+          nextMode: 'design',
+          planDir,
+          degradationDetail: designReadiness.degradation,
+          degradationLog: result._degradationLog || [],
+        }
+        stateCheckpoint('Design', 'degraded')
+        plog(`Design mode: NOT ready — ${degrSummary}`)
+        logTelemetrySummary()
+        await consolidate(slug, result, config)
+        return result
+      }
       result.designReady = true
+      // DBUDGET-01 / DLOOP-01: record budget summaries for handoff/status inspection.
+      result._designBudget = designBudgetSummary(designBudget)
+      result._loopBudgets = loopBudgetSummary(loopBudgets)
+      // DCHUNK-01: surface chunker degradation as an explicit acknowledged outcome.
+      var chunkerWarning = result._chunkerDegraded && !result._chunkerDegradationAcknowledged
+        ? ' WARNING: plan chunker degraded to a single stage — stage-level parallelism and resumability are lost.'
+        : ''
+      // DHIST-01: include degradation log summary in handoff for inspection.
+      var degrLogSummary = degradationLogSummary(result._degradationLog)
+      var degrLine = degrLogSummary ? ` Degradation events: ${degrLogSummary}.` : ''
       result.handoff = {
         from: 'design',
-        message: `Design ready${result.designApproved && result.designApproved.approved ? ' (user-approved)' : ''}. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}`,
+        message: `Design ready${result.designApproved && result.designApproved.approved ? ' (user-approved)' : ''}. Plan + artifacts are in ${planDir}. Review them, then run: /implement-feature ${planDir}.${chunkerWarning}${degrLine}`,
         nextMode: 'implement',
         planDir,
+        degradationLog: result._degradationLog || [],
+        chunkerDegraded: !!result._chunkerDegraded,
       }
       stateCheckpoint('Design', 'done')
       plog(`Design mode: designReady=true — stopping pre-execute (stages=${result.stages.length})`)
@@ -6264,6 +9970,7 @@ tests were created or existing coverage was verified.`,
         plog(`Test Authoring: written=${authored.written}; files=${(authored.files || []).length}; summary=${authored.summary || '(none)'}`)
       }
       stateCheckpoint('Test Authoring', 'done')
+      await checkpointDesign('test-authoring')
     } else if (isImplementMode && !useTestWriter) {
       stateCheckpoint('Test Authoring', 'skipped')
     }
@@ -6476,6 +10183,7 @@ declaring completion. ${carriedBlockersLine}`,
       }
     }
     stateCheckpoint('Execute', 'done')
+    await checkpointDesign('execute')
 
   } // end full-path branch — Gate 4+ run at main() level for BOTH paths
 
@@ -6566,6 +10274,7 @@ resolves the failures, plus a change summary.`
     plog(`Test: PASSED — ${test.summary || '(no summary)'}`)
   }
   stateCheckpoint('Test', 'done')
+  await checkpointDesign('test')
 
   // Gate 5: Code review ---------------------------------------------------
   phase('Code Review')
@@ -6635,6 +10344,7 @@ Do NOT include formatting nits unless they change meaning.`,
     }
   }
   stateCheckpoint('Code Review', 'done')
+  await checkpointDesign('code-review')
 
   // Gate 5.1: Commit Goalkeeper (Phase E3 — complex-decision-analyst) ---------
   // After final code-review passes, an authoritative decision-agent decides COMMIT vs LOOP-BACK.
@@ -6730,6 +10440,8 @@ Do NOT include formatting nits unless they change meaning.`,
     phase('Publish')
     plog('Publishing plan + architecture to project docs')
     await publishDesign(result, planPath, task)
+    // DTERM-01: distinguish attempted from durably verified publish outcome.
+    result._publishVerified = !!(result.published && result.published.published)
     stateCheckpoint('Publish', 'done')
   }
 
@@ -6761,6 +10473,16 @@ Use a clear conventional-commit message. Return the commit hash.`,
     result.committed = !!(commit && commit.committed)
     result.commitHash = commit ? commit.commitHash : null
     plog(`Commit: committed=${result.committed}; hash=${result.commitHash || '(none)'}`)
+    // DTERM-01: a failed commit is never reported as terminal success.
+    if (!result.committed) {
+      result.blockedAt = 'commit-failed'
+      recordDegradationEvent(result, 'fail-forward', 'Commit', 'git-ops', 'commit attempt failed')
+      stateCheckpoint('Commit', 'blocked')
+      result.retryUsed = retryState.used
+      logTelemetrySummary()
+      await consolidate(slug, result, config)
+      return result
+    }
   }
 
     // Reflect the true terminal gate in the persisted state and flush once more

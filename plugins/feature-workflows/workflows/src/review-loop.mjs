@@ -1,7 +1,7 @@
 import { FILE_ACK, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT } from './schemas.mjs'
 import { nsAgent, budgetExhausted, spendRetry, gm } from './config.mjs'
-import { safeAgent } from './agent-core.mjs'
-import { runQuickDecider, verifyAppendGrowth } from './decisions.mjs'
+import { safeAgent, recordDegradationEvent } from './agent-core.mjs'
+import { runQuickDecider, verifyAppendGrowth, compactList } from './decisions.mjs'
 
 
 // Append a review verdict to <planDir>/review-history.md (Phase C2 persistence). Non-blocking.
@@ -99,6 +99,7 @@ async function reviewLoop({
       // Reviewer agent failed — fail-forward (treat as accepted) so a flaky reviewer doesn't block.
       plogFromResult(result, `${phaseLabel}: reviewer returned null — fail-forward (accepted)`)
       await appendReviewHistory(planDir, phaseLabel, iterations, null, 'fail-forward (reviewer-null)', result)
+      recordDegradationEvent(result, 'fail-forward', phaseLabel, 'critical-reviewer', 'reviewer returned null')
       return { accepted: true, iterations, lastVerdict: null, failForward: true, acceptancePath: 'fail-forward (reviewer-null)' }
     }
     lastVerdict = review
@@ -126,7 +127,7 @@ async function reviewLoop({
       revisePrompt = await enhancePrompt({
         gateKey: `${phaseLabel}-revise`,
         basePrompt: revisePrompt,
-        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${JSON.stringify(review.blockers).slice(0, 600)}; gaps: ${JSON.stringify(review.gaps).slice(0, 400)}`,
+        failureContext: `${phaseLabel} review iteration ${iterations}: prior revision did not satisfy the reviewer. Outstanding blockers: ${compactList(review.blockers, 8)}; gaps: ${compactList(review.gaps, 8)}`,
         intent: 'improve-design',
         result, planDir, useEnhancer,
       })
@@ -140,6 +141,7 @@ async function reviewLoop({
     if (!revise || !revise.artifactPath) {
       plogFromResult(result, `${phaseLabel}: reviser returned null — fail-forward (accepted)`)
       await appendReviewHistory(planDir, phaseLabel, iterations, review, 'fail-forward (reviser-null)', result)
+      recordDegradationEvent(result, 'fail-forward', phaseLabel, 'design-reviser', 'reviser returned null')
       return { accepted: true, iterations, lastVerdict: review, failForward: true, acceptancePath: 'fail-forward (reviser-null)' }
     }
     plogFromResult(result, `${phaseLabel}: revised (${(revise.changesApplied || []).length} changes)`)
@@ -147,6 +149,7 @@ async function reviewLoop({
   // Sub-cap exhausted without acceptance — fail-forward (non-terminal like the plan convergence gate).
   plogFromResult(result, `${phaseLabel}: sub-cap (${refineSubcap}) reached without acceptance — fail-forward`)
   await appendReviewHistory(planDir, phaseLabel, iterations, lastVerdict, 'fail-forward (sub-cap)', result)
+  recordDegradationEvent(result, 'fail-forward', phaseLabel, 'review-loop', 'sub-cap reached without acceptance')
   return { accepted: true, iterations, lastVerdict, failForward: true, acceptancePath: 'fail-forward (sub-cap)' }
 }
 

@@ -2,14 +2,6 @@
 name: compress-agent
 description: |-
   Use this agent to compress a natural-language markdown body into caveman format in-session, preserving all code, URLs, paths, and headings exactly. Spawned in parallel by the compress-md skill (one agent per file) to cut input tokens (~46%) without any out-of-session claude/API call.
-
-  <example>
-  user: "Compress CLAUDE.md to save tokens"
-  assistant: "I'll spawn the compress-agent to rewrite the prose into caveman form while preserving every code block and URL."
-  <commentary>
-  The user wants token reduction on a markdown file. Use the compress-agent to do the in-session LLM compression step of the compress-md skill.
-  </commentary>
-  </example>
 tools: Read, Write
 model: haiku
 color: cyan

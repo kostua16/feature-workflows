@@ -2,14 +2,6 @@
 name: task-definition-architect
 description: |-
   Use this agent when the user wants to define a complex task with detailed specifications, acceptance criteria, and subtask breakdown.
-
-  <example>
-  user: "Create a detailed task for implementing the caching layer with performance requirements"
-  assistant: "I'll use the task-definition-architect agent to create a comprehensive task definition."
-  <commentary>
-  The user needs a detailed task specification, so use the task-definition-architect agent.
-  </commentary>
-  </example>
 tools: Write, ListMcpResourcesTool, Read, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: opus
 color: yellow

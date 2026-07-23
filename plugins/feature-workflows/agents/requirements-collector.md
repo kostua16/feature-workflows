@@ -2,14 +2,6 @@
 name: requirements-collector
 description: |-
   Use this agent when task needs collecting, eliciting, and structuring functional/non-functional requirements before implementation. Conducts structured interviews and investigates project docs to produce requirements specification.
-
-  <example>
-  user: "We need to add caching layer to log parser. Can you figure out what we need?"
-  assistant: "I'll launch requirements-collector agent to interview you and document requirements."
-  <commentary>
-  Use requirements-collector agent before planning or architecting new feature.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Edit, NotebookEdit, Write, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: opus
 color: red

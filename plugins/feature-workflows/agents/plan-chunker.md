@@ -2,22 +2,6 @@
 name: plan-chunker
 description: |-
   Use this agent to decompose large plan into smaller, dependency-aware execution stages (`stageNN.md` files) so executors fit in context and maximize parallelism. Updates original plan with TODO references to created stages.
-
-  <example>
-  user: "plan at.omc/plans/feature-auth.md is too large. Split it into stages."
-  assistant: "I'll use plan-chunker agent to decompose plan into manageable stages."
-  <commentary>
-  When plan is too large for one executor, use plan-chunker to split it into dependency-ordered, parallelizable stages.
-  </commentary>
-  </example>
-
-  <example>
-  user: "Can we parallelize parts of this plan?"
-  assistant: "I'll use plan-chunker agent to identify parallelizable and sequential stages."
-  <commentary>
-  Use plan-chunker to analyze dependencies and expose parallel execution opportunities.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Edit, NotebookEdit, Write, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: opus
 color: red

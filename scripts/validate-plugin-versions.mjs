@@ -1,24 +1,33 @@
-// Enforces the plugin's 3-way version lockstep:
+// Enforces the plugin's version lockstep across the manifest and ALL generated
+// workflow entries. Every dist file must carry the same engine-version header
+// and meta.version, and both must equal plugin.json's version.
+//
+// Checked surfaces:
 //   1. plugins/feature-workflows/.claude-plugin/plugin.json -> "version"
-//   2. plugins/feature-workflows/workflows/feature-pipeline.js -> "// engine-version:" header
-//   3. plugins/feature-workflows/workflows/feature-pipeline.js -> meta.version
-// The pipeline-command preflights compare the user-level install (~/.claude/workflows/
-// symlink, or its copy fallback) to the plugin by the header alone and auto-repair on
-// drift, so a header that drifts from the manifest silently disables drift detection.
-// Exit 0 = all three match; exit 1 = mismatch or a marker is missing.
+//   2. For each generated entry (feature-pipeline.js, fp-extract-slice.js):
+//      a. "// engine-version:" header
+//      b. meta.version literal
+//
+// The pipeline-command preflights compare the user-level install to the plugin
+// by the header alone and auto-repair on drift, so a header that drifts from the
+// manifest silently disables drift detection. Exit 0 = all surfaces match;
+// exit 1 = mismatch or a marker is missing.
 import { readFileSync } from 'node:fs'
 
 const pluginRoot = new URL('../plugins/feature-workflows/', import.meta.url)
 const manifest = JSON.parse(readFileSync(new URL('.claude-plugin/plugin.json', pluginRoot), 'utf8'))
-const engine = readFileSync(new URL('workflows/feature-pipeline.js', pluginRoot), 'utf8')
 
-const headerVersion = engine.match(/^\/\/ engine-version:\s*(\S+)\s*$/m)?.[1] ?? null
-const metaVersion = engine.match(/^\s*version:\s*'([^']+)',\s*$/m)?.[1] ?? null
+const ENTRIES = ['feature-pipeline.js', 'fp-extract-slice.js']
 
-const versions = {
-  'plugin.json version': manifest.version ?? null,
-  'engine-version header': headerVersion,
-  'meta.version': metaVersion,
+const versions = {}
+versions['plugin.json version'] = manifest.version ?? null
+
+for (const file of ENTRIES) {
+  const src = readFileSync(new URL(`workflows/${file}`, pluginRoot), 'utf8')
+  const headerVersion = src.match(/^\/\/ engine-version:\s*(\S+)\s*$/m)?.[1] ?? null
+  const metaVersion = src.match(/^\s*version:\s*'([^']+)',\s*$/m)?.[1] ?? null
+  versions[`${file} engine-version header`] = headerVersion
+  versions[`${file} meta.version`] = metaVersion
 }
 
 let failed = false
@@ -36,4 +45,4 @@ if (distinct.size > 1) {
 }
 
 if (failed) process.exit(1)
-console.log(`version lockstep OK: ${[...distinct][0]}`)
+console.log(`version lockstep OK: ${[...distinct][0]} (${ENTRIES.length} entries)`)

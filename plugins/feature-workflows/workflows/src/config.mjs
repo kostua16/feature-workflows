@@ -18,6 +18,7 @@ const RETRY_BUDGET_DEFAULT = 20
 const REFINE_SUBCAP_DEFAULT = 10   // soft per-loop cap on plan refine iterations
 const DEBUG_SUBCAP_DEFAULT = 20    // soft per-loop cap on gsd-debug fix+retest
 const RECONCILE_SUBCAP_DEFAULT = 5 // soft per-loop cap on reconcile design-fix iterations
+const ESCALATION_RETRIES_DEFAULT = 5 // configurable cap on plan-review escalation retries (DLOOP-01)
 const DECISION_CAP_DEFAULT = 50   // Phase E1: hard runaway cap on authoritative decision-agent calls
 const AGENT_TIMEOUT_MS_DEFAULT = 10 * 60 * 1000
 const AGENT_MAX_OUTPUT_CHARS_DEFAULT = 200000
@@ -202,4 +203,4 @@ function gateModeActive(gateGroup, mode) {
   return true // shared front-matter gates (categorize/translate/resume) always active
 }
 
-export { AGENT_NS, nsAgent, RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECONCILE_SUBCAP_DEFAULT, DECISION_CAP_DEFAULT, AGENT_TIMEOUT_MS_DEFAULT, AGENT_MAX_OUTPUT_CHARS_DEFAULT, IDENTICAL_FAILURE_LIMIT, GATE_FALLBACKS, MODEL_DEFAULTS, PROFILES, resolveProfile, resolveConfigFlag, profileDefault, resolveUseTestWriter, retryState, budgetExhausted, spendRetry, hydrateBudget, decisionState, decisionBudgetExhausted, spendDecision, gm, resolveMode, gateModeActive }
+export { AGENT_NS, nsAgent, RETRY_BUDGET_DEFAULT, REFINE_SUBCAP_DEFAULT, DEBUG_SUBCAP_DEFAULT, RECONCILE_SUBCAP_DEFAULT, ESCALATION_RETRIES_DEFAULT, DECISION_CAP_DEFAULT, AGENT_TIMEOUT_MS_DEFAULT, AGENT_MAX_OUTPUT_CHARS_DEFAULT, IDENTICAL_FAILURE_LIMIT, GATE_FALLBACKS, MODEL_DEFAULTS, PROFILES, resolveProfile, resolveConfigFlag, profileDefault, resolveUseTestWriter, retryState, budgetExhausted, spendRetry, hydrateBudget, decisionState, decisionBudgetExhausted, spendDecision, gm, resolveMode, gateModeActive }

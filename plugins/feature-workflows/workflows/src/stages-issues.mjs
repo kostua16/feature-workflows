@@ -48,7 +48,12 @@ and the source files it owns.`,
     return chunk.stages
   }
   // Degrade to a single implicit stage covering the whole plan (preserves single-executor behavior).
+  // DCHUNK-01: record the degradation so the design terminal can surface it as an explicit outcome.
   plogFromResult(result, 'plan-chunker: returned no stages — degrading to single implicit stage01')
+  if (result) {
+    result._chunkerDegraded = true
+    result._chunkerDegradationReason = 'plan-chunker returned no stages — single implicit stage01'
+  }
   return [{
     id: 'stage01',
     file: planDir + 'stage01.md',

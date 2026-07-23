@@ -2,14 +2,6 @@
 name: complex-decision-analyst
 description: |-
   Use this agent for complex, high-stakes decisions requiring deep analysis, evidence gathering, impact assessment, and weighing pros and cons. Use instead of quick-decider when stakes are high or problem is ambiguous.
-
-  <example>
-  user: "We need to migrate our monolith to microservices. Use strangler fig, build new platform, or refactor in place?"
-  assistant: "I'll use complex-decision-analyst agent to evaluate evidence and recommend best migration strategy."
-  <commentary>
-  High-stakes architectural choice with multiple options and serious trade-offs warrants complex-decision-analyst agent.
-  </commentary>
-  </example>
 tools: ListMcpResourcesTool, Read, ReadMcpResourceDirTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskStop, TaskUpdate, WebFetch, WebSearch, Bash, mcp__plugin_serena_serena__activate_project, mcp__plugin_serena_serena__find_declaration, mcp__plugin_serena_serena__find_file, mcp__plugin_serena_serena__find_implementations, mcp__plugin_serena_serena__find_referencing_symbols, mcp__plugin_serena_serena__find_symbol, mcp__plugin_serena_serena__get_current_config, mcp__plugin_serena_serena__get_diagnostics_for_file, mcp__plugin_serena_serena__get_symbols_overview, mcp__plugin_serena_serena__initial_instructions, mcp__plugin_serena_serena__list_dir, mcp__plugin_serena_serena__list_memories, mcp__plugin_serena_serena__onboarding, mcp__plugin_serena_serena__read_file, mcp__plugin_serena_serena__read_memory, mcp__plugin_serena_serena__search_for_pattern
 model: opus
 color: red
