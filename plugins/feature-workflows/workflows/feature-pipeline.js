@@ -6052,6 +6052,26 @@ function upsertRegistryEntry(registry, entry) {
   return updated
 }
 
+
+// refreshRegistryFiles: returns a copy of the registry with the named feature's
+// mutable `files` list refreshed from the current per-file hashes. Immutable
+// ownership identity (featureId, planDir, ownershipScopeDigest, anchorPath,
+// scopeId16, area) is preserved so the feature's identity stays stable across
+// auto-updates while subsequent findFeature matches see the current revision.
+// PURE; returns the same registry reference unchanged if the feature is absent.
+function refreshRegistryFiles(registry, featureId, fileHashes) {
+  if (!registry || !registry.features || !featureId || !registry.features[featureId]) {
+    return registry
+  }
+  var updated = { features: Object.assign({}, registry.features) }
+  var entry = Object.assign({}, registry.features[featureId])
+  entry.files = (fileHashes || []).map(function (fh) {
+    return { path: fh.path, contentSha256: fh.contentSha256 }
+  })
+  updated.features[featureId] = entry
+  return updated
+}
+
 // readRegistry: load the registry JSON via a file-reader agent.
 // Returns { features: {} } if the file does not exist; null if corrupt JSON.
 async function readRegistry(registryPath, result) {
@@ -10742,6 +10762,16 @@ ${task}`,
             }
             stateCheckpoint('Invalidation', 'done')
             result.extractQueue = reconciled.slices
+
+            // Refresh the registry entry's mutable files from the current revision so
+            // subsequent findFeature matches see current paths/hashes. Immutable ownership
+            // identity (featureId, planDir, ownershipScopeDigest, anchorPath) is untouched.
+            var refreshReg = await readRegistry(REGISTRY_PATH, result)
+            var refreshedReg = refreshRegistryFiles(refreshReg, findResult.featureId, preflight.fileHashes || [])
+            if (refreshedReg !== refreshReg) {
+              await writeRegistry(REGISTRY_PATH, refreshedReg, result)
+              plog('Registry: refreshed files for ' + findResult.featureId + ' after change detection')
+            }
           }
 
           stateCheckpoint('Upsert', upsertMode.mode)
@@ -13071,6 +13101,12 @@ Use a clear conventional-commit message. Return the commit hash.`,
 // and applyLifecycleEvent.
 function onSliceRemoved(state, sliceId, queueEntry) {
   invalidatePersistenceEvidence(state, sliceId)
+
+  // Mark synthesis views stale for this slice — symmetric with the chain-based
+  // invalidator. Removal excludes the lifecycle and supersedes persistence evidence;
+  // this adds the explicit synthesis-staleness signal so views re-derive rather than
+  // serve cached data.
+  state.synthesisState = markStaleForSlice(state.synthesisState, sliceId)
 
   var next = applyLifecycleEvent(queueEntry, { type: 'exclude', payload: { rationale: 'slice-removed-empty' } })
   Object.assign(queueEntry, next)

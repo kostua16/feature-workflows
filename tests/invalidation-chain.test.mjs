@@ -436,6 +436,47 @@ test('GREEN: result.published/result.persist cleared via invalidatePersistenceEv
   assert.equal(state.persist, null)
 })
 
+// ---- INT-W1: onSliceRemoved marks synthesis stale (symmetry with chain invalidator) ----
+
+test('INT-W1: onSliceRemoved marks the removed slice stale in synthesisState', () => {
+  const state = makeParentState()
+  state.synthesisState = { synthesized: true, views: { systemOverview: {} }, staleSlices: [] }
+  const qe = { lifecycle: 'runnable' }
+  onSliceRemoved(state, 'slice-7', qe)
+  assert.ok(state.synthesisState.staleSlices.includes('slice-7'),
+    'removed slice id is added to staleSlices')
+})
+
+test('INT-W1: onSliceRemoved populates staleViews for all 4 view types', () => {
+  const state = makeParentState()
+  state.synthesisState = { synthesized: true, views: { systemOverview: {} }, staleSlices: [] }
+  const qe = { lifecycle: 'runnable' }
+  onSliceRemoved(state, 'slice-7', qe)
+  assert.deepEqual(state.synthesisState.staleViews.sort(),
+    ['coverageIndex', 'crossCutting', 'dependencyMap', 'systemOverview'])
+})
+
+test('INT-W1: onSliceRemoved calls markStaleForSlice on state.synthesisState (source assertion)', () => {
+  assert.ok(
+    mainSrc.match(/function onSliceRemoved[\s\S]*?markStaleForSlice\(state\.synthesisState/),
+    'onSliceRemoved calls markStaleForSlice(state.synthesisState, sliceId)'
+  )
+})
+
+test('INT-W1: removal + synthesis-staleness is symmetric (lifecycle excluded AND stale)', () => {
+  const state = makeParentState()
+  state.synthesisState = { synthesized: true, views: { systemOverview: {} }, staleSlices: [] }
+  const qe = { lifecycle: 'runnable' }
+  onSliceRemoved(state, 'slice-9', qe)
+  // Lifecycle excluded (terminal removal)
+  assert.equal(qe.lifecycle, LIFECYCLE_STATES.EXCLUDED)
+  // Persistence evidence superseded
+  assert.equal(state.published, null)
+  assert.equal(state.persist, null)
+  // Synthesis marked stale
+  assert.ok(state.synthesisState.staleSlices.includes('slice-9'))
+})
+
 // ---- GREEN tests: crash-resume ----
 
 test('CRASH-RESUME: after invalidateSliceChain, all 4 publish/persist guards false/null', () => {

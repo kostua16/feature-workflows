@@ -7,7 +7,7 @@ import { computeContentDigest } from './revision.mjs'
 import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
-import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, reconcileSlices, runChangeDetection, resolveUpsertMode, deriveForkedFeatureId, isLegacyRoot, scanForLegacyFolders, adoptLegacyFolder } from './extract-scope.mjs'
+import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix, findFeature, upsertRegistryEntry, refreshRegistryFiles, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, reconcileSlices, runChangeDetection, resolveUpsertMode, deriveForkedFeatureId, isLegacyRoot, scanForLegacyFolders, adoptLegacyFolder } from './extract-scope.mjs'
 import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectReviewDocs, buildReviewReport, runReviewLenses, mergeReviewFindings, verifyReviewFindings, recordReviewIssues } from './review-mode.mjs'
 import { extractSlice, writeSystemOverview, invalidateSliceChain } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
@@ -1512,6 +1512,16 @@ ${task}`,
             }
             stateCheckpoint('Invalidation', 'done')
             result.extractQueue = reconciled.slices
+
+            // Refresh the registry entry's mutable files from the current revision so
+            // subsequent findFeature matches see current paths/hashes. Immutable ownership
+            // identity (featureId, planDir, ownershipScopeDigest, anchorPath) is untouched.
+            var refreshReg = await readRegistry(REGISTRY_PATH, result)
+            var refreshedReg = refreshRegistryFiles(refreshReg, findResult.featureId, preflight.fileHashes || [])
+            if (refreshedReg !== refreshReg) {
+              await writeRegistry(REGISTRY_PATH, refreshedReg, result)
+              plog('Registry: refreshed files for ' + findResult.featureId + ' after change detection')
+            }
           }
 
           stateCheckpoint('Upsert', upsertMode.mode)
@@ -3841,6 +3851,12 @@ Use a clear conventional-commit message. Return the commit hash.`,
 // and applyLifecycleEvent.
 function onSliceRemoved(state, sliceId, queueEntry) {
   invalidatePersistenceEvidence(state, sliceId)
+
+  // Mark synthesis views stale for this slice — symmetric with the chain-based
+  // invalidator. Removal excludes the lifecycle and supersedes persistence evidence;
+  // this adds the explicit synthesis-staleness signal so views re-derive rather than
+  // serve cached data.
+  state.synthesisState = markStaleForSlice(state.synthesisState, sliceId)
 
   var next = applyLifecycleEvent(queueEntry, { type: 'exclude', payload: { rationale: 'slice-removed-empty' } })
   Object.assign(queueEntry, next)

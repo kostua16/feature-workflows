@@ -248,6 +248,7 @@ const CANDIDATES = [
   // Phase 14 — feature-identity registry, lookup & integrity (D1.2-D1.4)
   'findFeature',
   'upsertRegistryEntry',
+  'refreshRegistryFiles',
   'readRegistry',
   'writeRegistry',
   'readIdentitySidecar',

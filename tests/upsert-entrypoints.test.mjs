@@ -9,6 +9,7 @@ import { engine } from './harness.mjs'
 const {
   resolveUpsertMode,
   deriveForkedFeatureId,
+  refreshRegistryFiles,
   UPSERT_MODE_VERDICT,
   ADOPT_RESULT,
 } = engine
@@ -361,4 +362,102 @@ test('auto-update copies extractQueue from loaded existing state', () => {
     'extractQueue copied from loaded state for resume continuity')
   assert.ok(block.includes('loadPipelineStateWithRecovery'),
     'existing state loaded via loadPipelineStateWithRecovery')
+})
+
+// ---- INT-W2: auto-update refreshes registry entry files from current revision ----
+
+test('INT-W2: refreshRegistryFiles is defined and callable', () => {
+  assert.equal(typeof refreshRegistryFiles, 'function')
+})
+
+test('INT-W2: refreshRegistryFiles updates files to the current revision', () => {
+  const registry = {
+    features: {
+      'auth-abc123': {
+        featureId: 'auth-abc123',
+        planDir: 'docs/extract/auth/auth-abc123/',
+        ownershipScopeDigest: 'a'.repeat(64),
+        scopeId16: 'abc123',
+        anchorPath: 'src/auth/login.ts',
+        area: 'src/auth',
+        files: [{ path: 'src/auth/login.ts', contentSha256: 'old-hash' }],
+        status: 'extracting',
+        updatedAt: '2026-01-01',
+      },
+    },
+  }
+  const currentHashes = [
+    { path: 'src/auth/login.ts', contentSha256: 'new-hash' },
+    { path: 'src/auth/logout.ts', contentSha256: 'hash-logout' },
+  ]
+  const result = refreshRegistryFiles(registry, 'auth-abc123', currentHashes)
+  assert.deepEqual(result.features['auth-abc123'].files, currentHashes,
+    'files reflect the current revision, not the promotion-time snapshot')
+})
+
+test('INT-W2: refreshRegistryFiles leaves immutable ownership identity untouched', () => {
+  const registry = {
+    features: {
+      'auth-abc123': {
+        featureId: 'auth-abc123',
+        planDir: 'docs/extract/auth/auth-abc123/',
+        ownershipScopeDigest: 'a'.repeat(64),
+        scopeId16: 'abc123',
+        anchorPath: 'src/auth/login.ts',
+        area: 'src/auth',
+        files: [{ path: 'src/auth/login.ts', contentSha256: 'old-hash' }],
+        status: 'extracting',
+        updatedAt: '2026-01-01',
+      },
+    },
+  }
+  const currentHashes = [{ path: 'src/auth/logout.ts', contentSha256: 'new-hash' }]
+  const result = refreshRegistryFiles(registry, 'auth-abc123', currentHashes)
+  const entry = result.features['auth-abc123']
+  assert.equal(entry.featureId, 'auth-abc123', 'featureId immutable')
+  assert.equal(entry.planDir, 'docs/extract/auth/auth-abc123/', 'planDir immutable')
+  assert.equal(entry.ownershipScopeDigest, 'a'.repeat(64), 'ownershipScopeDigest immutable')
+  assert.equal(entry.scopeId16, 'abc123', 'scopeId16 immutable')
+  assert.equal(entry.anchorPath, 'src/auth/login.ts', 'anchorPath immutable')
+  assert.equal(entry.area, 'src/auth', 'area immutable')
+})
+
+test('INT-W2: refreshRegistryFiles does not mutate the input registry', () => {
+  const registry = {
+    features: {
+      'auth-abc123': {
+        featureId: 'auth-abc123',
+        files: [{ path: 'old.ts', contentSha256: 'old' }],
+      },
+    },
+  }
+  const currentHashes = [{ path: 'new.ts', contentSha256: 'new' }]
+  refreshRegistryFiles(registry, 'auth-abc123', currentHashes)
+  assert.deepEqual(registry.features['auth-abc123'].files, [{ path: 'old.ts', contentSha256: 'old' }],
+    'input registry unchanged (pure function)')
+})
+
+test('INT-W2: refreshRegistryFiles returns same ref when feature absent', () => {
+  const registry = { features: {} }
+  const result = refreshRegistryFiles(registry, 'missing', [{ path: 'x.ts', contentSha256: 'x' }])
+  assert.equal(result, registry, 'same reference returned when feature not found')
+})
+
+test('INT-W2: refreshRegistryFiles handles null/missing registry', () => {
+  assert.equal(refreshRegistryFiles(null, 'x', []), null)
+  assert.deepEqual(refreshRegistryFiles({ features: {} }, 'x', []), { features: {} })
+})
+
+test('INT-W2: auto-update block calls refreshRegistryFiles after change detection (source assertion)', () => {
+  const upsertIdx = srcMain.indexOf("upsertMode.mode === 'auto-update'")
+  const block = srcMain.slice(upsertIdx, upsertIdx + 6000)
+  assert.ok(block.includes('refreshRegistryFiles('),
+    'auto-update block calls refreshRegistryFiles to refresh registry entry files')
+  assert.ok(block.includes('preflight.fileHashes'),
+    'refresh uses current preflight file hashes, not the promotion-time snapshot')
+})
+
+test('INT-W2: refreshRegistryFiles is exported from extract-scope.mjs', () => {
+  assert.ok(srcExtractScope.match(/export \{[^}]*refreshRegistryFiles/),
+    'refreshRegistryFiles exported from extract-scope')
 })

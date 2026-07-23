@@ -6005,6 +6005,26 @@ function upsertRegistryEntry(registry, entry) {
   return updated
 }
 
+
+// refreshRegistryFiles: returns a copy of the registry with the named feature's
+// mutable `files` list refreshed from the current per-file hashes. Immutable
+// ownership identity (featureId, planDir, ownershipScopeDigest, anchorPath,
+// scopeId16, area) is preserved so the feature's identity stays stable across
+// auto-updates while subsequent findFeature matches see the current revision.
+// PURE; returns the same registry reference unchanged if the feature is absent.
+function refreshRegistryFiles(registry, featureId, fileHashes) {
+  if (!registry || !registry.features || !featureId || !registry.features[featureId]) {
+    return registry
+  }
+  var updated = { features: Object.assign({}, registry.features) }
+  var entry = Object.assign({}, registry.features[featureId])
+  entry.files = (fileHashes || []).map(function (fh) {
+    return { path: fh.path, contentSha256: fh.contentSha256 }
+  })
+  updated.features[featureId] = entry
+  return updated
+}
+
 // readRegistry: load the registry JSON via a file-reader agent.
 // Returns { features: {} } if the file does not exist; null if corrupt JSON.
 async function readRegistry(registryPath, result) {

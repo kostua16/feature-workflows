@@ -739,6 +739,26 @@ function upsertRegistryEntry(registry, entry) {
   return updated
 }
 
+
+// refreshRegistryFiles: returns a copy of the registry with the named feature's
+// mutable `files` list refreshed from the current per-file hashes. Immutable
+// ownership identity (featureId, planDir, ownershipScopeDigest, anchorPath,
+// scopeId16, area) is preserved so the feature's identity stays stable across
+// auto-updates while subsequent findFeature matches see the current revision.
+// PURE; returns the same registry reference unchanged if the feature is absent.
+function refreshRegistryFiles(registry, featureId, fileHashes) {
+  if (!registry || !registry.features || !featureId || !registry.features[featureId]) {
+    return registry
+  }
+  var updated = { features: Object.assign({}, registry.features) }
+  var entry = Object.assign({}, registry.features[featureId])
+  entry.files = (fileHashes || []).map(function (fh) {
+    return { path: fh.path, contentSha256: fh.contentSha256 }
+  })
+  updated.features[featureId] = entry
+  return updated
+}
+
 // readRegistry: load the registry JSON via a file-reader agent.
 // Returns { features: {} } if the file does not exist; null if corrupt JSON.
 async function readRegistry(registryPath, result) {
@@ -1805,4 +1825,4 @@ async function adoptLegacyFolder(arg) {
   return { adopted: true, featureId: featureId, planDir: planDir, reason: reason }
 }
 
-export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, normalizeToPosix, validateHashes, deriveFeatureFolder, hashSources, writeIdentity, findFeature, upsertRegistryEntry, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, REGISTRY_ENTRY, REGISTRY_FILE, computePrefixScore, clusterByTwoSegDir, deriveClusterSliceId, detectMoves, validatePartition, reconcileSlices, frameSliceDigest, validateDigest64Hex, detectSliceChanges, computeSliceDigests, writeSliceDigestFile, readSliceDigestFile, runChangeDetection, resolveUpsertMode, deriveForkedFeatureId, isLegacyRoot, scanForLegacyFolders, adoptLegacyFolder, UPSERT_MODE_VERDICT, ADOPT_RESULT }
+export { seedExtractQueue, nextPendingSlice, resolveScope, auditExtractedDesign, generatePendingId, buildPendingRecord, isPendingExpired, resolveLocatorEntry, resolveScopePreflight, writePendingRecord, readPendingRecord, appendLocatorEntry, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, normalizeToPosix, validateHashes, deriveFeatureFolder, hashSources, writeIdentity, findFeature, upsertRegistryEntry, refreshRegistryFiles, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, REGISTRY_ENTRY, REGISTRY_FILE, computePrefixScore, clusterByTwoSegDir, deriveClusterSliceId, detectMoves, validatePartition, reconcileSlices, frameSliceDigest, validateDigest64Hex, detectSliceChanges, computeSliceDigests, writeSliceDigestFile, readSliceDigestFile, runChangeDetection, resolveUpsertMode, deriveForkedFeatureId, isLegacyRoot, scanForLegacyFolders, adoptLegacyFolder, UPSERT_MODE_VERDICT, ADOPT_RESULT }
