@@ -315,9 +315,15 @@ test('--no-update (continue-incomplete) is EXCLUDED from change-detection inner 
 test('--feature mode reassigns to auto-update for fallthrough', () => {
   const featureBranchIdx = srcMain.indexOf("upsertMode.mode === 'feature'")
   assert.ok(featureBranchIdx > -1, 'feature branch exists')
-  const branch = srcMain.slice(featureBranchIdx, featureBranchIdx + 1000)
+  const branch = srcMain.slice(featureBranchIdx, featureBranchIdx + 1200)
   assert.ok(branch.includes("upsertMode.mode = 'auto-update'"),
     'feature mode reassigns to auto-update to fall through to update path')
+  // Codex review fix: --feature must update findResult so downstream registry
+  // refresh (refreshRegistryFiles) targets the correct feature, not a stale lookup.
+  assert.ok(branch.includes('findResult.featureId = upsertMode.featureId'),
+    '--feature updates findResult.featureId for correct registry refresh')
+  assert.ok(branch.includes("findResult.decision = 'reuse'"),
+    '--feature updates findResult.decision to reuse')
 })
 
 test('--feature nonexistent blocks with feature-not-found handoff', () => {

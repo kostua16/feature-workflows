@@ -10687,6 +10687,9 @@ ${task}`,
           }
           planDir = featureEntry.planDir
           preflight.derivedPlanDir = planDir
+          // Update findResult so downstream registry refresh uses the correct feature.
+          findResult.featureId = upsertMode.featureId
+          findResult.decision = 'reuse'
           plog('Upsert: --feature selected ' + upsertMode.featureId + ' at ' + planDir)
           // Fall through to auto-update for the selected feature.
           upsertMode.mode = 'auto-update'
