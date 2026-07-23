@@ -1,192 +1,98 @@
-# Requirements: feature-workflows v1.5.0
+# Requirements: feature-workflows v1.6.0
 
-**Defined:** 2026-07-22  
-**Milestone:** v1.5.0 Project-Scale Extract Design  
-**Status:** Complete — all 36 requirements delivered, Nyquist-validated, and UAT-verified GOAL MET
+**Defined:** 2026-07-23
+**Milestone:** v1.6.0 Design-Extract Determination
+**Status:** Approved scope (converted from `plans/260723-extract-deterministic-folders-upsert/plan.md`), ready for phase planning
 
 ## Core Value
 
-One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts without silently losing work or overstating completion.
+One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts — without silently losing work or overstating completion. v1.6.0 extends that to **extract-mode folder stability + change-aware upsert**: a feature maps to one durable folder for its lifetime, and re-extraction updates only what changed.
 
-## v1 Requirements
+## v1.6.0 Requirements
 
-The 15 user-approved improvement themes remain the capability backbone. Six atomic enabling contracts were separated so state, revision invalidation, distribution, continuation, compatibility, and dogfood proof each have one owner and one acceptance boundary.
+Derived from the plan's Goals (G1–G3) and Design (D0–D4). All decisions are baked (no open questions).
 
-The milestone was extended with 15 additional user-approved design-mode themes (16-30) covering `/design-feature` durability, truthfulness, bounded execution, and reliability. Each traces to a file:line-verified defect in `.planning/research/DESIGN-MODE-FINDINGS.md` (F1-F17) and adopts the primitives phases 1-7 establish wherever the same contract applies.
+### Pending-Confirmation & Promotion
 
-### State, Coverage, Migration, and Revision Contracts
+- [ ] **PROMO-01**: A user can resume the pre-`planDir` scope-confirmation checkpoint via an explicit, addressable `--confirm <pendingId>`, and promotion to an authoritative folder is atomic and crash-idempotent (replaying `--confirm` never creates a duplicate folder or re-promotes). (D0)
+- [ ] **PROMO-02**: When the resolved scope matches an existing feature, the run loads and updates that feature's state (revision) without overwriting its immutable ownership identity or creating a new folder; only a genuinely new feature creates a folder + immutable identity. (D0)
+- [ ] **LOCATOR-01**: A compact permanent `pendingId → planDir` locator lets `--confirm <pendingId>` always resolve, while the bulky scratch payload is TTL-expired (30 days) — bounded growth without breaking confirmation replay. (D0)
 
-- [x] **CONTRACT-01**: The engine uses a versioned state contract with explicit feature lifecycle and readiness invariants, pure deterministic transition/readiness reducers, and a root-last v1.4.5 migration that durably writes and validates child shards before atomically acknowledging their compact project manifest.
-- [x] **STATE-01**: A user can resume any feature independently from a validated feature-state shard referenced by a bounded project manifest; root state contains indexes and aggregate evidence rather than project-wide gate histories or artifacts.
-- [x] **REV-01**: When repository source, scope, graph inputs, dependency summaries, or generated artifacts change, the engine compares durable revisions/digests and selectively invalidates only affected feature gates and derived project views while retaining independently valid evidence.
+### Deterministic Identity & Folders
 
-### Bounded Discovery and Schedulability
+- [ ] **IDENT-01**: Before any folder/feature selection, the engine has complete, schema-valid per-file `contentSha256` and a full `scopeDigest` (agent-computed SHA-256); missing/malformed hashes block identity selection (no silent folder split). (D1.1)
+- [ ] **FOLDER-01**: Each feature maps to one deterministic folder `docs/extract/<area>/<featureId>/` (no LLM in the path), where `<area>` = first-2-segments of the anchor file's repo-relative path and `featureId` derives from the lex-smallest file + `scopeId16`; the folder is stable across clones/worktrees and fixed for the feature's lifetime. (D1.1, G1)
 
-- [x] **INV-01**: A user can extract a requested project scope from a deterministic, bounded repository inventory that accounts for every discovered path as included or explicitly excluded and records the applicable generated, vendor, and ignore policy as evidence.
-- [x] **DISC-01**: A user can discover all features and subsystems through durable paginated pages and cursors, with oversized areas recursively refined so no workflow prompt or response must contain the whole repository inventory.
-- [x] **GRAPH-01**: Before extraction starts, a user receives a validated feature graph whose canonical identities are collision-free, whose ownership covers the included inventory without unexplained overlap or gaps, and whose dependency edges, entry points, coverage links, dangling references, and cycle policy are verified.
-- [x] **QUEUE-01**: A user can see each feature in exactly one durable lifecycle state: runnable, deferred, in progress, blocked, failed, skipped, excluded, or completed; caps and selectors preserve unprocessed in-scope features as resumable deferred work rather than completion.
-- [x] **DEPCTX-01**: A user gets a validated schedulability plan that identifies prerequisite order, safe independent waves, cycle/no-progress handling, and the bounded verified dependency summaries available to each feature before any leaf is admitted.
+### Registry, Lookup & Integrity
 
-### Generated Multi-Entry Distribution
+- [ ] **REGISTRY-01**: A feature-identity registry (`.registry.json`) plus per-folder immutable `.identity.json` record each feature's ownership identity, folder, and current file set. (D1.2)
+- [ ] **MATCH-01**: Feature lookup is rename-resilient (matches by path OR `contentSha256`) and requires a **defensible** match — anchor equality OR a majority of the smaller scope's files; weak/minority-only matches (e.g. a single shared `package.json`/`tsconfig.json`) and ties are **blocked** for explicit `--feature`/`--new` selection, never silently mismerged. (D1.2)
+- [ ] **COLLISION-01**: New-folder creation guards against overwriting another feature by comparing the **full** ownership digest (not a truncated id) across different features; mismatch → abort upsert. (D1.4)
+- [ ] **INTEGRITY-01**: Registry/sidecar/state writes are atomic (temp-then-rename) with a root-last readiness commit (status→current only after extraction+publish+persist are durable); startup recovery rebuilds mutable `files`/fingerprints from **current** pipeline-state/source-digest (ownership from sidecars) and fails closed when current revision evidence is unavailable. (D1.3)
 
-- [x] **DIST-01**: The source build produces exactly two supported workflow entries for this flow, the top-level `feature-pipeline` entry and the `fp-extract-slice` leaf; copy and symlink installs expose both, and build drift, engine headers, plugin version, release contents, and installed entry resolution are validated in lockstep.
+### Ownership Reconciliation
 
-### Checkpointed Feature Leaf
+- [ ] **OWN-01**: Slice ownership is reconciled by a pure, fully-deterministic algorithm — stable sliceIds, exactly-one-owner partition, prefix-score assignment (removed slices excluded as candidates), zero-score files clustered by 2-segment directory into permutation-invariant new slices, moves detected via content fingerprint (duplicate content → conservative remove+add). (D2.1)
 
-- [x] **ORCH-01**: A user can extract one admitted feature through `fp-extract-slice`, which owns exactly that feature's extraction gates while the top-level workflow alone owns discovery, scheduling, reconciliation, synthesis, continuation, and readiness and the leaf performs no further workflow composition.
-- [x] **CHECKPOINT-01**: A user can resume an interrupted feature at its first incomplete material extraction gate because the leaf durably acknowledges before/after, retry, invalidation, and terminal transitions together with artifact evidence using the shared state reducer.
+### Change Detection
 
-### Bounded Scheduling and Automatic Continuation
+- [ ] **CHANGE-01**: On update, source changes (added/removed/moved/renamed) are detected by comparing full 64-hex SHA-256 digests over framed per-file `(path, contentSha256)`; hash failure/missing/malformed is **fail-closed** (treated as changed → re-extract, never skip), and an unverifiable slice blocks with `extractReady=false`. (D2.2, G2)
 
-- [x] **BUDGET-01**: A user can run large-project extraction without hitting the shared runtime ceiling because each gate, feature, and segment is admitted against bounded call, token, concurrency, and retry budgets with non-spendable capacity reserved for checkpointing, reconciliation, synthesis, and truthful handoff.
-- [x] **RETRY-01**: A user can resume a failed or blocked feature under bounded per-gate and per-feature retry rules that persist attempt history and terminal reasons, continue eligible independent work, and never reclassify exhausted retries as completed.
-- [x] **ISOLATE-01**: A user retains all verified work when one feature times out, fails, or returns invalid output because the failure updates only that feature's durable outcome and dependency-independent features continue within the current segment.
-- [x] **CONT-01**: One `/feature-workflows:extract-design` command automatically launches durably acknowledged bounded segments while progress is possible; segment intents and completions use monotonic identifiers and idempotency keys so duplicate, lost, or interrupted launches cannot skip or double-apply work, and every stop preserves an exact manual resume command.
+### Invalidation Chain
 
-### Synthesis, Publishing, Persistence, and Status Truth
+- [ ] **INVALIDATE-01**: Invalidating a changed slice resets the durable queue entry, slice-local artifact-path/review guards, **and** all parent aggregates — clearing/versioning the actual publish/persist gate predicates (`result.published`/`result.persist`) plus `_publishVerified`/`_persistVerified` via a no-demote evidence primitive (version/remove keys + history event), and marking synthesis/overview/readiness/status stale so they regenerate. (D2.3)
+- [ ] **REMOVED-01**: A slice emptied by membership loss is terminal for re-extraction but triggers a parent invalidation (`onSliceRemoved`): lifecycle marked excluded, its feature/index/synthesis evidence superseded, coverage denominator updated, and parent publish/persist + handoff rerun — so parent views reflect the removal without re-extracting the removed slice. (D2.1/D2.3)
 
-- [x] **SYNTH-01**: A user receives incrementally updated, idempotent project views, including the system overview, dependency map, cross-cutting concerns, and coverage index, derived only from verified bounded feature summaries through the shared revision contract.
-- [x] **OBSERVE-01**: A user can publish and persist feature shards, project indexes, synthesis artifacts, and continuation acknowledgements in bounded retry-safe units that distinguish attempted writes from durably verified success and expose budgets, failures, and continuation evidence.
-- [x] **STATUS-01**: The command handoff and read-only status surface report the same revision-current coverage denominator and lifecycle outcomes, and set `extractReady=true` only when discovery is exhausted, the graph is valid, every in-scope feature and required artifact is verified, required synthesis is current, and no incomplete lifecycle state remains.
+### Upsert & Migration
 
-### Compatibility and Scale Proof
+- [ ] **UPSERT-01**: An existing folder **auto-updates by default** (change detection → in-place re-extract) on any re-run (fresh lookup or `--resume`); `--update` is explicit, `--no-update` opts out to continue-incomplete, `--force` re-extracts regardless of digest, `--feature` selects an existing feature, and `--new` creates a distinct forked folder (mutually exclusive with `--feature`). (D3, G3)
+- [ ] **MIGRATE-01**: On the first run after upgrade, existing v1.5 extract folders (roots only — excluding `slices/`, `.pending`, registry) are detected and offered for adoption (prompt, not silent); `--adopt <planDir>` imports a specific folder. Adoption derives identity, writes `.identity.json` + registry root-last with rollback, and is idempotent (re-adoption is a no-op; old resume + new lookup converge on one folder). (D4)
 
-- [x] **COMPAT-01**: Existing design, implement, tune, review, and read-only status workflows continue to hydrate v1.4.5 and v1.5 state safely, consume completed feature docsets/shards, and preserve their established gates, artifacts, handoffs, and command behavior under continuous regression tests.
-- [x] **QUAL-01**: Generated-source and installed-plugin E2E characterization covers inventory determinism, pagination, graph rejection, queue semantics, root-last migration, selective revision invalidation, both install modes, gate interruption/resume, dependency ordering, budgeting, retries, isolated failure, duplicate continuation delivery, synthesis, publishing failure, truthful readiness, and every non-extract regression gate named by the milestone matrix.
-- [x] **DOGFOOD-01**: An observed whole-repository `/feature-workflows:extract-design` run started by one user command processes multiple features across as many automatically continued bounded segments as required and records durable segment, budget, coverage, failure, synthesis, compatibility, and final readiness evidence without reaching the shared runtime ceiling.
+### Compatibility & Proof
 
-### Design-Mode Durability and State (Extension)
-
-- [x] **DCKPT-01**: A user whose design run is interrupted at any point resumes from the last completed material design gate because pipeline state is durably persisted after every gate transition, not only at hard-block and terminal exits; the same gate-level persistence applies to implement and tune where the identical coarse-checkpoint loss is proven. (F1)
-- [x] **DSTATE-01**: A user never loses a resumable run to a truncated state file because state writes follow a write-verify-acknowledge pattern with a retained last-good snapshot, and resume auto-recovers from a failed or partial write instead of hard-blocking as `resume-invalid-state`. (F2)
-- [x] **DRESUME-01**: A user resuming a run or answering an approval checkpoint pays only for changed work: unchanged artifacts are trusted via durable digests without per-artifact re-verification calls, reviews re-run only when their inputs changed, and approval decisions apply without re-running unaffected gates. (F3)
-
-### Design-Mode Truthfulness (Extension)
-
-- [x] **DREADY-01**: A user sees `designReady=true` only when every design review genuinely passed, no plan was force-accepted with carried blockers, reconcile conflicts are resolved, and all required artifacts are verified; any degraded outcome is reported with its exact cause instead of silent readiness. (F4, F5, F6)
-- [x] **DHIST-01**: A user can inspect a durable record of every fail-forward, retry, model escalation, and fallback with reasons and attempt counts through the handoff and read-only status surfaces. (F16)
-- [x] **DTERM-01**: A user is never told a run finished successfully when its commit failed, and publish/persist results distinguish attempted from durably verified outcomes across all modes. (F10)
-- [x] **DQUEST-01**: A user's unresolved open questions must be resolved, explicitly deferred with recorded evidence, or block design completion; they can no longer ride silently into architecture, design, and planning. (F8)
-- [x] **DCHUNK-01**: A user is explicitly told, and must acknowledge, when plan chunking degrades to a single stage and implement-mode parallelism and stage-level resumability are lost. (F9)
-- [x] **DYAGNI-01**: A user running with reconcile disabled still has BLOCKER-severity YAGNI findings delivered to the plan reviewer instead of silently dropped. (F7)
-
-### Design-Mode Bounded Execution (Extension)
-
-- [x] **DBUDGET-01**: A user's design run enforces per-gate and per-run call/token budgets derived from existing gate telemetry, with non-spendable reserve for state persistence and handoff, instead of purely observational counters. (F11)
-- [x] **DLOOP-01**: A user's later design gates cannot be starved by earlier ones because each review/refine loop draws from its own bounded sub-budget, and escalation retry limits are configurable rather than hardcoded. (F12)
-- [x] **DPROMPT-01**: A user's design-gate prompts stay bounded because conflict, blocker, and fix payloads are capped and compacted with the existing prompt-hygiene helpers before interpolation. (F13)
-
-### Design-Mode Reliability and Proof (Extension)
-
-- [x] **DTRANS-01**: A user's blocking design gate survives a transient provider or network error because the shared agent core classifies failures (transient, schema, fatal) and applies bounded backoff retries to transient errors before converting them to a hard block. (F14)
-- [x] **DVERIFY-01**: A user's artifact-presence and append-growth checks are deterministic through the shared digest/revision contract, so a hallucinated agent self-report can neither pass a missing artifact nor false-block a present one. (F15)
-- [x] **DTEST-01**: The design gate sequence, review loop, agent retry ladder, crash-resume without a flushed state, and partial state writes are covered by behavioral characterization tests under the milestone's RED/GREEN evidence model. (F17)
-
-## Approved Improvement Theme Traceability
-
-| Approved theme | Owning requirement(s) |
-|----------------|-----------------------|
-| 1. Deterministic repository inventory | INV-01 |
-| 2. Hierarchical paginated feature discovery | DISC-01 |
-| 3. Validated feature and dependency graph | GRAPH-01 |
-| 4. Correct deferred and excluded queue semantics | QUEUE-01 |
-| 5. Truthful partial versus complete status | STATUS-01 |
-| 6. Retry policy for blocked slices | RETRY-01 |
-| 7. Gate-level durable checkpoints | CHECKPOINT-01 |
-| 8. Sharded per-feature state | STATE-01 |
-| 9. Dedicated `fp-extract-slice` child workflow | ORCH-01, DIST-01 |
-| 10. Per-slice call, token, and retry budgets | BUDGET-01 |
-| 11. Isolated failure domains | ISOLATE-01 |
-| 12. Dependency-aware scheduling and context | DEPCTX-01 |
-| 13. Incremental cross-feature synthesis | SYNTH-01, REV-01 |
-| 14. Extract-aware publishing, persistence, and status | OBSERVE-01, STATUS-01 |
-| 15. Large-project E2E characterization and dogfooding | QUAL-01, DOGFOOD-01 |
-| Cross-cutting state and migration enabler | CONTRACT-01 |
-| One-command continuation enabler | CONT-01 |
-| Other-mode compatibility enabler | COMPAT-01 |
-| 16. Gate-level durable design checkpoints | DCKPT-01 |
-| 17. Atomic, recoverable state persistence | DSTATE-01 |
-| 18. Revision-aware resume and approval round-trips | DRESUME-01 |
-| 19. Truthful design readiness | DREADY-01 |
-| 20. Durable fail-forward and attempt history | DHIST-01 |
-| 21. Truthful commit, publish, and persist outcomes | DTERM-01 |
-| 22. Open-questions resolution policy | DQUEST-01 |
-| 23. Surfaced plan-chunker degradation | DCHUNK-01 |
-| 24. YAGNI blocker routing independent of reconcile | DYAGNI-01 |
-| 25. Enforced per-gate call and token budgets | DBUDGET-01 |
-| 26. Per-loop retry sub-budgets | DLOOP-01 |
-| 27. Bounded prompt context in design loops | DPROMPT-01 |
-| 28. Transient-error retry with backoff | DTRANS-01 |
-| 29. Deterministic artifact verification | DVERIFY-01 |
-| 30. Design-flow and shared-infra characterization tests | DTEST-01 |
+- [ ] **PROOF-01**: The changed extract flow preserves all v1.5 continuous regression gates (build drift, version lockstep, six-mode compatibility, resume/migration), and characterization tests prove the end-to-end contracts: deterministic folder across runs/worktrees/renames, full-rename registry match, blocked ambiguous match, in-place update of changed slices, removed-slice parent update, v1.5→v1.6 adopt convergence, and crash-resume after invalidation. (plan §Tests)
 
 ## Future Requirements
 
-- Project-scale sharding and automatic continuation for design, implement, tune, or review modes where measurements later demonstrate the same multi-item scaling need.
-- A generalized arbitrary-DAG orchestration platform beyond the dependency behavior required for whole-project extraction.
-- Dynamic repartitioning of a feature after its leaf workflow starts, unless project-scale characterization proves fixed pre-admission slices insufficient.
-- New design artifact formats or a new design language independent of bounded indexing and compatibility needs.
+- Gate-level change-detection granularity (only re-run gates whose specific inputs changed) — deferred (slice-level first; Q2).
+- Concurrent same-feature invocation safety (currently explicitly unsupported) — would need real exclusive locking the sandbox cannot provide.
+- Dynamic re-clustering of slices across runs when ownership heuristics drift.
 
 ## Out of Scope
 
 | Boundary | Reason |
 |----------|--------|
-| One literally unbounded Workflow invocation | Parent and child workflows share finite call, token, concurrency, and abort limits; the supported contract is one user command backed by automatic durable top-level segments. |
-| Removing or weakening extraction gates, verification, reviews, or tests | Scale must preserve the workflow's existing quality and evidence guarantees. |
-| Replacing or incompatibly rewriting `pipeline-state.json` | v1.4.5 state must hydrate through additive, versioned, validated migration. |
-| Broad rewrites or scale orchestration of all non-extract modes | This milestone preserves compatibility and shares proven primitives; it does not redesign unrelated mode behavior. |
-| Direct filesystem or shell access from workflow scripts | Runtime I/O remains agent-mediated and generated workflow output remains self-contained. |
-| More than one level of workflow composition | The runtime permits a top-level workflow to invoke a leaf; the leaf cannot invoke another workflow. |
-| External services, databases, queues, daemons, bundlers, or runtime packages | Repository research found the dependency-free generated Node/ESM and JSON-state model sufficient for this milestone. |
-| Speculative runtime constants | Segment limits, reserves, quotas, and concurrency must be established by RED characterization and dogfooding evidence. |
+| Deterministic free-text scope *resolution* (the `resolveScope` LLM) | LLM step; only folder assignment/ownership/change-detection are made deterministic. Explicit paths/globs give full determinism. |
+| Re-extracting unchanged gates | Waste; change detection must be selective. |
+| Changing forward design/implement/tune folder schemes | Extract-only milestone. |
+| Categorizer LLM in the folder path | Demoted to a display-only label. |
+| Multi-writer/distributed registry concurrency (CAS/file locks) | Single-user CLI; the sandbox engine cannot create real exclusive locks. Concurrent same-feature invocation is unsupported by design. |
+| External filesystem/lock services | The dependency-free generated-ESM + agent-mediated-JSON model is retained. |
 
 ## Traceability
 
-Each v1 requirement is assigned to exactly one owning roadmap phase.
+Each v1.6.0 requirement maps to exactly one owning phase (numbering continues from v1.5.0's Phase 11).
 
 | Requirement | Roadmap Phase | Status |
 |-------------|---------------|--------|
-| CONTRACT-01 | Phase 1 | Complete |
-| STATE-01 | Phase 1 | Complete |
-| REV-01 | Phase 1 | Complete |
-| INV-01 | Phase 2 | Complete |
-| DISC-01 | Phase 2 | Complete |
-| GRAPH-01 | Phase 2 | Complete |
-| QUEUE-01 | Phase 2 | Complete |
-| DEPCTX-01 | Phase 2 | Complete |
-| DIST-01 | Phase 3 | Complete |
-| ORCH-01 | Phase 4 | Complete |
-| CHECKPOINT-01 | Phase 4 | Complete |
-| BUDGET-01 | Phase 5 | Complete |
-| RETRY-01 | Phase 5 | Complete |
-| ISOLATE-01 | Phase 5 | Complete |
-| CONT-01 | Phase 5 | Complete |
-| SYNTH-01 | Phase 6 | Complete |
-| OBSERVE-01 | Phase 6 | Complete |
-| STATUS-01 | Phase 6 | Complete |
-| COMPAT-01 | Phase 7 | Complete |
-| QUAL-01 | Phase 7 | Complete |
-| DOGFOOD-01 | Phase 7 | Complete |
-| DCKPT-01 | Phase 8 | Complete |
-| DSTATE-01 | Phase 8 | Complete |
-| DRESUME-01 | Phase 8 | Complete |
-| DREADY-01 | Phase 9 | Complete |
-| DHIST-01 | Phase 9 | Complete |
-| DTERM-01 | Phase 9 | Complete |
-| DQUEST-01 | Phase 9 | Complete |
-| DCHUNK-01 | Phase 9 | Complete |
-| DYAGNI-01 | Phase 9 | Complete |
-| DBUDGET-01 | Phase 10 | Complete |
-| DLOOP-01 | Phase 10 | Complete |
-| DPROMPT-01 | Phase 10 | Complete |
-| DTRANS-01 | Phase 11 | Complete |
-| DVERIFY-01 | Phase 11 | Complete |
-| DTEST-01 | Phase 11 | Complete |
+| PROMO-01 | Phase 12 | Pending |
+| PROMO-02 | Phase 12 | Pending |
+| LOCATOR-01 | Phase 12 | Pending |
+| IDENT-01 | Phase 13 | Pending |
+| FOLDER-01 | Phase 13 | Pending |
+| REGISTRY-01 | Phase 14 | Pending |
+| MATCH-01 | Phase 14 | Pending |
+| COLLISION-01 | Phase 14 | Pending |
+| INTEGRITY-01 | Phase 14 | Pending |
+| OWN-01 | Phase 15 | Pending |
+| CHANGE-01 | Phase 16 | Pending |
+| INVALIDATE-01 | Phase 17 | Pending |
+| REMOVED-01 | Phase 17 | Pending |
+| UPSERT-01 | Phase 18 | Pending |
+| MIGRATE-01 | Phase 18 | Pending |
+| PROOF-01 | Phase 19 | Pending |
 
-**Coverage:** 36/36 v1 requirements mapped; 0 orphaned; 0 duplicated. All 30 approved improvement themes are represented.
+**Coverage:** 16/16 v1.6.0 requirements mapped; 0 orphaned; 0 duplicated.
 
 ---
-*Requirements defined: 2026-07-22*  
-*Last updated: 2026-07-23 — reconciled status ledger: all 36 requirements marked Complete (verified via per-phase UAT VERIFICATION.md).*
-*Previously updated: 2026-07-22 after extending the milestone with design-mode themes 16-30.*
+*Requirements defined: 2026-07-23 — converted from `plans/260723-extract-deterministic-folders-upsert/plan.md` (5-round review-hardened).*
