@@ -281,3 +281,190 @@ test('NYQ: computeSliceDigests prompt contains sha256 or SHA-256', () => {
   )
   assert.ok(/sha256|SHA-256/.test(fnBody), 'agent prompt must reference SHA-256')
 })
+
+// ---- GAP-7: Validity flag trust contract (fail-closed on flag mismatch) ----
+
+test('NYQ: current valid-64hex digest but valid:false → changed (current-invalid)', () => {
+  // detectSliceChanges trusts the caller's valid flag, not the digest format.
+  // A valid 64-hex digest marked invalid must still classify as changed.
+  const result = detectSliceChanges(
+    { s1: { digest: H1, valid: true } },
+    { s1: { digest: H1, valid: false } }
+  )
+  assert.equal(result.decisions[0].reason, 'current-invalid')
+})
+
+test('NYQ: persisted valid-64hex digest but valid:false → changed (persisted-invalid)', () => {
+  const result = detectSliceChanges(
+    { s1: { digest: H1, valid: false } },
+    { s1: { digest: H2, valid: true } }
+  )
+  assert.equal(result.decisions[0].reason, 'persisted-invalid')
+})
+
+test('NYQ: invalid digest but valid:true and matching → unchanged (trusts caller)', () => {
+  // Contract documentation: detectSliceChanges delegates validation to the caller.
+  // If the caller incorrectly marks an invalid digest as valid AND both digests
+  // match, the result is 'unchanged'. This is a pure comparator.
+  const result = detectSliceChanges(
+    { s1: { digest: 'garbage', valid: true } },
+    { s1: { digest: 'garbage', valid: true } }
+  )
+  assert.equal(result.decisions[0].status, 'unchanged')
+  assert.equal(result.decisions[0].reason, 'digest-match')
+})
+
+// ---- GAP-8: Rename-same-bytes (explicit scenarios) ----
+
+test('NYQ: rename old.ts → new.ts same content → different frames', () => {
+  const before = frameSliceDigest([{ path: 'src/old.ts', contentSha256: H1 }])
+  const after = frameSliceDigest([{ path: 'src/new.ts', contentSha256: H1 }])
+  assert.notEqual(before, after)
+})
+
+test('NYQ: move to different directory same content → different frames', () => {
+  const before = frameSliceDigest([{ path: 'module-a/file.ts', contentSha256: H1 }])
+  const after = frameSliceDigest([{ path: 'module-b/file.ts', contentSha256: H1 }])
+  assert.notEqual(before, after)
+})
+
+test('NYQ: case-change rename (User.ts → user.ts) same content → different frames', () => {
+  const before = frameSliceDigest([{ path: 'src/User.ts', contentSha256: H1 }])
+  const after = frameSliceDigest([{ path: 'src/user.ts', contentSha256: H1 }])
+  assert.notEqual(before, after)
+})
+
+// ---- GAP-9: 64-hex whitespace boundaries ----
+
+test('NYQ: leading whitespace in digest → invalid', () => {
+  assert.equal(validateDigest64Hex(' ' + H1).valid, false)
+})
+
+test('NYQ: trailing whitespace in digest → invalid', () => {
+  assert.equal(validateDigest64Hex(H1 + ' ').valid, false)
+})
+
+test('NYQ: internal space in digest → invalid', () => {
+  assert.equal(validateDigest64Hex(H1.slice(0, 32) + ' ' + H1.slice(32)).valid, false)
+})
+
+test('NYQ: newline prefix in digest → invalid', () => {
+  assert.equal(validateDigest64Hex('\n' + H1).valid, false)
+})
+
+test('NYQ: all distinct hex chars cycled to 64 → valid', () => {
+  const allHexChars = '0123456789abcdef'
+  assert.equal(validateDigest64Hex(allHexChars.repeat(4)).valid, true)
+})
+
+// ---- GAP-10: Force-override source structure ----
+
+test('NYQ: runChangeDetection force branch maps reason to "forced"', () => {
+  const fnBody = source.slice(
+    source.indexOf('function runChangeDetection'),
+    source.indexOf('\nexport { seedExtractQueue')
+  )
+  assert.match(fnBody, /reason:\s*'forced'/)
+})
+
+test('NYQ: runChangeDetection force branch sets status to "changed"', () => {
+  const fnBody = source.slice(
+    source.indexOf('function runChangeDetection'),
+    source.indexOf('\nexport { seedExtractQueue')
+  )
+  const forceIdx = fnBody.indexOf('if (force)')
+  assert.ok(forceIdx > -1, 'force branch exists')
+  const forceBlock = fnBody.slice(forceIdx, forceIdx + 200)
+  assert.match(forceBlock, /status:\s*'changed'/)
+})
+
+// ---- GAP-11: Decision ordering and extra property tolerance ----
+
+test('NYQ: current slice decisions come before removed slice decisions', () => {
+  const persisted = {
+    z_removed: { digest: H1, valid: true },
+    a_current: { digest: H2, valid: true },
+  }
+  const current = {
+    a_current: { digest: H3, valid: true },
+  }
+  const result = detectSliceChanges(persisted, current)
+  assert.equal(result.decisions[0].sliceId, 'a_current')
+  assert.equal(result.decisions[1].sliceId, 'z_removed')
+})
+
+test('NYQ: extra properties on digest entries are ignored', () => {
+  const result = detectSliceChanges(
+    { s1: { digest: H1, valid: true, extra: 'ignored', timestamp: 123 } },
+    { s1: { digest: H1, valid: true, foo: 'bar', nested: { a: 1 } } }
+  )
+  assert.equal(result.decisions[0].status, 'unchanged')
+})
+
+test('NYQ: extra properties on file hash entries are ignored by frameSliceDigest', () => {
+  const result = frameSliceDigest([
+    { path: 'a.ts', contentSha256: H1, size: 42, mode: 0o644 },
+  ])
+  assert.equal(result, '[[\"a.ts\",\"' + H1 + '\"]]')
+})
+
+// ---- GAP-12: runChangeDetection fail-closed source assertions ----
+
+test('NYQ: runChangeDetection agent failure marks all slices valid:false', () => {
+  const fnBody = source.slice(
+    source.indexOf('function runChangeDetection'),
+    source.indexOf('\nexport { seedExtractQueue')
+  )
+  assert.match(fnBody, /else\s*\{[\s\S]*?valid:\s*false/)
+})
+
+test('NYQ: runChangeDetection extractReady checks for current-invalid', () => {
+  const fnBody = source.slice(
+    source.indexOf('function runChangeDetection'),
+    source.indexOf('\nexport { seedExtractQueue')
+  )
+  assert.match(fnBody, /extractReady/)
+  assert.match(fnBody, /current-invalid/)
+})
+
+test('NYQ: runChangeDetection persists only when curEntry.valid is true', () => {
+  const fnBody = source.slice(
+    source.indexOf('function runChangeDetection'),
+    source.indexOf('\nexport { seedExtractQueue')
+  )
+  assert.match(fnBody, /curEntry\.valid/)
+})
+
+// ---- GAP-13: Multi-file framing distinctness (path-hash boundary) ----
+
+test('NYQ: two-file frame differs from concatenated single-file frame', () => {
+  const twoFiles = frameSliceDigest([
+    { path: 'ab', contentSha256: H1 },
+    { path: 'cd', contentSha256: H2 },
+  ])
+  const oneFile = frameSliceDigest([{ path: 'abcd', contentSha256: H1 + H2 }])
+  assert.notEqual(twoFiles, oneFile)
+})
+
+test('NYQ: path-hash swap produces different frame', () => {
+  const r1 = frameSliceDigest([{ path: 'abc', contentSha256: H1 }])
+  const r2 = frameSliceDigest([{ path: H1.slice(0, 3), contentSha256: 'abc' }])
+  assert.notEqual(r1, r2)
+})
+
+// ---- GAP-14: validateDigest64Hex reason quality ----
+
+test('NYQ: invalid digest results always include non-empty reason string', () => {
+  const cases = [null, undefined, '', 42, 'z' + H1.slice(1), H1.slice(0, 63), H1 + 'a', H1.toUpperCase(), ' ' + H1]
+  for (const c of cases) {
+    const result = validateDigest64Hex(c)
+    assert.equal(result.valid, false)
+    assert.ok(typeof result.reason === 'string' && result.reason.length > 0, `case: ${String(c)}`)
+  }
+})
+
+test('NYQ: valid digest result has no reason field', () => {
+  const result = validateDigest64Hex(H1)
+  assert.equal(result.valid, true)
+  assert.ok(result.reason === undefined, 'valid result should not have a reason')
+})
