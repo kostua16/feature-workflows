@@ -27,6 +27,8 @@ const PERSONA_ONLY = new Set([
   'issue-classifier',   // Phase I: upstream-vs-code finding classifier
   'tune-confirmation',  // Phase J: AskUserQuestion confirmation persona
   'test-runner',        // IM-4: stack-agnostic test gate (pytest/npm/go/cargo/…)
+  'hash-sources',       // v1.6.0: per-file SHA-256 content fingerprinting
+  'slice-digest',       // v1.6.0: combined slice digest computation
 ])
 
 const problems = []
