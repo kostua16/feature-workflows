@@ -8,7 +8,7 @@
 
 One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts without silently losing work or overstating completion.
 
-## Current Milestone: v1.6.0 Design-Extract Determination
+## Previous Milestone: v1.6.0 Design-Extract Determination (shipped 2026-07-24)
 
 **Goal:** Make `/feature-workflows:extract-design` map each feature to ONE deterministic, stable folder for its lifetime — across fresh runs, resumes, full path/entry-point renames, and the v1.5→v1.6 upgrade — detect source changes (added/removed/moved/renamed) and re-extract only affected slices in place, recomputing all downstream state truthfully. No LLM in the folder path.
 
