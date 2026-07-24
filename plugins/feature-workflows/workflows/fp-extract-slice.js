@@ -1,5 +1,5 @@
 // fp-extract-slice.js
-// engine-version: 1.4.5
+// engine-version: 1.5.0
 // GENERATED FILE — do not edit. Source: workflows/src/*.mjs; rebuild with `npm run build`.
 // Leaf workflow: extract design docs for one admitted feature.
 //
@@ -9,7 +9,7 @@
 
 export const meta = {
   name: 'fp-extract-slice',
-  version: '1.4.5',
+  version: '1.5.0',
   description: 'Leaf workflow: extract design docs for one admitted feature through the per-slice extraction gates (code facts, e2e use cases, detailed design, architecture, fidelity reviews, requirements, audit). Processes exactly one feature; the top-level pipeline retains discovery, scheduling, synthesis, continuation, and readiness authority.',
   phases: [
     { title: 'Extract Slice' },
@@ -17,7 +17,7 @@ export const meta = {
   ],
 }
 
-const ENGINE_VERSION = '1.4.5';
+const ENGINE_VERSION = '1.5.0';
 
 // ---- Schemas (JSON Schema) -------------------------------------------------
 
