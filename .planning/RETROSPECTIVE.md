@@ -56,6 +56,56 @@ engine. 36 requirements; 35-row E2E matrix; build drift-free.
 
 ---
 
+## Milestone: v1.6.0 — Design-Extract Determination
+
+**Shipped:** 2026-07-24
+**Phases:** 8 (12–19) | **Plans:** 8 | **Tests:** 1470 → 2443 | **Commits:** 41
+
+### What Was Built
+Deterministic, stable folder-per-feature for `/extract-design` — one folder per feature for its
+lifetime (surviving full renames via a content-fingerprint registry), with fail-closed SHA-256 change
+detection, a full invalidation chain (incl. publish/persist evidence + removal parent path),
+auto-update-by-default upsert, and seamless v1.5 docset adoption migration.
+
+### What Worked
+- **4-command-per-phase protocol** (plan → execute → validate → verify) — 32 sub-agents, each phase
+  independently verified. Caught 1 real defect (P17 substring collision in `invalidatePersistenceEvidence`).
+- **5-round adversarial plan review upfront** — the implementation was unambiguous; sub-agents rarely
+  improvised. Zero open questions entering execution.
+- **Integration checker** (sonnet) at milestone audit — confirmed all 7 critical seams wired end-to-end,
+  found 2 fragile-but-functional warnings (W1/W2), both fixed.
+- **Codex stop-time review gate** — caught a real bug (`--feature` stale registry entry) that the entire
+  4-command pipeline + integration checker missed. Defense-in-depth from independent reviewers pays off.
+
+### What Was Inefficient
+- **SUMMARY.md missing for all 8 phases** — agents wrote VERIFICATION but not SUMMARY; backfilled manually.
+- **REQUIREMENTS.md ledger stale** — checkboxes not updated during inline execution; reconciled at audit.
+- **gsd-tools phase-count heuristic under-counted** (0/8 vs actual 8) throughout.
+- **Source-assertion tests with fixed char-windows** (1000 chars) broke when code was added — fragile.
+- **Codex `exec` hung** non-interactively (replaced by the review gate which worked reliably).
+
+### Patterns Established
+- The 4-command pipeline is now the standard per-phase protocol for this project.
+- Plan → milestone conversion (`/gsd-new-milestone` from a hardened plan) is a viable fast-track for
+  well-specified milestones.
+- Integration checker + Codex stop-time review as a post-pipeline defense layer.
+
+### Key Lessons
+- **Independent reviewers catch what the pipeline can't** — the Codex gate found a bug that 32 opus
+  sub-agents + 1 sonnet integration checker all missed. Worth the extra latency.
+- **Fixed-window source assertions are fragile** — use anchored patterns (indexOf + includes) with
+  generous windows or structural assertions instead.
+- **Adversarial plan review has diminishing returns after ~5 rounds** — at that point, implementation +
+  TDD catches remaining issues more efficiently than more abstract review.
+
+### Cost Observations
+- Model mix: predominantly **opus** (32 phase sub-agents + cleanup); **sonnet** (integration checker).
+- Sub-agent invocations: ~36 (32 phase + 1 integration + 1 cleanup + 1 SUMMARY backfill + 1 Codex fix).
+- Notable: the 4-command pipeline cost ~4× the v1.5.0 2-command (plan+execute only) but caught
+  proportionally more defects per phase.
+
+---
+
 ## Cross-Milestone Trends
 
 | Metric | v1.4.5 (baseline) | v1.5.0 |
