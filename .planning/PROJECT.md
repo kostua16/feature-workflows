@@ -8,13 +8,28 @@
 
 One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts without silently losing work or overstating completion.
 
-## Last Shipped Milestone: v1.5.0 Project-Scale Extract Design (shipped 2026-07-22)
+## Previous Milestone: v1.6.0 Design-Extract Determination (shipped 2026-07-24)
+
+**Goal:** Make `/feature-workflows:extract-design` map each feature to ONE deterministic, stable folder for its lifetime — across fresh runs, resumes, full path/entry-point renames, and the v1.5→v1.6 upgrade — detect source changes (added/removed/moved/renamed) and re-extract only affected slices in place, recomputing all downstream state truthfully. No LLM in the folder path.
+
+**Target features:**
+- Deterministic feature→folder identity + a feature-identity registry (rename-resilient, sticky for life).
+- Pending-confirmation protocol with crash-idempotent promotion (new vs existing branches).
+- Pure deterministic slice ownership reconciliation.
+- Fail-closed source-change detection (full SHA-256) + a full invalidation chain (slice, queue, parent aggregates, publish/persist evidence).
+- Auto-update upsert entrypoints + v1.5 docset adoption migration.
+
+**Source plan:** [`plans/260723-extract-deterministic-folders-upsert/plan.md`](../plans/260723-extract-deterministic-folders-upsert/plan.md) (hardened across 5 adversarial review rounds; all decisions baked; no open questions).
+
+---
+
+## Previous Milestone: v1.5.0 Project-Scale Extract Design (shipped 2026-07-22)
 
 **Status:** ✅ SHIPPED, Nyquist-validated, UAT-verified (36/36 requirements GOAL MET), audit passed. Tagged `v1.5.0` (local). Full record: `.planning/milestones/v1.5.0-ROADMAP.md`.
 
 **Goal (delivered):** Make `/feature-workflows:extract-design` automatically process an entire large project through bounded, durable per-feature segments from one user command, while reporting coverage and completion truthfully — and extend the same durability, truthfulness, and bounded-execution contracts to `/feature-workflows:design-feature` and the shared engine where the same defects are proven.
 
-**Next:** Not yet planned — run `/gsd-new-milestone`.
+**Next:** superseded by v1.6.0 (above).
 
 **Target features:**
 

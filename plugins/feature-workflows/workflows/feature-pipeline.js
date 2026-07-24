@@ -50,6 +50,17 @@ export const meta = {
     { title: 'Goalkeeper' },
     { title: 'Decide' },
     { title: 'Checkpoint' },
+    { title: 'Pending Confirm' },
+    { title: 'Hash Sources' },
+    { title: 'Promote' },
+    { title: 'Registry Lookup' },
+    { title: 'Registry Recovery' },
+    { title: 'Reconcile Slices' },
+    { title: 'Change Detection' },
+    { title: 'Invalidation' },
+    { title: 'Upsert' },
+    { title: 'Adopt' },
+    { title: 'Migrate' },
   ],
 }
 
@@ -1020,6 +1031,359 @@ const OVERVIEW_VERDICT = {
       },
     },
     summary: { type: 'string' },
+  },
+}
+
+// --- Pending-confirmation protocol schemas (extract D0) -------------------
+
+// PREFLIGHT_VERDICT: returned by resolveScopePreflight — wraps a SCOPE_VERDICT with
+// the pending-confirmation lifecycle fields. The pendingId is engine-generated
+// (deterministic djb2 of task+timestamp); the agent resolves the scope but does NOT
+// write any files. State transitions: PENDING → PROMOTED (on --confirm).
+const PREFLIGHT_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string', description: 'Deterministic 16-hex confirmation id' },
+    task: { type: 'string' },
+    verdict: { type: 'object', description: 'Full SCOPE_VERDICT from the preflight resolution' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED'] },
+    createdAt: { type: 'string', description: 'ISO-like timestamp from args.timestamp' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+    fileHashes: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash from the hash-sources agent',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+    featureId: { type: 'string', description: 'Deterministic feature id: <primarySlug>-<scopeId16>' },
+    derivedPlanDir: { type: 'string', description: 'Deterministic docs/extract/<area>/<featureId>/ path' },
+  },
+}
+
+// PENDING_RECORD: shape of docs/extract/.pending/<pendingId>.json — the durable
+// scratch checkpoint written by the preflight and updated on promotion.
+const PENDING_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    task: { type: 'string' },
+    verdict: { type: 'object' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED', 'EXPIRED'] },
+    createdAt: { type: 'string' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+    expiredAt: { type: 'string', description: 'Set when the bulky payload is TTL-expired' },
+    fileHashes: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash from the hash-sources agent',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+    featureId: { type: 'string', description: 'Deterministic feature id: <primarySlug>-<scopeId16>' },
+    derivedPlanDir: { type: 'string', description: 'Deterministic docs/extract/<area>/<featureId>/ path' },
+  },
+}
+
+// HASH_SOURCES_VERDICT: the hash-sources agent reads each file, computes per-file
+// SHA-256 (64-hex), then frames sorted [path, contentSha256] pairs as JSON and
+// SHA-256s that to produce scopeDigest. Agent-mediated — the engine never hashes.
+const HASH_SOURCES_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['files', 'scopeDigest'],
+  properties: {
+    files: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+  },
+}
+
+// IDENTITY_RECORD: shape of <planDir>/.identity.json. The ownershipScopeDigest is the
+// immutable full 64-hex SHA-256 scope digest, fixed at creation (never overwritten).
+const IDENTITY_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['featureId', 'planDir', 'ownershipScopeDigest', 'area', 'createdAt'],
+  properties: {
+    featureId: { type: 'string', description: 'Deterministic feature id' },
+    planDir: { type: 'string', description: 'Repo-relative POSIX folder path' },
+    ownershipScopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 scope digest (immutable at creation)' },
+    area: { type: 'string', description: 'First-2-segment area, fixed at creation' },
+    scopeId16: { type: 'string', description: '16-hex display/folder id' },
+    createdAt: { type: 'string' },
+  },
+}
+
+// LOCATOR_ENTRY: compact permanent record in docs/extract/.pending-locator.json.
+// Retained indefinitely so --confirm <pendingId> always resolves to the authoritative
+// folder even after the bulky pending payload is TTL-expired.
+const LOCATOR_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'featureId', 'planDir', 'promotedAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    featureId: { type: 'string' },
+    planDir: { type: 'string' },
+    promotedAt: { type: 'string' },
+  },
+}
+
+// REGISTRY_ENTRY: a single feature's entry in docs/extract/.registry.json.
+// The files array carries current per-file hashes (mutable — rebuilt from
+// pipeline-state on recovery). Immutable ownership fields come from .identity.json.
+const REGISTRY_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['featureId', 'planDir', 'ownershipScopeDigest', 'scopeId16', 'files', 'status', 'updatedAt'],
+  properties: {
+    featureId: { type: 'string', description: 'Deterministic feature id' },
+    planDir: { type: 'string', description: 'Repo-relative POSIX folder path' },
+    ownershipScopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 scope digest (immutable, mirrors .identity.json)' },
+    scopeId16: { type: 'string', description: '16-hex display/folder id' },
+    files: {
+      type: 'array',
+      description: 'Current file set with content hashes',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string' },
+          contentSha256: { type: 'string' },
+        },
+      },
+    },
+    anchorPath: { type: 'string', description: 'Anchor file path (lex-smallest, immutable ownership evidence)' },
+    status: { type: 'string', enum: ['extracting', 'current', 'stale'], description: 'Registry lifecycle status' },
+    updatedAt: { type: 'string', description: 'ISO timestamp of last registry update' },
+  },
+}
+
+// REGISTRY_FILE: the top-level registry shape — a map of featureId to REGISTRY_ENTRY.
+const REGISTRY_FILE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['features'],
+  properties: {
+    features: {
+      type: 'object',
+      description: 'Map of featureId to REGISTRY_ENTRY',
+      additionalProperties: REGISTRY_ENTRY,
+    },
+  },
+}
+
+// RECONCILE_FILE: a file with its content fingerprint (shared input/output shape for reconcile).
+const RECONCILE_FILE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path', 'contentSha256'],
+  properties: {
+    path: { type: 'string', description: 'Repo-relative POSIX path' },
+    contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+  },
+}
+
+// RECONCILE_DELTA: change record returned by reconcileSlices.
+const RECONCILE_DELTA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['added', 'removed', 'moved', 'newSlices', 'removedSlices', 'overlaps'],
+  properties: {
+    added: {
+      type: 'array',
+      description: 'Files assigned to an existing non-removed slice via prefix score',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that received the file' },
+        },
+      },
+    },
+    removed: {
+      type: 'array',
+      description: 'Files dropped from their owner (old path no longer in current set)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that lost the file' },
+        },
+      },
+    },
+    moved: {
+      type: 'array',
+      description: 'Files whose path changed but contentSha256 uniquely matches a gone old path',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['oldPath', 'newPath', 'contentSha256', 'sliceId'],
+        properties: {
+          oldPath: { type: 'string' },
+          newPath: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Original owner (unchanged)' },
+        },
+      },
+    },
+    newSlices: {
+      type: 'array',
+      description: 'New slices created from zero-score clusters',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sliceId', 'files'],
+        properties: {
+          sliceId: { type: 'string' },
+          files: { type: 'array', items: RECONCILE_FILE },
+        },
+      },
+    },
+    removedSlices: {
+      type: 'array',
+      description: 'Slices emptied by membership loss (terminal for re-extraction)',
+      items: { type: 'string' },
+    },
+    overlaps: {
+      type: 'array',
+      description: 'Overlap conflicts resolved by lex-smallest sliceId',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'winnerSliceId', 'loserSliceId'],
+        properties: {
+          path: { type: 'string' },
+          winnerSliceId: { type: 'string' },
+          loserSliceId: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+// SLICE_DIGEST: shape of <sliceDir>/.source-digest.json — per-file fingerprints + slice digest.
+const SLICE_DIGEST = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['files', 'digest'],
+  properties: {
+    files: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash (fingerprints for change detection)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    digest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs for this slice' },
+  },
+}
+
+// SLICE_DIGEST_RESULT: agent return for per-slice SHA-256 digest computation.
+const SLICE_DIGEST_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['slices'],
+  properties: {
+    slices: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sliceId', 'digest'],
+        properties: {
+          sliceId: { type: 'string', description: 'Slice identifier' },
+          digest: { type: 'string', description: 'Full 64-hex SHA-256 of the framed per-file pairs' },
+        },
+      },
+    },
+  },
+}
+
+const INVALIDATION_EVENT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['sliceId', 'key', 'action'],
+  properties: {
+    sliceId: { type: 'string', description: 'Slice whose evidence was invalidated' },
+    key: { type: 'string', description: 'Durable key that was versioned or removed' },
+    action: { type: 'string', enum: ['versioned', 'removed', 'superseded'], description: 'How the key was invalidated (no-demote: never demoted)' },
+    reason: { type: 'string', description: 'Why the evidence was invalidated' },
+  },
+}
+
+const UPSERT_MODE_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['mode'],
+  properties: {
+    mode: {
+      type: 'string',
+      enum: ['auto-update', 'continue-incomplete', 'force', 'new', 'feature', 'blocked', 'error'],
+      description: 'Resolved update behavior for an existing feature',
+    },
+    featureId: { type: 'string', description: 'Selected feature id (mode=feature)' },
+    reason: { type: 'string', description: 'Block/error reason' },
+  },
+}
+
+const ADOPT_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['adopted'],
+  properties: {
+    adopted: { type: 'boolean', description: 'Whether adoption occurred' },
+    featureId: { type: 'string', description: 'Derived or forked feature id' },
+    planDir: { type: 'string', description: 'Adopted folder path' },
+    reason: {
+      type: 'string',
+      enum: ['already-adopted', 'not-a-root', 'collision-forked', 'success'],
+      description: 'Why adoption did or did not occur',
+    },
   },
 }
 
@@ -4169,6 +4533,21 @@ function synthesisSummary(state) {
   }
 }
 
+// Mark synthesis views as stale for a specific slice so the next
+// synthesizeProjectViews call rebuilds affected views. Complements
+// invalidateStaleViews (revision-delta based) with a slice-targeted variant.
+// PURE: no agent calls, no I/O, no side effects on the input.
+function markStaleForSlice(synthesisState, sliceId) {
+  if (!synthesisState) {
+    return { synthesized: false, staleSlices: [sliceId], views: {}, viewRevisions: {}, featureDigests: {} }
+  }
+  if (!synthesisState.synthesized) return synthesisState
+  var newState = Object.assign({}, synthesisState)
+  newState.staleSlices = (synthesisState.staleSlices || []).concat([sliceId])
+  newState.staleViews = ['systemOverview', 'dependencyMap', 'crossCutting', 'coverageIndex']
+  return newState
+}
+
 // Attempted-vs-durable persistence tracking: distinguish writes that were
 // attempted from writes that are durably verified. Retry-safe: retrying a
 // failed write cannot produce duplicate index, synthesis, or continuation
@@ -4350,6 +4729,61 @@ function persistenceReport(tracker) {
   }
 
   return report
+}
+
+// Invalidate persistence evidence for a slice: enumerate affected durable keys,
+// supersede or remove them, and reset the gate-predicate guards so publish/persist
+// re-run on the next pass. Respects OBSERVE-01 no-demote — a DURABLY_VERIFIED write
+// is never set back to ATTEMPTED; instead a supersede-history event is appended.
+// PURE: no agent calls, no I/O, no non-deterministic primitives.
+function invalidatePersistenceEvidence(state, sliceId) {
+  if (!state || typeof state !== 'object') return state
+  if (!sliceId) return state
+
+  state._invalidations = state._invalidations || []
+
+  var tracker = state.persistenceTracker
+  if (tracker && tracker.writes) {
+    // Delimiter-aware match prevents substring collisions: invalidating
+    // slice-1 must not affect slice-10's keys. Keys follow type:sliceId:component.
+    var needle = ':' + sliceId + ':'
+    var affectedKeys = []
+    for (var key of Object.keys(tracker.writes)) {
+      if (key.indexOf(needle) !== -1) {
+        affectedKeys.push(key)
+      }
+    }
+
+    var newWrites = Object.assign({}, tracker.writes)
+    for (var i = 0; i < affectedKeys.length; i++) {
+      var k = affectedKeys[i]
+      var w = tracker.writes[k]
+      if (w && w.state === PERSISTENCE_STATES.DURABLY_VERIFIED) {
+        state._invalidations.push({
+          sliceId: sliceId,
+          key: k,
+          action: 'superseded',
+          reason: 'invalidation-chain',
+        })
+      } else {
+        delete newWrites[k]
+        state._invalidations.push({
+          sliceId: sliceId,
+          key: k,
+          action: 'removed',
+          reason: 'invalidation-chain',
+        })
+      }
+    }
+    state.persistenceTracker = { writes: newWrites, history: tracker.history }
+  }
+
+  state._publishVerified = false
+  state._persistVerified = false
+  state.published = null
+  state.persist = null
+
+  return state
 }
 
 // Truthful readiness derivation and status projection: the command handoff
@@ -5058,6 +5492,1652 @@ ${sections}`,
   return verdict
 }
 
+// ---- Pending-confirmation protocol (extract D0) ----------------------------
+
+// Durable paths for the pending checkpoint and permanent locator.
+const PENDING_DIR = 'docs/extract/.pending/'
+const PENDING_LOCATOR_PATH = 'docs/extract/.pending-locator.json'
+
+// File-reader result schemas (local — not exported).
+const PENDING_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['record'],
+  properties: {
+    record: { type: ['object', 'null'], description: 'Parsed pending record, or null if the file does not exist' },
+  },
+}
+
+const LOCATOR_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['entries'],
+  properties: {
+    entries: { type: 'array', items: { type: 'object' }, description: 'Locator entries (empty if file does not exist)' },
+  },
+}
+
+// generatePendingId: deterministic 16-hex pending id from task text + timestamp.
+// Uses djb2 hash — sandbox-safe (no RNG or wall-clock dependency). PURE.
+function generatePendingId(task, timestamp) {
+  var raw = String(task || '') + '|' + String(timestamp || '')
+  return computeDigest(raw).padStart(16, '0').slice(0, 16)
+}
+
+// buildPendingRecord: construct the PENDING-shaped record from preflight parts. PURE.
+function buildPendingRecord(pendingId, task, verdict, createdAt) {
+  return {
+    pendingId: pendingId,
+    task: String(task || ''),
+    verdict: verdict,
+    state: 'PENDING',
+    createdAt: String(createdAt || ''),
+  }
+}
+
+// isPendingExpired: check whether a pending record's bulky payload is past the TTL.
+// Elapsed-time comparison via Date.parse; the caller supplies the current timestamp. PURE.
+function isPendingExpired(record, maxAgeDays, nowTimestamp) {
+  if (!record || !record.createdAt) return true
+  if (record.state === 'EXPIRED') return true
+  var createdMs = Date.parse(record.createdAt)
+  var nowMs = Date.parse(nowTimestamp)
+  if (isNaN(createdMs) || isNaN(nowMs)) return false
+  var ageMs = nowMs - createdMs
+  var maxMs = (maxAgeDays || 30) * 24 * 60 * 60 * 1000
+  return ageMs > maxMs
+}
+
+// resolveLocatorEntry: pure lookup in a locator array. Returns the entry or null.
+function resolveLocatorEntry(locator, pendingId) {
+  if (!Array.isArray(locator)) return null
+  for (var i = 0; i < locator.length; i++) {
+    if (locator[i] && locator[i].pendingId === pendingId) return locator[i]
+  }
+  return null
+}
+
+// ---- Deterministic identity + hashing (Phase 13 / D1.1) --------------------
+
+// normalizeToPosix: convert a path to repo-relative POSIX form.
+// Replaces backslashes, strips leading ./ and /. PURE.
+function normalizeToPosix(path) {
+  var p = String(path || '').replace(/\\/g, '/')
+  // strip leading ./ repeatedly (e.g. ././src -> src)
+  while (p.startsWith('./')) p = p.slice(2)
+  // strip a single leading /
+  if (p.startsWith('/')) p = p.slice(1)
+  return p
+}
+
+// validateHashes: fail-closed validation of per-file contentSha256 + scopeDigest.
+// Returns { valid: true } only when every hash is 64-lowercase-hex and the arrays
+// are well-formed; otherwise { valid: false, reason }. PURE.
+var HEX64 = /^[0-9a-f]{64}$/
+function validateHashes(fileHashes, scopeDigest) {
+  if (!Array.isArray(fileHashes) || fileHashes.length === 0) {
+    return { valid: false, reason: 'fileHashes is empty or not an array' }
+  }
+  for (var i = 0; i < fileHashes.length; i++) {
+    var fh = fileHashes[i]
+    if (!fh || typeof fh !== 'object') {
+      return { valid: false, reason: 'fileHashes[' + i + '] is not an object' }
+    }
+    if (typeof fh.path !== 'string' || !fh.path) {
+      return { valid: false, reason: 'fileHashes[' + i + '].path missing' }
+    }
+    if (typeof fh.contentSha256 !== 'string' || !HEX64.test(fh.contentSha256)) {
+      return { valid: false, reason: 'fileHashes[' + i + '].contentSha256 is not 64-lowercase-hex' }
+    }
+  }
+  if (typeof scopeDigest !== 'string' || !HEX64.test(scopeDigest)) {
+    return { valid: false, reason: 'scopeDigest is not 64-lowercase-hex' }
+  }
+  return { valid: true }
+}
+
+// deriveFeatureFolder: deterministic folder derivation from file hashes + scopeDigest.
+// No agent calls, no LLM. Returns { area, primarySlug, scopeId16, featureId, planDir, anchorPath }.
+// PURE.
+function deriveFeatureFolder(arg) {
+  var fileHashes = arg && arg.fileHashes
+  var scopeDigest = arg && arg.scopeDigest
+  var entryPoints = (arg && arg.entryPoints) || []
+  var entrySet = new Set(entryPoints.map(normalizeToPosix))
+  // Normalize all paths to POSIX for deterministic sorting.
+  var allPaths = (fileHashes || []).map(function (fh) {
+    return normalizeToPosix(fh.path)
+  })
+  // Exclude entry points from anchor candidates; fallback to full set if all are entries.
+  var candidates = allPaths.filter(function (p) { return !entrySet.has(p) })
+  if (!candidates.length) candidates = allPaths.slice()
+  candidates.sort()
+  var anchorPath = candidates[0] || ''
+  var segments = anchorPath.split('/').filter(Boolean)
+  var area = segments.length >= 2 ? segments[0] + '/' + segments[1] : 'uncategorized'
+  var basename = segments.length > 0 ? segments[segments.length - 1] : 'feature'
+  var primarySlug = categorizeSlug(basename)
+  var scopeId16 = String(scopeDigest || '').slice(0, 16)
+  var featureId = primarySlug + '-' + scopeId16
+  var planDir = 'docs/extract/' + area + '/' + featureId + '/'
+  return { area: area, primarySlug: primarySlug, scopeId16: scopeId16, featureId: featureId, planDir: planDir, anchorPath: anchorPath }
+}
+
+// hashSources: agent-mediated SHA-256 computation. The engine NEVER computes SHA-256.
+// The agent reads each file, computes per-file contentSha256 using Node's crypto,
+// then frames sorted [path, hash] pairs as JSON and SHA-256s that to produce scopeDigest.
+async function hashSources(arg) {
+  var files = arg && arg.files
+  var result = arg && arg.result
+  if (!files || !files.length) return null
+  var fileList = files.map(normalizeToPosix).join('\n')
+  return safeAgent(
+    'You are a hash-sources agent. For each file path listed below, READ the file content and\n' +
+    'compute its SHA-256 hash using Node.js crypto (available to you via shell or scripts).\n' +
+    'Then compute a combined scopeDigest:\n' +
+    '1. Sort all (path, contentSha256) pairs by path ascending (lexicographic).\n' +
+    '2. Frame as a JSON array of [path, contentSha256] pairs: e.g. [["src/a.ts","abc..."],["src/b.ts","def..."]]\n' +
+    '3. Compute SHA-256 of JSON.stringify(that array) — this is scopeDigest.\n\n' +
+    'All hashes must be 64 lowercase hex characters. Return the per-file hashes and scopeDigest.\n\n' +
+    'Files to hash:\n' + fileList + '\n\n' +
+    'Do NOT modify any files. Do NOT commit.',
+    { label: 'hash-sources', phase: 'Hash Sources', schema: HASH_SOURCES_VERDICT, model: gm('todo') },
+    result
+  )
+}
+
+// resolveScopePreflight: resolve the extraction scope WITHOUT writing any files.
+// Wraps the code-explorer agent call — captures the verdict in-memory for the
+// pending checkpoint. Returns { pendingId, task, verdict, state:'PENDING', createdAt }
+// or null if scope resolution fails. WRITES NOTHING TO DISK.
+async function resolveScopePreflight(arg) {
+  var task = arg && arg.task
+  var result = arg && arg.result
+  var timestamp = arg && arg.timestamp
+  var pendingId = generatePendingId(task, timestamp)
+  var verdict = await flexibleAgent(
+    'You are the code-explorer agent. Resolve the extraction input below into a CONCRETE code scope.\n' +
+    'DO NOT WRITE ANY FILES — just resolve the scope and return the verdict fields.\n' +
+    'Use Serena tools (activate the project, list_dir, find_symbol, find_referencing_symbols,\n' +
+    'search_for_pattern) to locate the code — do NOT guess paths.\n\n' +
+    'IMPORTANT: You are running inside an automated workflow pipeline. AskUserQuestion is NOT available.\n' +
+    'Record anything needing user judgment in the ambiguities array instead of asking.\n\n' +
+    'Extraction input:\n' + (task || '') + '\n\n' +
+    'Return in the verdict:\n' +
+    '- files: every concrete file path in scope (resolved, existing files only)\n' +
+    '- entryPoints: observable entry points into this code (routes, commands, handlers, exports)\n' +
+    '- symbols: the key classes/functions anchoring the scope\n' +
+    '- confidence: high|medium|low\n' +
+    '- wide: true ONLY if the scope spans multiple coherent subsystems\n' +
+    '- suggestedSlices: when wide, candidate subsystem slices\n' +
+    '- ambiguities: unclear boundaries or intent questions (recorded, not blocking)\n' +
+    '- scopePath: set to "pending" (the manifest is written later after confirmation)\n' +
+    '- summary: one-line scope summary\n\n' +
+    'Do NOT modify any code. Do NOT commit. Do NOT write any files.',
+    { label: 'code-explorer(scope-preflight)', phase: 'Pending Confirm', schema: SCOPE_VERDICT, model: gm('scopeResolver') },
+    result
+  )
+  if (!verdict || !verdict.files || !verdict.files.length) return null
+
+  // Phase 13: hash sources + validate + derive deterministic folder.
+  // The engine NEVER computes SHA-256 — hashSources delegates to an agent.
+  var hashResult = await hashSources({ files: verdict.files, result: result })
+  if (!hashResult || !hashResult.files || !hashResult.scopeDigest) {
+    // Blocked: can't hash — return null so the caller writes a blocked handoff.
+    return null
+  }
+  var validation = validateHashes(hashResult.files, hashResult.scopeDigest)
+  if (!validation.valid) {
+    // Fail-closed: return a blocked preflight with the hash error reason.
+    return {
+      pendingId: pendingId,
+      task: String(task || ''),
+      verdict: verdict,
+      state: 'PENDING',
+      createdAt: String(timestamp || ''),
+      hashError: validation.reason,
+    }
+  }
+  // Derive the deterministic folder from validated hashes.
+  var entryPoints = (verdict.entryPoints || []).map(normalizeToPosix)
+  var folder = deriveFeatureFolder({
+    fileHashes: hashResult.files,
+    scopeDigest: hashResult.scopeDigest,
+    entryPoints: entryPoints,
+  })
+  return {
+    pendingId: pendingId,
+    task: String(task || ''),
+    verdict: verdict,
+    state: 'PENDING',
+    createdAt: String(timestamp || ''),
+    fileHashes: hashResult.files,
+    scopeDigest: hashResult.scopeDigest,
+    featureId: folder.featureId,
+    derivedPlanDir: folder.planDir,
+    area: folder.area,
+    scopeId16: folder.scopeId16,
+    primarySlug: folder.primarySlug,
+    anchorPath: folder.anchorPath,
+  }
+}
+
+// writePendingRecord: persist the pending record JSON to <pendingDir><pendingId>.json
+// via a file-writer agent (temp-then-rename pattern).
+async function writePendingRecord(pendingDir, record, result) {
+  var filePath = pendingDir + record.pendingId + '.json'
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + filePath + ' using a\n' +
+    'temp-then-rename pattern (write to a .tmp file first, then rename to the target).\n' +
+    'Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + filePath + '.\n\nJSON:\n' + JSON.stringify(record, null, 2),
+    { label: 'file-writer(pending-record)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// readPendingRecord: read + parse a pending record via a file-reader agent.
+// Returns the record object or null if the file does not exist.
+async function readPendingRecord(pendingDir, pendingId, result) {
+  var filePath = pendingDir + pendingId + '.json'
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + filePath + ' and return its full JSON content parsed\n' +
+    'as an object in the "record" field. If the file does not exist, return record=null.',
+    { label: 'file-reader(pending-record)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: PENDING_READ_RESULT, model: gm('todo') },
+    result
+  )
+  return loaded
+}
+
+// appendLocatorEntry: append a permanent locator entry to the locator JSON file.
+// Reads the existing array (or starts fresh), appends, writes atomically.
+async function appendLocatorEntry(locatorPath, entry, result) {
+  var existing = await safeAgent(
+    'You are a file-reader agent. Read ' + locatorPath + ' and return its JSON content as an\n' +
+    'array in the "entries" field. If the file does not exist, return entries=[].',
+    { label: 'file-reader(locator)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: LOCATOR_READ_RESULT, model: gm('todo') },
+    result
+  )
+  var entries = (existing && Array.isArray(existing.entries)) ? existing.entries : []
+  entries.push(entry)
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON array to ' + locatorPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + locatorPath + '.\n\nJSON:\n' + JSON.stringify(entries, null, 2),
+    { label: 'file-writer(locator)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// resolveLocator: look up a pendingId in the locator file via a file-reader agent.
+// Returns { featureId, planDir, promotedAt } or null.
+async function resolveLocator(locatorPath, pendingId, result) {
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + locatorPath + ' and return its JSON content as an\n' +
+    'array in the "entries" field. If the file does not exist, return entries=[].',
+    { label: 'file-reader(locator-lookup)', phase: 'Pending Confirm', agentType: nsAgent('file-writer'), schema: LOCATOR_READ_RESULT, model: gm('todo') },
+    result
+  )
+  var entries = (loaded && Array.isArray(loaded.entries)) ? loaded.entries : []
+  return resolveLocatorEntry(entries, pendingId)
+}
+
+// writeScopeManifestFromVerdict: serialize a scope verdict to scope-manifest.md
+// and write via a file-writer agent (temp-then-rename).
+async function writeScopeManifestFromVerdict(scopeManifestPath, verdict, result) {
+  var files = (verdict && verdict.files) || []
+  var entryPoints = (verdict && verdict.entryPoints) || []
+  var symbols = (verdict && verdict.symbols) || []
+  var confidence = (verdict && verdict.confidence) || 'unspecified'
+  var ambiguities = (verdict && verdict.ambiguities) || []
+  var summary = (verdict && verdict.summary) || ''
+  var lines = ['# Scope Manifest', '', '**Confidence:** ' + confidence, '', '## Files in scope']
+  for (var i = 0; i < files.length; i++) lines.push('- ' + files[i])
+  if (entryPoints.length) { lines.push('', '## Entry points'); for (var j = 0; j < entryPoints.length; j++) lines.push('- ' + entryPoints[j]) }
+  if (symbols.length) { lines.push('', '## Key symbols'); for (var k = 0; k < symbols.length; k++) lines.push('- ' + symbols[k]) }
+  if (summary) lines.push('', '## Summary', '', summary)
+  if (ambiguities.length) { lines.push('', '## Ambiguities'); for (var m = 0; m < ambiguities.length; m++) lines.push('- ' + ambiguities[m]) }
+  var md = lines.join('\n') + '\n'
+  return safeAgent(
+    'You are a file-writer agent. Write the following markdown to ' + scopeManifestPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + scopeManifestPath + '.\n\nContent:\n' + md,
+    { label: 'file-writer(scope-manifest)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// writeIdentityStub: write the D0 .identity.json placeholder. Ownership digest
+// is null — Phase 13 fills it in with the real deterministic hash.
+async function writeIdentity(arg) {
+  var identityPath = arg.identityPath
+  var featureId = arg.featureId
+  var planDir = arg.planDir
+  var scopeDigest = arg.scopeDigest
+  var area = arg.area
+  var scopeId16 = arg.scopeId16
+  var createdAt = String(arg.createdAt || '')
+  var result = arg.result
+  var identity = {
+    featureId: featureId,
+    planDir: planDir,
+    ownershipScopeDigest: scopeDigest,
+    area: area,
+    scopeId16: scopeId16,
+    createdAt: createdAt,
+  }
+  return safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + identityPath + ' using\n' +
+    'temp-then-rename. Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + identityPath + '.\n\nJSON:\n' + JSON.stringify(identity, null, 2),
+    { label: 'file-writer(identity)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// promotePendingRecord: atomically promote a PENDING record to PROMOTED.
+// NEW-feature branch: create folder + scope-manifest.md + .identity.json stub,
+//   then root-last pipeline-state.json via flushPipelineState.
+// EXISTING-feature branch: update scope-manifest.md only (do NOT overwrite identity).
+// Both branches: update pending record state + append permanent locator entry.
+async function promotePendingRecord(arg) {
+  var pendingDir = arg && arg.pendingDir
+  var record = arg && arg.record
+  var planDir = arg && arg.planDir
+  var result = arg && arg.result
+  var config = arg && arg.config
+  var timestamp = arg && arg.timestamp
+  var identityFields = arg && arg.identityFields
+  var identityPath = planDir + '.identity.json'
+  var scopeManifestPath = planDir + 'scope-manifest.md'
+
+  // Check if pipeline-state.json already exists at planDir (EXISTING vs NEW).
+  var existingCheck = await safeAgent(
+    'You are a file-reader agent. Check if ' + planDir + 'pipeline-state.json exists.\n' +
+    'Return exists=true and sizeBytes if it exists; exists=false if not.',
+    { label: 'file-reader(promotion-check)', phase: 'Promote', agentType: nsAgent('file-writer'), schema: ARTIFACT_CHECK, model: gm('todo') },
+    result
+  )
+  var isExisting = existingCheck && existingCheck.exists === true
+
+  if (!isExisting) {
+    // NEW feature — create scope-manifest.md + .identity.json (root-last: state after)
+    await writeScopeManifestFromVerdict(scopeManifestPath, record.verdict, result)
+    // Write real identity with the actual ownershipScopeDigest (not null stub).
+    await writeIdentity({
+      identityPath: identityPath,
+      featureId: (identityFields && identityFields.featureId) || (planDir.split('/').filter(Boolean).pop() || planDir),
+      planDir: planDir,
+      scopeDigest: (identityFields && identityFields.scopeDigest) || '',
+      area: (identityFields && identityFields.area) || 'uncategorized',
+      scopeId16: (identityFields && identityFields.scopeId16) || '',
+      createdAt: String(timestamp || ''),
+      result: result,
+    })
+    // Root-last: pipeline-state.json only after identity + manifest exist
+    await flushPipelineState(planDir, result, config)
+  } else {
+    // EXISTING feature — revision, NOT a new identity.
+    // Do NOT create folder, do NOT overwrite .identity.json.
+    // Update scope-manifest.md with the new scope verdict.
+    await writeScopeManifestFromVerdict(scopeManifestPath, record.verdict, result)
+    // pipeline-state.json already exists — preserved; updated later by the extract flow
+  }
+
+  // Update pending record to PROMOTED (durable — survives crash on replay)
+  var promotedRecord = Object.assign({}, record, {
+    state: 'PROMOTED',
+    promotedAt: String(timestamp || ''),
+    planDir: planDir,
+  })
+  await writePendingRecord(pendingDir, promotedRecord, result)
+
+  // Append permanent compact locator entry (retained indefinitely)
+  await appendLocatorEntry(PENDING_LOCATOR_PATH, {
+    pendingId: record.pendingId,
+    featureId: (identityFields && identityFields.featureId) || (planDir.split('/').filter(Boolean).pop() || planDir),
+    planDir: planDir,
+    promotedAt: String(timestamp || ''),
+  }, result)
+
+  if (result && Array.isArray(result.logLines)) {
+    result.logLines.push('Promote: ' + record.pendingId + ' → ' + planDir + ' (' + (isExisting ? 'EXISTING' : 'NEW') + ')')
+  }
+  return { promoted: true, record: promotedRecord, isNew: !isExisting }
+}
+
+// ---- Feature-identity registry (Phase 14 / D1.2-D1.4) -----------------------
+
+// Registry path — the single JSON index of all extracted features.
+const REGISTRY_PATH = 'docs/extract/.registry.json'
+
+// File-reader result schemas for registry + sidecar reads (local — not exported).
+var REGISTRY_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['registry'],
+  properties: {
+    registry: { type: ['object', 'null'], description: 'Parsed registry object, or null if the file does not exist or is corrupt' },
+  },
+}
+
+var IDENTITY_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['identity'],
+  properties: {
+    identity: { type: ['object', 'null'], description: 'Parsed identity record, or null if the file does not exist' },
+  },
+}
+
+var PIPELINE_STATE_FOR_RECOVERY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['state'],
+  properties: {
+    state: { type: ['object', 'null'], description: 'Parsed pipeline-state.json, or null if missing' },
+  },
+}
+
+// findFeature: rename-resilient feature lookup. PURE — no agent calls, no I/O.
+// Determines whether a current scope reuses an existing feature folder, creates a
+// new one, or is ambiguous/blocked. A file matches by path OR contentSha256
+// (survives full rename). Strong = anchor match OR majority of min(counts).
+function findFeature(arg) {
+  var currentFiles = (arg && arg.currentFiles) || []
+  var currentAnchor = (arg && arg.currentAnchor) || ''
+  var registryFeatures = (arg && arg.registryFeatures) || []
+
+  // Empty input — nothing to match against.
+  if (!currentFiles.length) {
+    return { decision: 'blocked', reason: 'empty-current-files' }
+  }
+
+  // Build current path and hash lookup sets.
+  var currentPathSet = new Set()
+  var currentHashSet = new Set()
+  for (var i = 0; i < currentFiles.length; i++) {
+    var cf = currentFiles[i]
+    if (cf && cf.path) currentPathSet.add(cf.path)
+    if (cf && cf.contentSha256) currentHashSet.add(cf.contentSha256)
+  }
+
+  var strongCandidates = []
+  var weakMatches = []
+
+  for (var j = 0; j < registryFeatures.length; j++) {
+    var feat = registryFeatures[j]
+    if (!feat || !feat.files) continue
+
+    var featPathSet = new Set()
+    var featHashSet = new Set()
+    for (var k = 0; k < feat.files.length; k++) {
+      var ff = feat.files[k]
+      if (ff && ff.path) featPathSet.add(ff.path)
+      if (ff && ff.contentSha256) featHashSet.add(ff.contentSha256)
+    }
+
+    // Count current files matching by path OR hash (dedup: a file matching both counts once).
+    var totalMatches = 0
+    for (var m = 0; m < currentFiles.length; m++) {
+      var cur = currentFiles[m]
+      var matchByPath = cur && cur.path && featPathSet.has(cur.path)
+      var matchByHash = cur && cur.contentSha256 && featHashSet.has(cur.contentSha256)
+      if (matchByPath || matchByHash) totalMatches++
+    }
+
+    var anchorMatch = currentAnchor && feat.anchorPath && currentAnchor === feat.anchorPath
+    var minCount = Math.min(currentFiles.length, feat.files.length)
+    var majority = Math.floor(minCount / 2) + 1
+    var isStrong = anchorMatch || totalMatches >= majority
+
+    if (isStrong) {
+      strongCandidates.push({
+        featureId: feat.featureId,
+        matchCount: totalMatches,
+        anchorMatch: !!anchorMatch,
+      })
+    } else if (totalMatches > 0) {
+      weakMatches.push({ featureId: feat.featureId, matchCount: totalMatches })
+    }
+  }
+
+  // Decision logic:
+  // Zero strong → new (if no weak) or blocked weak-only (if some overlap).
+  // One strong → reuse (trivially strictly-highest).
+  // Two+ strong → find strictly-highest; tie at top → blocked ambiguous.
+  if (!strongCandidates.length) {
+    if (weakMatches.length) {
+      return { decision: 'blocked', reason: 'weak-only-match', weakMatches: weakMatches }
+    }
+    return { decision: 'new' }
+  }
+
+  if (strongCandidates.length === 1) {
+    return {
+      decision: 'reuse',
+      featureId: strongCandidates[0].featureId,
+      matchCount: strongCandidates[0].matchCount,
+    }
+  }
+
+  // Two+ strong candidates — find the strictly-highest match count.
+  strongCandidates.sort(function (a, b) { return b.matchCount - a.matchCount })
+  var topCount = strongCandidates[0].matchCount
+  var tied = strongCandidates.filter(function (c) { return c.matchCount === topCount })
+
+  if (tied.length === 1) {
+    return {
+      decision: 'reuse',
+      featureId: tied[0].featureId,
+      matchCount: tied[0].matchCount,
+    }
+  }
+
+  return {
+    decision: 'blocked',
+    reason: 'ambiguous-match',
+    candidates: tied.map(function (c) { return { featureId: c.featureId, matchCount: c.matchCount } }),
+  }
+}
+
+// upsertRegistryEntry: insert or replace a feature entry in the registry. PURE —
+// does NOT mutate the input registry; returns a shallow copy with the entry set.
+function upsertRegistryEntry(registry, entry) {
+  var base = registry && registry.features ? registry : { features: {} }
+  var updated = { features: Object.assign({}, base.features) }
+  updated.features[entry.featureId] = entry
+  return updated
+}
+
+
+// refreshRegistryFiles: returns a copy of the registry with the named feature's
+// mutable `files` list refreshed from the current per-file hashes. Immutable
+// ownership identity (featureId, planDir, ownershipScopeDigest, anchorPath,
+// scopeId16, area) is preserved so the feature's identity stays stable across
+// auto-updates while subsequent findFeature matches see the current revision.
+// PURE; returns the same registry reference unchanged if the feature is absent.
+function refreshRegistryFiles(registry, featureId, fileHashes) {
+  if (!registry || !registry.features || !featureId || !registry.features[featureId]) {
+    return registry
+  }
+  var updated = { features: Object.assign({}, registry.features) }
+  var entry = Object.assign({}, registry.features[featureId])
+  entry.files = (fileHashes || []).map(function (fh) {
+    return { path: fh.path, contentSha256: fh.contentSha256 }
+  })
+  updated.features[featureId] = entry
+  return updated
+}
+
+// readRegistry: load the registry JSON via a file-reader agent.
+// Returns { features: {} } if the file does not exist; null if corrupt JSON.
+async function readRegistry(registryPath, result) {
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + registryPath + ' and return its full JSON content parsed\\n' +
+    'as an object in the "registry" field. If the file does not exist, return registry=null.\\n' +
+    'If the file exists but contains invalid JSON, return registry=null.',
+    { label: 'file-reader(registry)', phase: 'Registry Lookup', agentType: nsAgent('file-writer'), schema: REGISTRY_READ_RESULT, model: gm('todo') },
+    result
+  )
+  if (!loaded || loaded.registry === null || loaded.registry === undefined) {
+    // Distinguish "file not found" from "corrupt" — safeAgent returns the parsed
+    // object. null registry means either not-found or corrupt; caller treats both
+    // as "no valid registry" and falls through to empty or recovery.
+    return null
+  }
+  return loaded.registry
+}
+
+// writeRegistry: atomically persist the registry JSON via temp-then-rename.
+async function writeRegistry(registryPath, registry, result) {
+  var json = JSON.stringify(registry, null, 2)
+  var ack = await safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + registryPath + ' using a\\n' +
+    'temp-then-rename pattern (write to a .tmp file first, then rename to the target).\\n' +
+    'Create the directory if it does not exist.\\n\\n' +
+    'Return ok=true and path=' + registryPath + '.\\n\\nJSON:\\n' + json,
+    { label: 'file-writer(registry)', phase: 'Registry Lookup', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+  return ack
+}
+
+// readIdentitySidecar: load <planDir>/.identity.json via a file-reader agent.
+// Returns the identity object or null if the file does not exist.
+async function readIdentitySidecar(identityPath, result) {
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + identityPath + ' and return its full JSON content\\n' +
+    'parsed as an object in the "identity" field. If the file does not exist, return identity=null.',
+    { label: 'file-reader(identity-sidecar)', phase: 'Registry Lookup', agentType: nsAgent('file-writer'), schema: IDENTITY_READ_RESULT, model: gm('todo') },
+    result
+  )
+  if (!loaded) return null
+  return loaded.identity
+}
+
+// checkFolderCollision: guard against overwriting another feature's folder on
+// NEW-feature creation. Compares the requester's full ownershipScopeDigest
+// against the existing .identity.json at the target planDir.
+async function checkFolderCollision(arg) {
+  var planDir = arg && arg.planDir
+  var requesterDigest = arg && arg.requesterDigest
+  var result = arg && arg.result
+  var identityPath = planDir + '.identity.json'
+
+  var identity = await readIdentitySidecar(identityPath, result)
+  if (!identity) {
+    // No existing identity — safe to create.
+    return { collision: false }
+  }
+
+  // Compare FULL 64-hex ownership digest (not truncated featureId).
+  if (identity.ownershipScopeDigest === requesterDigest) {
+    return { collision: false, idempotent: true }
+  }
+
+  return {
+    collision: true,
+    existingFeatureId: identity.featureId || '(unknown)',
+  }
+}
+
+// recoverRegistry: startup recovery — reconcile 'extracting' entries from
+// current pipeline-state + sidecars. Immutable ownership fields always come from
+// .identity.json sidecars (never from the potentially-stale registry). Mutable
+// fields (files, status) are rebuilt from current pipeline-state. Fail-closed
+// if evidence is missing.
+async function recoverRegistry(arg) {
+  var registryPath = arg && arg.registryPath
+  var result = arg && arg.result
+
+  var registry = await readRegistry(registryPath, result)
+
+  // Corrupt or missing registry — try to rebuild from sidecars.
+  if (!registry) {
+    // Scan for .identity.json sidecars under docs/extract/ to rebuild.
+    var scanResult = await safeAgent(
+      'You are a file-reader agent. Search for all .identity.json files under docs/extract/\\n' +
+      '(excluding docs/extract/.pending/ and docs/extract/slices/). For each found, read and\\n' +
+      'return its JSON content. Return an array of identity objects in the "identities" field.\\n' +
+      'If none found, return identities=[].',
+      { label: 'file-reader(registry-rebuild)', phase: 'Registry Recovery', agentType: nsAgent('file-writer'), schema: { type: 'object', additionalProperties: false, required: ['identities'], properties: { identities: { type: 'array', items: { type: 'object' } } } }, model: gm('todo') },
+      result
+    )
+    var identities = (scanResult && scanResult.identities) || []
+    if (!identities.length) {
+      // No sidecars — nothing to rebuild; return empty registry.
+      return { recovered: 0, failed: 0, registry: { features: {} }, failClosed: true }
+    }
+    // Rebuild registry from sidecar identities. Mutable fields are unknown
+    // without pipeline-state — mark all as 'stale' (fail-closed).
+    var rebuilt = { features: {} }
+    for (var ri = 0; ri < identities.length; ri++) {
+      var id = identities[ri]
+      if (!id || !id.featureId) continue
+      rebuilt.features[id.featureId] = {
+        featureId: id.featureId,
+        planDir: id.planDir,
+        ownershipScopeDigest: id.ownershipScopeDigest,
+        scopeId16: id.scopeId16 || '',
+        files: [],
+        anchorPath: '',
+        status: 'stale',
+        updatedAt: '',
+        recoveryError: 'corrupt-registry-rebuild',
+      }
+    }
+    await writeRegistry(registryPath, rebuilt, result)
+    return { recovered: 0, failed: identities.length, registry: rebuilt }
+  }
+
+  // Registry exists — reconcile each 'extracting' entry.
+  var features = (registry && registry.features) || {}
+  var featureIds = Object.keys(features)
+  if (!featureIds.length) {
+    return { recovered: 0, failed: 0, registry: registry }
+  }
+
+  var recovered = 0
+  var failed = 0
+  var updatedRegistry = { features: Object.assign({}, features) }
+
+  for (var fi = 0; fi < featureIds.length; fi++) {
+    var fid = featureIds[fi]
+    var entry = features[fid]
+    if (!entry) continue
+
+    // Verify .identity.json still exists (immutable ownership source).
+    var identityPath = entry.planDir + '.identity.json'
+    var identity = await readIdentitySidecar(identityPath, result)
+
+    if (!identity) {
+      // Missing identity — fail-closed: mark stale.
+      updatedRegistry.features[fid] = Object.assign({}, entry, {
+        status: 'stale',
+        recoveryError: 'missing-identity',
+      })
+      failed++
+      continue
+    }
+
+    // Always source immutable fields from the sidecar (not the stale registry).
+    entry.featureId = identity.featureId
+    entry.planDir = identity.planDir
+    entry.ownershipScopeDigest = identity.ownershipScopeDigest
+    entry.scopeId16 = identity.scopeId16 || entry.scopeId16
+
+    if (entry.status !== 'extracting') {
+      // Non-extracting entries keep their status; immutable fields refreshed.
+      updatedRegistry.features[fid] = entry
+      continue
+    }
+
+    // Extracting entry — rebuild mutable fields from current pipeline-state.
+    var statePath = entry.planDir + 'pipeline-state.json'
+    var stateResult = await safeAgent(
+      'You are a file-reader agent. Read ' + statePath + ' and return its JSON content\\n' +
+      'parsed as an object in the "state" field. If the file does not exist, return state=null.',
+      { label: 'file-reader(recovery-state)', phase: 'Registry Recovery', agentType: nsAgent('file-writer'), schema: PIPELINE_STATE_FOR_RECOVERY, model: gm('todo') },
+      result
+    )
+    var pipelineState = (stateResult && stateResult.state) || null
+
+    if (!pipelineState) {
+      // Missing pipeline-state — fail-closed: mark stale.
+      updatedRegistry.features[fid] = Object.assign({}, entry, {
+        status: 'stale',
+        recoveryError: 'missing-pipeline-state',
+      })
+      failed++
+      continue
+    }
+
+    // Check for durable extraction evidence (gate checkpoints or extractReady).
+    var hasEvidence = (pipelineState.result && (
+      (pipelineState.result._gateCheckpoints && Object.keys(pipelineState.result._gateCheckpoints).length > 0) ||
+      pipelineState.result.extractReady === true
+    ))
+
+    if (!hasEvidence) {
+      // Incomplete extraction — fail-closed: mark stale.
+      updatedRegistry.features[fid] = Object.assign({}, entry, {
+        status: 'stale',
+        recoveryError: 'incomplete-pipeline-state',
+      })
+      failed++
+      continue
+    }
+
+    // Rebuild mutable files from pipeline-state if available.
+    var rebuiltFiles = []
+    if (pipelineState.result && pipelineState.result._sourceDigest && pipelineState.result._sourceDigest.files) {
+      rebuiltFiles = pipelineState.result._sourceDigest.files
+    } else if (pipelineState.result && pipelineState.result.extractScope && pipelineState.result.extractScope.files) {
+      // Fallback: derive file list from the scope verdict (paths only — no hashes).
+      var scopeFiles = pipelineState.result.extractScope.files || []
+      rebuiltFiles = scopeFiles.map(function (p) {
+        return { path: normalizeToPosix(p), contentSha256: '' }
+      })
+    }
+
+    updatedRegistry.features[fid] = Object.assign({}, entry, {
+      files: rebuiltFiles,
+      status: pipelineState.result.extractReady ? 'current' : 'stale',
+      recoveryError: pipelineState.result.extractReady ? undefined : 'extraction-incomplete',
+    })
+
+    if (pipelineState.result.extractReady) {
+      recovered++
+    } else {
+      failed++
+    }
+  }
+
+  // Write recovered registry atomically.
+  await writeRegistry(registryPath, updatedRegistry, result)
+  return { recovered: recovered, failed: failed, registry: updatedRegistry }
+}
+
+// ---- Slice ownership reconciliation (D2.1) ----------------------------------
+
+// Split a POSIX path into directory segments (drop the filename).
+// "src/auth/login.ts" -> ["src", "auth"]. "README.md" -> []. PURE.
+function directorySegments(filePath) {
+  var parts = String(filePath || '').split('/')
+  if (parts.length > 0) parts.pop()
+  return parts.filter(Boolean)
+}
+
+// First 2 segments of the full path joined by /.
+// "src/auth/login.ts" -> "src/auth". "README.md" -> null. PURE.
+function twoSegDir(filePath) {
+  var segs = String(filePath || '').split('/').filter(Boolean)
+  if (segs.length < 2) return null
+  return segs[0] + '/' + segs[1]
+}
+
+// computePrefixScore: max over sliceFiles of common-leading-directory-segment count
+// between filePath's directory and each sliceFile's directory. PURE.
+function computePrefixScore(filePath, sliceFiles) {
+  var fileDir = directorySegments(filePath)
+  var best = 0
+  var arr = sliceFiles || []
+  for (var i = 0; i < arr.length; i++) {
+    var sfDir = directorySegments(arr[i].path)
+    var common = 0
+    var len = Math.min(fileDir.length, sfDir.length)
+    for (var j = 0; j < len; j++) {
+      if (fileDir[j] === sfDir[j]) common++
+      else break
+    }
+    if (common > best) best = common
+  }
+  return best
+}
+
+// clusterByTwoSegDir: cluster files by first-2-segment directory via union-find.
+// Same 2-seg dir -> same cluster. null dir or unique dir -> singleton. PURE.
+function clusterByTwoSegDir(files) {
+  var n = (files || []).length
+  if (n === 0) return []
+  var parent = []
+  for (var p = 0; p < n; p++) parent.push(p)
+  function ufFind(x) {
+    while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x] }
+    return x
+  }
+  function ufUnion(a, b) {
+    var ra = ufFind(a), rb = ufFind(b)
+    if (ra !== rb) parent[ra] = rb
+  }
+  var dirs = []
+  for (var d = 0; d < n; d++) dirs.push(twoSegDir(files[d].path))
+  for (var i = 0; i < n; i++) {
+    for (var j = i + 1; j < n; j++) {
+      if (dirs[i] !== null && dirs[i] === dirs[j]) ufUnion(i, j)
+    }
+  }
+  var groups = {}
+  for (var k = 0; k < n; k++) {
+    var r = ufFind(k)
+    if (!groups[r]) groups[r] = []
+    groups[r].push(files[k])
+  }
+  return Object.values(groups)
+}
+
+// deriveClusterSliceId: "slice-<lexSmallest(cluster hashes).slice(0,12)>".
+// Collision (base id already in existingIds) -> append deterministic "-<n>". PURE.
+function deriveClusterSliceId(cluster, existingIds) {
+  var hashes = (cluster || []).map(function (f) { return f.contentSha256 }).sort()
+  var base = 'slice-' + hashes[0].slice(0, 12)
+  if (!existingIds.has(base)) return base
+  var n = 1
+  while (existingIds.has(base + '-' + n)) n++
+  return base + '-' + n
+}
+
+// detectMoves: classify new-path current files as moves or adds.
+// Move = unique contentSha256 match whose old path is gone. Ambiguous (>=2 old paths)
+// or old-path-still-exists -> add. Returns { moves, adds }. PURE.
+function detectMoves(currentFiles, oldPathMap, oldHashMap, currentPathSet) {
+  var moves = []
+  var adds = []
+  var arr = currentFiles || []
+  for (var i = 0; i < arr.length; i++) {
+    var cf = arr[i]
+    if (oldPathMap.has(cf.path)) continue
+    var oldPaths = oldHashMap.get(cf.contentSha256)
+    if (oldPaths && oldPaths.length === 1) {
+      var oldPath = oldPaths[0]
+      if (!currentPathSet.has(oldPath)) {
+        moves.push({
+          newPath: cf.path, oldPath: oldPath,
+          contentSha256: cf.contentSha256,
+          sliceId: oldPathMap.get(oldPath).sliceId,
+        })
+      } else {
+        adds.push(cf)
+      }
+    } else {
+      adds.push(cf)
+    }
+  }
+  return { moves: moves, adds: adds }
+}
+
+// validatePartition: assert every current file is owned by exactly one non-removed
+// output slice. Throws on violation. PURE.
+function validatePartition(slices, currentFiles) {
+  var ownerCount = new Map()
+  var sArr = slices || []
+  for (var i = 0; i < sArr.length; i++) {
+    var s = sArr[i]
+    if (s.status === 'removed') continue
+    var fArr = s.files || []
+    for (var j = 0; j < fArr.length; j++) {
+      var p = fArr[j].path
+      ownerCount.set(p, (ownerCount.get(p) || 0) + 1)
+    }
+  }
+  var cArr = currentFiles || []
+  for (var k = 0; k < cArr.length; k++) {
+    var count = ownerCount.get(cArr[k].path) || 0
+    if (count === 0) throw new Error('Partition violation: ' + cArr[k].path + ' has no owner')
+    if (count > 1) throw new Error('Partition violation: ' + cArr[k].path + ' has ' + count + ' owners')
+  }
+}
+
+// reconcileSlices: PURE ownership reconciliation. No agent calls, no LLM, no I/O.
+// Determines the current slice assignment for every current file and returns the
+// reconciled slices + a change delta. Permutation-invariant (all output sorted).
+function reconcileSlices(persistedSlices, currentFiles) {
+  var pSlices = persistedSlices || []
+  var current = currentFiles || []
+  var delta = { added: [], removed: [], moved: [], newSlices: [], removedSlices: [], overlaps: [] }
+
+  // 1. Build lookup structures from persisted state
+  var oldPathMap = new Map()
+  var oldHashMap = new Map()
+  var currentPathSet = new Set()
+  var nonRemovedSlices = []
+
+  for (var si = 0; si < pSlices.length; si++) {
+    var sl = pSlices[si]
+    if (sl.status !== 'removed') nonRemovedSlices.push(sl)
+    var slFiles = sl.files || []
+    for (var fi = 0; fi < slFiles.length; fi++) {
+      var pf = slFiles[fi]
+      oldPathMap.set(pf.path, { sliceId: sl.sliceId, contentSha256: pf.contentSha256 })
+      if (!oldHashMap.has(pf.contentSha256)) oldHashMap.set(pf.contentSha256, [])
+      oldHashMap.get(pf.contentSha256).push(pf.path)
+    }
+  }
+  for (var ci = 0; ci < current.length; ci++) currentPathSet.add(current[ci].path)
+
+  // 2. Classify current files — detect moves/adds for new-path files
+  var moveResult = detectMoves(current, oldPathMap, oldHashMap, currentPathSet)
+  var moves = moveResult.moves
+  var adds = moveResult.adds
+  var movedOldPaths = new Set(moves.map(function (m) { return m.oldPath }))
+
+  // Track modified paths (same path, different hash)
+  var modifiedPaths = new Set()
+  for (var mi = 0; mi < current.length; mi++) {
+    var cf2 = current[mi]
+    if (oldPathMap.has(cf2.path) && oldPathMap.get(cf2.path).contentSha256 !== cf2.contentSha256) {
+      modifiedPaths.add(cf2.path)
+    }
+  }
+
+  // 3. Assign added files to non-removed slices by prefix score (tie -> lex-smallest sliceId)
+  var sortedNonRemoved = nonRemovedSlices.slice().sort(function (a, b) {
+    return a.sliceId < b.sliceId ? -1 : a.sliceId > b.sliceId ? 1 : 0
+  })
+  var zeroScoreFiles = []
+  var addAssignments = new Map()
+
+  for (var ai = 0; ai < adds.length; ai++) {
+    var add = adds[ai]
+    var bestSliceId = null
+    var bestScore = 0
+    for (var nsi = 0; nsi < sortedNonRemoved.length; nsi++) {
+      var score = computePrefixScore(add.path, sortedNonRemoved[nsi].files)
+      if (score > bestScore) {
+        bestScore = score
+        bestSliceId = sortedNonRemoved[nsi].sliceId
+      }
+    }
+    if (bestScore > 0) {
+      addAssignments.set(add.path, bestSliceId)
+    } else {
+      zeroScoreFiles.push(add)
+    }
+  }
+
+  // 4. Cluster zero-score files into new slices
+  var clusters = clusterByTwoSegDir(zeroScoreFiles)
+  var existingIds = new Set()
+  for (var ei = 0; ei < pSlices.length; ei++) existingIds.add(pSlices[ei].sliceId)
+  var newSliceMap = new Map()
+  var newSliceOrder = []
+  for (var cli = 0; cli < clusters.length; cli++) {
+    var cluster = clusters[cli]
+    var newId = deriveClusterSliceId(cluster, existingIds)
+    existingIds.add(newId)
+    newSliceMap.set(newId, cluster)
+    newSliceOrder.push(newId)
+  }
+
+  // 5. Build owner map: path -> sliceId for every current file
+  var ownerByPath = new Map()
+  var currentFileByPath = new Map()
+  for (var cfi = 0; cfi < current.length; cfi++) {
+    var cf3 = current[cfi]
+    currentFileByPath.set(cf3.path, cf3)
+    if (oldPathMap.has(cf3.path)) ownerByPath.set(cf3.path, oldPathMap.get(cf3.path).sliceId)
+  }
+  for (var mvi = 0; mvi < moves.length; mvi++) ownerByPath.set(moves[mvi].newPath, moves[mvi].sliceId)
+  addAssignments.forEach(function (sliceId, path) { ownerByPath.set(path, sliceId) })
+  newSliceMap.forEach(function (cluster, sliceId) {
+    for (var cli2 = 0; cli2 < cluster.length; cli2++) ownerByPath.set(cluster[cli2].path, sliceId)
+  })
+
+  // 6. Build per-slice file lists
+  var filesBySlice = new Map()
+  ownerByPath.forEach(function (sliceId, path) {
+    if (!filesBySlice.has(sliceId)) filesBySlice.set(sliceId, [])
+    var cf4 = currentFileByPath.get(path)
+    filesBySlice.get(sliceId).push({ path: cf4.path, contentSha256: cf4.contentSha256 })
+  })
+
+  // 7. Build output slices + delta
+  var outputSlices = []
+  for (var oi = 0; oi < pSlices.length; oi++) {
+    var orig = pSlices[oi]
+    if (orig.status === 'removed') {
+      outputSlices.push({ sliceId: orig.sliceId, files: [], status: 'removed', planDir: orig.planDir || '' })
+      continue
+    }
+    var owned = filesBySlice.get(orig.sliceId) || []
+    owned.sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+    var hasChanges = false
+
+    var origFiles = orig.files || []
+    for (var ri = 0; ri < origFiles.length; ri++) {
+      if (!currentPathSet.has(origFiles[ri].path) && !movedOldPaths.has(origFiles[ri].path)) {
+        hasChanges = true
+        delta.removed.push({ path: origFiles[ri].path, sliceId: orig.sliceId })
+      }
+    }
+    for (var ofi = 0; ofi < owned.length; ofi++) {
+      if (modifiedPaths.has(owned[ofi].path)) hasChanges = true
+      if (addAssignments.has(owned[ofi].path)) {
+        hasChanges = true
+        delta.added.push({ path: owned[ofi].path, contentSha256: owned[ofi].contentSha256, sliceId: orig.sliceId })
+      }
+    }
+    for (var mvi2 = 0; mvi2 < moves.length; mvi2++) {
+      if (moves[mvi2].sliceId === orig.sliceId) {
+        hasChanges = true
+        delta.moved.push({
+          oldPath: moves[mvi2].oldPath, newPath: moves[mvi2].newPath,
+          contentSha256: moves[mvi2].contentSha256, sliceId: orig.sliceId,
+        })
+      }
+    }
+    var status
+    if (owned.length === 0) {
+      status = 'removed'
+      delta.removedSlices.push(orig.sliceId)
+    } else if (hasChanges) {
+      status = 'pending'
+    } else {
+      status = orig.status || 'current'
+    }
+    outputSlices.push({ sliceId: orig.sliceId, files: owned, status: status, planDir: orig.planDir || '' })
+  }
+
+  // Add new slices from zero-score clusters
+  for (var nsi2 = 0; nsi2 < newSliceOrder.length; nsi2++) {
+    var nsId = newSliceOrder[nsi2]
+    var nsFiles = newSliceMap.get(nsId).slice().sort(function (a, b) {
+      return a.path < b.path ? -1 : a.path > b.path ? 1 : 0
+    })
+    outputSlices.push({ sliceId: nsId, files: nsFiles, status: 'pending', planDir: '' })
+    delta.newSlices.push({ sliceId: nsId, files: nsFiles })
+    for (var nfi = 0; nfi < nsFiles.length; nfi++) {
+      delta.added.push({ path: nsFiles[nfi].path, contentSha256: nsFiles[nfi].contentSha256, sliceId: nsId })
+    }
+  }
+
+  // 8. Resolve overlaps — lex-smallest sliceId wins
+  var pathOwners = new Map()
+  for (var osi = 0; osi < outputSlices.length; osi++) {
+    if (outputSlices[osi].status === 'removed') continue
+    var outFiles = outputSlices[osi].files || []
+    for (var ofi2 = 0; ofi2 < outFiles.length; ofi2++) {
+      var p2 = outFiles[ofi2].path
+      if (!pathOwners.has(p2)) pathOwners.set(p2, [])
+      pathOwners.get(p2).push(outputSlices[osi].sliceId)
+    }
+  }
+  pathOwners.forEach(function (owners, path) {
+    if (owners.length > 1) {
+      owners.sort()
+      var winner = owners[0]
+      for (var li = 1; li < owners.length; li++) {
+        delta.overlaps.push({ path: path, winnerSliceId: winner, loserSliceId: owners[li] })
+      }
+      for (var osi2 = 0; osi2 < outputSlices.length; osi2++) {
+        if (owners.indexOf(outputSlices[osi2].sliceId) > 0) {
+          outputSlices[osi2].files = outputSlices[osi2].files.filter(function (f) { return f.path !== path })
+        }
+      }
+    }
+  })
+
+  // 9. Validate partition invariant
+  validatePartition(outputSlices, current)
+
+  // 10. Sort all output for permutation invariance
+  delta.added.sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+  delta.removed.sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+  delta.moved.sort(function (a, b) { return a.newPath < b.newPath ? -1 : a.newPath > b.newPath ? 1 : 0 })
+  delta.newSlices.sort(function (a, b) { return a.sliceId < b.sliceId ? -1 : a.sliceId > b.sliceId ? 1 : 0 })
+  delta.removedSlices.sort()
+  delta.overlaps.sort(function (a, b) {
+    if (a.path !== b.path) return a.path < b.path ? -1 : 1
+    return a.loserSliceId < b.loserSliceId ? -1 : 1
+  })
+  outputSlices.sort(function (a, b) { return a.sliceId < b.sliceId ? -1 : a.sliceId > b.sliceId ? 1 : 0 })
+
+  return { slices: outputSlices, delta: delta }
+}
+
+// ---- Change Detection (D2.2) ------------------------------------------------
+
+// frameSliceDigest: PURE — sort + JSON-frame a slice's per-file hashes into a
+// deterministic string for agent-mediated SHA-256 computation. Permutation-invariant:
+// sorting by path ascending makes the frame independent of input order. The [path, hash]
+// pair structure separates path from hash so different file sets never collide.
+// The engine NEVER computes SHA-256 — this function only frames.
+function frameSliceDigest(fileHashes) {
+  var pairs = (fileHashes || [])
+    .slice()
+    .sort(function (a, b) { return a.path < b.path ? -1 : a.path > b.path ? 1 : 0 })
+    .map(function (fh) { return [fh.path, fh.contentSha256] })
+  return JSON.stringify(pairs)
+}
+
+// validateDigest64Hex: PURE — validate a 64-lowercase-hex SHA-256 string.
+// Returns { valid: true } or { valid: false, reason }.
+function validateDigest64Hex(digest) {
+  if (typeof digest !== 'string' || !digest) {
+    return { valid: false, reason: 'digest is missing or empty' }
+  }
+  if (!HEX64.test(digest)) {
+    return { valid: false, reason: 'digest is not 64-lowercase-hex' }
+  }
+  return { valid: true }
+}
+
+// detectSliceChanges: PURE — compare persisted vs current per-slice digests.
+// Fail-closed: any missing/invalid/unverifiable digest is classified as 'changed'
+// (never skip). Returns { decisions, changedCount, unchangedCount }.
+// decisions: [{ sliceId, status, reason }]
+function detectSliceChanges(persistedDigests, currentDigests) {
+  var persisted = persistedDigests || {}
+  var current = currentDigests || {}
+  var decisions = []
+  var changedCount = 0
+  var unchangedCount = 0
+
+  // Check every current slice against persisted digests.
+  for (var sliceId in current) {
+    var cur = current[sliceId]
+    var old = persisted[sliceId]
+
+    if (!cur || !cur.valid) {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'current-invalid' })
+      changedCount++
+    } else if (!old) {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'new-slice' })
+      changedCount++
+    } else if (!old.valid) {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'persisted-invalid' })
+      changedCount++
+    } else if (cur.digest === old.digest) {
+      decisions.push({ sliceId: sliceId, status: 'unchanged', reason: 'digest-match' })
+      unchangedCount++
+    } else {
+      decisions.push({ sliceId: sliceId, status: 'changed', reason: 'digest-mismatch' })
+      changedCount++
+    }
+  }
+
+  // Detect removed slices (in persisted but not in current) — independent loop.
+  for (var oldSliceId in persisted) {
+    if (!(oldSliceId in current)) {
+      decisions.push({ sliceId: oldSliceId, status: 'changed', reason: 'slice-removed' })
+      changedCount++
+    }
+  }
+
+  return { decisions: decisions, changedCount: changedCount, unchangedCount: unchangedCount }
+}
+
+// Read-result schema for the slice-digest file-reader agent.
+var SLICE_DIGEST_READ_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['sliceDigest'],
+  properties: {
+    sliceDigest: { type: ['object', 'null'], description: 'Parsed slice digest record, or null if the file does not exist' },
+  },
+}
+
+// computeSliceDigests: agent-mediated SHA-256 computation for each slice frame.
+// The engine NEVER computes SHA-256 — the agent uses Node's crypto to hash each
+// pre-framed string. Returns { slices: [{sliceId, digest}] } or null on failure.
+async function computeSliceDigests(arg) {
+  var sliceFrames = (arg && arg.sliceFrames) || []
+  var result = arg && arg.result
+  if (!sliceFrames.length) return { slices: [] }
+
+  var prompt = 'You are a slice-digest agent. For each slice below, compute the SHA-256 hash\n' +
+    'of the provided frame string. The frame is already deterministic (sorted,\n' +
+    'JSON-stringified [path, hash] pairs) — just hash each frame string.\n' +
+    'Return lowercase hex digests (64 chars each). Use whatever SHA-256 tooling\n' +
+    'is available to you (Node.js, shell, scripts).\n\n' +
+    'Slices to hash:\n' +
+    sliceFrames.map(function (sf) { return sf.sliceId + ':\n' + sf.frame }).join('\n\n') +
+    '\n\nDo NOT modify any files. Do NOT commit.'
+
+  return safeAgent(
+    prompt,
+    { label: 'slice-digest', phase: 'Change Detection', schema: SLICE_DIGEST_RESULT, model: gm('todo') },
+    result
+  )
+}
+
+// writeSliceDigestFile: persist <sliceDir>/.source-digest.json via file-writer agent.
+// Validates the digest via validateDigest64Hex before writing — fail-closed (no
+// malformed digest persisted). Returns { ok: true } or null on failure/invalid.
+async function writeSliceDigestFile(arg) {
+  var sliceDir = arg && arg.sliceDir
+  var files = (arg && arg.files) || []
+  var digest = arg && arg.digest
+  var result = arg && arg.result
+
+  // Fail-closed: validate the digest BEFORE calling the agent.
+  var validation = validateDigest64Hex(digest)
+  if (!validation.valid) return null
+
+  var filePath = String(sliceDir || '').replace(/\/$/, '') + '/.source-digest.json'
+  var payload = {
+    files: files.map(function (fh) { return { path: fh.path, contentSha256: fh.contentSha256 } }),
+    digest: digest,
+  }
+
+  return safeAgent(
+    'You are a file-writer agent. Write the following JSON to ' + filePath + ' using a\n' +
+    'temp-then-rename pattern (write to a .tmp file first, then rename to the target).\n' +
+    'Create the directory if it does not exist.\n\n' +
+    'Return ok=true and path=' + filePath + '.\n\nJSON:\n' + JSON.stringify(payload, null, 2),
+    { label: 'file-writer(slice-digest)', phase: 'Change Detection', agentType: nsAgent('file-writer'), schema: FILE_ACK, model: gm('todo') },
+    result
+  )
+}
+
+// readSliceDigestFile: load <sliceDir>/.source-digest.json via file-reader agent.
+// Returns { files, digest, valid } or null if the file does not exist.
+// The validity flag comes from validateDigest64Hex so detectSliceChanges can
+// make fail-closed decisions without re-validating.
+async function readSliceDigestFile(arg) {
+  var sliceDir = arg && arg.sliceDir
+  var result = arg && arg.result
+
+  var filePath = String(sliceDir || '').replace(/\/$/, '') + '/.source-digest.json'
+  var loaded = await safeAgent(
+    'You are a file-reader agent. Read ' + filePath + ' and return its full JSON content parsed\n' +
+    'as an object in the "sliceDigest" field. If the file does not exist, return sliceDigest=null.\n' +
+    'If the file exists but contains invalid JSON, return sliceDigest=null.',
+    { label: 'file-reader(slice-digest)', phase: 'Change Detection', agentType: nsAgent('file-writer'), schema: SLICE_DIGEST_READ_RESULT, model: gm('todo') },
+    result
+  )
+
+  if (!loaded || !loaded.sliceDigest) return null
+
+  var sd = loaded.sliceDigest
+  var digestValidation = validateDigest64Hex(sd.digest)
+  return {
+    files: Array.isArray(sd.files) ? sd.files : [],
+    digest: typeof sd.digest === 'string' ? sd.digest : '',
+    valid: digestValidation.valid,
+  }
+}
+
+// runChangeDetection: orchestrator — frame, hash, validate, read-persisted, compare,
+// persist new digests. Returns { decisions, digests, extractReady }.
+// The invalidation chain (invalidateSliceChain for changed slices) is NOT wired here —
+// Phase 17 adds it. This phase delivers decisions + persisted digests only.
+async function runChangeDetection(arg) {
+  var reconciledSlices = (arg && arg.reconciledSlices) || []
+  var fileHashes = (arg && arg.fileHashes) || []
+  var force = arg && arg.force
+  var result = arg && arg.result
+
+  // 1. Build a path → contentSha256 lookup from the flat file-hash list.
+  var hashByPath = {}
+  for (var hi = 0; hi < fileHashes.length; hi++) {
+    hashByPath[fileHashes[hi].path] = fileHashes[hi]
+  }
+
+  // 2. Partition file hashes by slice + frame each slice.
+  var sliceFrames = []
+  var sliceFileHashes = {} // sliceId → [{path, contentSha256}]
+  for (var si = 0; si < reconciledSlices.length; si++) {
+    var sl = reconciledSlices[si]
+    var sId = sl.sliceId
+    var sFiles = (sl.files || []).map(function (f) {
+      return hashByPath[f.path] || { path: f.path, contentSha256: f.contentSha256 || '' }
+    })
+    sliceFileHashes[sId] = sFiles
+    sliceFrames.push({ sliceId: sId, frame: frameSliceDigest(sFiles) })
+  }
+
+  // 3. Compute current digests via agent.
+  var digestResult = await computeSliceDigests({ sliceFrames: sliceFrames, result: result })
+
+  // 4. Build currentDigests map with validity flags.
+  var currentDigests = {}
+  if (digestResult && Array.isArray(digestResult.slices)) {
+    for (var di = 0; di < digestResult.slices.length; di++) {
+      var entry = digestResult.slices[di]
+      var dValid = validateDigest64Hex(entry.digest)
+      currentDigests[entry.sliceId] = { digest: entry.digest, valid: dValid.valid }
+    }
+  } else {
+    // Agent failed entirely — mark all slices as current-invalid (fail-closed).
+    for (var fi = 0; fi < reconciledSlices.length; fi++) {
+      currentDigests[reconciledSlices[fi].sliceId] = { digest: '', valid: false }
+    }
+  }
+
+  // 5. Read persisted digests per slice.
+  var persistedDigests = {}
+  for (var ri = 0; ri < reconciledSlices.length; ri++) {
+    var rSl = reconciledSlices[ri]
+    var rDir = rSl.planDir || ''
+    var persisted = await readSliceDigestFile({ sliceDir: rDir, result: result })
+    if (persisted) {
+      persistedDigests[rSl.sliceId] = { digest: persisted.digest, valid: persisted.valid }
+    }
+    // Missing persisted file → not in map → treated as new-slice by detectSliceChanges.
+  }
+
+  // 6. Detect changes.
+  var detection = detectSliceChanges(persistedDigests, currentDigests)
+  var decisions = detection.decisions
+
+  // 7. Force override: all slices become 'changed' regardless of digest comparison.
+  if (force) {
+    decisions = decisions.map(function (d) {
+      return { sliceId: d.sliceId, status: 'changed', reason: 'forced' }
+    })
+  }
+
+  // 8. Persist new digests for valid current digests (fail-closed — no invalid write).
+  for (var wi = 0; wi < reconciledSlices.length; wi++) {
+    var wSl = reconciledSlices[wi]
+    var wId = wSl.sliceId
+    var curEntry = currentDigests[wId]
+    if (curEntry && curEntry.valid) {
+      await writeSliceDigestFile({
+        sliceDir: wSl.planDir || '',
+        files: sliceFileHashes[wId],
+        digest: curEntry.digest,
+        result: result,
+      })
+    }
+  }
+
+  // 9. Feature-level digest on pipeline-state.
+  if (fileHashes.length && result) {
+    result._sourceDigest = { files: fileHashes }
+  }
+
+  // 10. extractReady: false if any slice is unverifiable (invalid current digest).
+  var extractReady = true
+  for (var ei = 0; ei < decisions.length; ei++) {
+    if (decisions[ei].reason === 'current-invalid') {
+      extractReady = false
+      break
+    }
+  }
+
+  return { decisions: decisions, digests: currentDigests, extractReady: extractReady }
+}
+
+// ---- Phase 18: Upsert entrypoints + v1.5 migration (D3/D4) -----------------
+
+// resolveUpsertMode: PURE — resolves the update behavior for an existing feature
+// from CLI args and the findFeature result. No agent calls, no I/O, no async.
+// Priority: mutual-exclusion check → --new → --feature → --force → --no-update →
+// findResult.decision (reuse→auto-update default, new→new, blocked→blocked).
+function resolveUpsertMode(args, findResult) {
+  args = args || {}
+  findResult = findResult || {}
+  var newFolder = !!(args.newFolder || args.new)
+  var feature = args.feature || ''
+  var force = !!(args.force)
+  var noUpdate = !!(args.noUpdate)
+  var update = !!(args.update)
+
+  // --new and --feature are mutually exclusive.
+  if (newFolder && feature) {
+    return { mode: 'error', reason: 'mutually-exclusive' }
+  }
+  if (newFolder) return { mode: 'new' }
+  if (feature) return { mode: 'feature', featureId: feature }
+  if (force) return { mode: 'force' }
+  if (noUpdate) return { mode: 'continue-incomplete' }
+
+  var decision = findResult.decision || ''
+  if (decision === 'reuse') return { mode: 'auto-update' }
+  if (decision === 'new') return { mode: 'new' }
+  if (decision === 'blocked') return { mode: 'blocked', reason: findResult.reason || 'ambiguous' }
+
+  return { mode: 'new' }
+}
+
+// deriveForkedFeatureId: PURE — finds the next available fork suffix for a base
+// feature id (e.g. <base>-2, <base>-3). Scans the registry for existing forks.
+function deriveForkedFeatureId(baseFeatureId, registry) {
+  var features = (registry && registry.features) || {}
+  var n = 2
+  var key = baseFeatureId + '-' + n
+  while (features[key]) {
+    n++
+    key = baseFeatureId + '-' + n
+  }
+  return { featureId: key, n: n }
+}
+
+// isLegacyRoot: PURE — qualifies a folder as a v1.5 extraction root based on
+// marker files present and path exclusions. Operates on strings only.
+function isLegacyRoot(folderPath, markerFiles) {
+  if (!folderPath || !Array.isArray(markerFiles)) return false
+  // Exclude slice children, pending dirs, registry, sidecars.
+  if (folderPath.indexOf('/slices/') !== -1) return false
+  if (folderPath.indexOf('/.pending/') !== -1) return false
+  if (folderPath.endsWith('.registry.json')) return false
+  if (folderPath.endsWith('.identity.json')) return false
+  // Must contain a root marker.
+  return markerFiles.indexOf('pipeline-state.json') !== -1
+    || markerFiles.indexOf('plan.md') !== -1
+}
+
+// scanForLegacyFolders: agent-mediated — recursively lists docs/extract/ and
+// qualifies each folder as a v1.5 root via isLegacyRoot. Returns sorted roots.
+async function scanForLegacyFolders(arg) {
+  var docsRoot = (arg && arg.docsRoot) || 'docs/extract/'
+  var result = arg && arg.result
+  var listing = await safeAgent({
+    phase: 'Migrate',
+    label: 'scan-legacy-folders',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['folders'],
+      properties: {
+        folders: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path', 'files'],
+            properties: {
+              path: { type: 'string', description: 'Folder path relative to repo root' },
+              files: { type: 'array', items: { type: 'string' }, description: 'File names directly in this folder' },
+            },
+          },
+        },
+      },
+    },
+    prompt: 'List every folder under ' + docsRoot + ' recursively (depth-limited to 5 levels). ' +
+      'For each folder return its POSIX path (relative to repo root) and the names of files directly in it. ' +
+      'Return ONLY JSON.',
+  })
+  var folders = (listing && listing.folders) || []
+  var roots = []
+  for (var i = 0; i < folders.length; i++) {
+    var f = folders[i]
+    if (isLegacyRoot(f.path || '', f.files || [])) {
+      roots.push(f.path)
+    }
+  }
+  roots.sort()
+  return { roots: roots }
+}
+
+// adoptLegacyFolder: agent-mediated — imports a v1.5 extract folder into the
+// registry. Derives identity from the folder's persisted scope, writes
+// .identity.json + registry entry (root-last, temp-rename), with rollback.
+async function adoptLegacyFolder(arg) {
+  var planDir = (arg && arg.planDir) || ''
+  var result = arg && arg.result
+  var config = arg && arg.config
+  var timestamp = (arg && arg.timestamp) || ''
+
+  // 1. Validate root: read the folder's file list.
+  var folderRead = await safeAgent({
+    phase: 'Adopt',
+    label: 'read-folder-files',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['files'],
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'File names directly in the folder' },
+      },
+    },
+    prompt: 'List the file names (not directories) directly in ' + planDir + '. Return ONLY JSON.',
+  })
+  if (!isLegacyRoot(planDir, (folderRead && folderRead.files) || [])) {
+    return { adopted: false, reason: 'not-a-root' }
+  }
+
+  // 2. Check idempotence: read .identity.json if it exists.
+  var existingIdentity = await readIdentitySidecar(planDir + '.identity.json', result)
+  var existingRegistry = await readRegistry(REGISTRY_PATH, result)
+  if (!existingRegistry) existingRegistry = { features: {} }
+
+  if (existingIdentity && existingIdentity.featureId) {
+    var regEntry = existingRegistry.features[existingIdentity.featureId]
+    if (regEntry && regEntry.ownershipScopeDigest === existingIdentity.ownershipScopeDigest) {
+      return { adopted: false, reason: 'already-adopted' }
+    }
+  }
+
+  // 3. Read the folder's persisted scope (scope-manifest.md or pipeline-state.json).
+  var scopeRead = await safeAgent({
+    phase: 'Adopt',
+    label: 'read-scope-manifest',
+    model: gm('todo'),
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['files'],
+      properties: {
+        files: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path'],
+            properties: {
+              path: { type: 'string', description: 'Repo-relative POSIX path of a source file' },
+              contentSha256: { type: 'string', description: '64-hex SHA-256 content hash (if known)' },
+            },
+          },
+        },
+      },
+    },
+    prompt: 'Read ' + planDir + 'scope-manifest.md (or pipeline-state.json if no manifest) ' +
+      'and extract the list of source files that belong to this extraction scope. ' +
+      'Return each file as { path, contentSha256 }. Return ONLY JSON.',
+  })
+  var scopeFiles = (scopeRead && scopeRead.files) || []
+
+  // 4. Hash the source files to compute per-file contentSha256 + scopeDigest.
+  var hashResult = await hashSources({ files: scopeFiles, phase: 'Adopt', result: result })
+  var fileHashes = (hashResult && hashResult.fileHashes) || []
+  var scopeDigest = (hashResult && hashResult.scopeDigest) || ''
+
+  // 5. Derive the deterministic feature folder.
+  var derived = deriveFeatureFolder({
+    fileHashes: fileHashes,
+    scopeDigest: scopeDigest,
+    entryPoints: [],
+  })
+
+  var featureId = derived.featureId
+  var reason = 'success'
+
+  // 6. Collision check: if registry has the featureId with a different digest, fork.
+  var collisionEntry = existingRegistry.features[featureId]
+  if (collisionEntry && collisionEntry.ownershipScopeDigest !== scopeDigest) {
+    var forked = deriveForkedFeatureId(featureId, existingRegistry)
+    featureId = forked.featureId
+    reason = 'collision-forked'
+  }
+
+  // 7. Write .identity.json (temp-then-rename via writeIdentity agent).
+  try {
+    await writeIdentity({
+      planDir: planDir,
+      featureId: featureId,
+      scopeDigest: scopeDigest,
+      scopeId16: derived.scopeId16,
+      area: derived.area,
+      anchorPath: derived.anchorPath,
+      files: fileHashes.map(function (fh) {
+        return { path: fh.path, contentSha256: fh.contentSha256 }
+      }),
+      phase: 'Adopt',
+      result: result,
+    })
+  } catch (e) {
+    // Rollback: do not update registry.
+    return { adopted: false, reason: 'not-a-root' }
+  }
+
+  // 8. Upsert registry entry + write root-last (temp-rename).
+  var regEntry2 = {
+    featureId: featureId,
+    planDir: planDir,
+    ownershipScopeDigest: scopeDigest,
+    scopeId16: derived.scopeId16 || '',
+    files: fileHashes.map(function (fh) {
+      return { path: fh.path, contentSha256: fh.contentSha256 }
+    }),
+    anchorPath: derived.anchorPath || '',
+    status: 'current',
+    updatedAt: String(timestamp),
+  }
+  var updatedReg = upsertRegistryEntry(existingRegistry, regEntry2)
+  await writeRegistry(REGISTRY_PATH, updatedReg, result)
+
+  return { adopted: true, featureId: featureId, planDir: planDir, reason: reason }
+}
+
 // ---- Review mode (standalone design-docset audit) ---------------------------
 // Review is the INSPECT flow: it reads an existing planDir docset (forward-designed,
 // extracted, or tuned), fans out one reviewer per review dimension (lens), dedups the
@@ -5609,6 +7689,40 @@ Return overviewPath set to ${overviewPath}.`,
   } catch (e) {
     plogFromResult(result, 'System Overview: failed (non-blocking) — ' + String(e))
   }
+}
+
+// Invalidate the full extraction chain for a slice: reset the queue entry to
+// pending, clear all 6 artifact-path guards (so gates re-run from scratch),
+// wipe caches and review flags, supersede persistence evidence, and mark parent
+// aggregates stale for rebuild. PURE (operates on state/queueEntry objects) —
+// calls invalidatePersistenceEvidence and markStaleForSlice.
+function invalidateSliceChain(state, sliceId, queueEntry) {
+  queueEntry.status = 'pending'
+  queueEntry.artifacts = {}
+  queueEntry._gateCheckpoints = {}
+
+  queueEntry.factsPath = null
+  queueEntry.useCasePath = null
+  queueEntry.designPath = null
+  queueEntry.archPath = null
+  queueEntry.requirementsPath = null
+  queueEntry.auditPath = null
+
+  queueEntry._facts = undefined
+  queueEntry._e2e = undefined
+  queueEntry._design = undefined
+  queueEntry._arch = undefined
+  queueEntry._requirements = undefined
+
+  queueEntry._reviewedDesign = false
+  queueEntry._reviewedArch = false
+
+  invalidatePersistenceEvidence(state, sliceId)
+
+  state.synthesisState = markStaleForSlice(state.synthesisState, sliceId)
+  state.overviewPath = null
+  state._sourceDigest = null
+  state.extractReady = false
 }
 
 // Gate 5.5: knowledge-persist (adopted agent). NON-BLOCKING: gathers the
@@ -7178,6 +9292,58 @@ async function main() {
     args = {}
   }
 
+  // --confirm <pendingId>: pending-confirmation protocol entry point (extract D0).
+  // Resolves a pending scope checkpoint: PENDING → promote during extract; PROMOTED
+  // or locator-only → redirect to --resume; unknown/expired → blocked. Must execute
+  // BEFORE resumeArg parsing so a redirect flows through the existing resume handler.
+  let confirmRecord = null
+  if (args && args.confirm) {
+    phase('Pending Confirm')
+    log('main: --confirm ' + args.confirm + ' — resolving pending checkpoint')
+    const pendingRead = await readPendingRecord(PENDING_DIR, args.confirm, null)
+    if (pendingRead && pendingRead.record) {
+      const pr = pendingRead.record
+      if (pr.state === 'PROMOTED' && pr.planDir) {
+        log('main: --confirm ' + args.confirm + ' already PROMOTED at ' + pr.planDir + ' — redirecting to --resume')
+        args = Object.assign({}, args, { resume: pr.planDir, confirm: null })
+      } else if (pr.state === 'EXPIRED') {
+        const locEntry = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+        if (locEntry && locEntry.planDir) {
+          log('main: --confirm ' + args.confirm + ' payload expired, locator resolved — redirecting to --resume ' + locEntry.planDir)
+          args = Object.assign({}, args, { resume: locEntry.planDir, confirm: null })
+        } else {
+          log('main: --confirm ' + args.confirm + ' expired, no locator — blocked')
+          await writeFailedLaunch('confirm', 'confirm-expired', 'pendingId ' + args.confirm + ' expired', Object.keys(args || {}))
+          return {
+            task: '', mode: 'extract', ready: false, blockedAt: 'confirm-expired',
+            handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' has expired (30-day TTL). Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+            logLines: ['main: --confirm ' + args.confirm + ' expired'],
+          }
+        }
+      } else {
+        // PENDING or CONFIRMED — promote during the extract flow
+        confirmRecord = pr
+        args = Object.assign({}, args, { task: pr.task })
+        log('main: --confirm ' + args.confirm + ' PENDING — will promote during extract')
+      }
+    } else {
+      // Not in pending records — check locator (payload may have been TTL-expired)
+      const locEntry2 = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+      if (locEntry2 && locEntry2.planDir) {
+        log('main: --confirm ' + args.confirm + ' not in pending but locator resolved — redirecting to --resume ' + locEntry2.planDir)
+        args = Object.assign({}, args, { resume: locEntry2.planDir, confirm: null })
+      } else {
+        log('main: --confirm ' + args.confirm + ' not found — blocked')
+        await writeFailedLaunch('confirm', 'confirm-not-found', 'pendingId ' + args.confirm + ' not found', Object.keys(args || {}))
+        return {
+          task: '', mode: 'extract', ready: false, blockedAt: 'confirm-not-found',
+          handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' was not found. It may have expired or never existed. Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+          logLines: ['main: --confirm ' + args.confirm + ' not found'],
+        }
+      }
+    }
+  }
+
   // --resume <planDir>: hydrate persisted pipeline state and re-run linearly.
   // args.resume is the ORIGINAL RUN's planDir (e.g. docs/parser/feature/add-retry-layer).
   // When set, args.task is optional (resolved from the persisted state). Slug-only resume
@@ -7579,11 +9745,19 @@ async function main() {
   let planPath
   if (explicitPlanPath) {
     planPath = explicitPlanPath
-  } else if (gateModeActive('design', mode) || isExtractMode) {
-    // Fresh run with no explicit --plan → derive dynamically. Extract runs share the
-    // categorizer but land under a mode-specific path segment (extract/ instead of feature/)
-    // so as-is extraction docsets are distinguishable from forward feature designs.
-    const kindSeg = isExtractMode ? 'extract' : 'feature'
+  } else if (isExtractMode && confirmRecord && confirmRecord.derivedPlanDir) {
+    // Extract --confirm: use the deterministic planDir from the pending record (Phase 13).
+    planPath = confirmRecord.derivedPlanDir + 'plan.md'
+    log('Extract --confirm: using deterministic folder ' + confirmRecord.derivedPlanDir)
+  } else if (isExtractMode) {
+    // Extract fresh run: categorizer bypassed — the preflight derives the deterministic
+    // folder from file hashes (Phase 13). Use a temporary placeholder; the user never
+    // sees it because the preflight returns awaiting-scope-confirm with the real path.
+    planPath = 'docs/extract/.pending/plan.md'
+    log('Extract fresh run — categorizer bypassed; folder derived after preflight')
+  } else if (gateModeActive('design', mode)) {
+    // Fresh run with no explicit --plan → derive dynamically.
+    const kindSeg = 'feature'
     const leafId = jiraIdFromTask(task) || ((args && args.timestamp) ? args.timestamp : slug)
     if (useCategorizer) {
       phase('Categorize')
@@ -7623,7 +9797,7 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
   }
   const definitionPath = (args && args.definitionPath) ||
     planPath.replace(/plan\.md$/, 'idea.md')
-  const planDir = planPath.replace(/plan\.md$/, '')
+  let planDir = planPath.replace(/plan\.md$/, '')
   const archPath = planDir + 'architecture.md'
   const designPath = planDir + 'detailed-design.md'
 
@@ -8235,33 +10409,413 @@ ${task}`,
     // output is a /tune-feature- and /design-feature-compatible baseline. Runs AFTER
     // Translate (free-text scope input benefits from translation), never enters E4.
     if (isExtractMode) {
-      // Gate X0: scope resolution — hybrid input -> concrete scope manifest. Blocking.
+      // Startup registry recovery: reconcile 'extracting' entries from current
+      // pipeline-state + sidecars before any extraction work. Entries with
+      // incomplete evidence are marked 'stale' (fail-closed).
+      phase('Registry Recovery')
+      var recoveryResult = await recoverRegistry({ registryPath: REGISTRY_PATH, result: result })
+      if (recoveryResult && recoveryResult.failed > 0) {
+        plog('Registry Recovery: ' + recoveryResult.recovered + ' recovered, ' + recoveryResult.failed + ' failed (marked stale)')
+      }
+      stateCheckpoint('Registry Recovery', 'done')
+
+      // Phase 18 (D4): auto-scan for legacy v1.5 folders on first post-upgrade run.
+      // Fires ONLY when registry has zero entries AND docs/extract/ exists.
+      // --adopt <planDir> bypasses the scan and directly adopts a specific folder.
+      if (!args || (!args.confirm && !args.resume)) {
+        var migrateRegistry = await readRegistry(REGISTRY_PATH, result)
+        var hasRegisteredFeatures = migrateRegistry
+          && migrateRegistry.features
+          && Object.keys(migrateRegistry.features).length > 0
+
+        if (!hasRegisteredFeatures && args && args.adoptPlanDir) {
+          phase('Adopt')
+          var adoptResult = await adoptLegacyFolder({
+            planDir: args.adoptPlanDir, result, config,
+            timestamp: args && args.timestamp,
+          })
+          if (adoptResult && adoptResult.adopted) {
+            plog('Adopt: imported ' + adoptResult.planDir + ' -> ' + adoptResult.featureId)
+          } else if (adoptResult) {
+            plog('Adopt: ' + args.adoptPlanDir + ' — ' + adoptResult.reason)
+          }
+          stateCheckpoint('Adopt', 'done')
+        }
+
+        if (!hasRegisteredFeatures && !(args && args.adoptPlanDir)) {
+          phase('Migrate')
+          var scanResult = await scanForLegacyFolders({
+            docsRoot: 'docs/extract/', result,
+          })
+          if (scanResult && scanResult.roots && scanResult.roots.length > 0) {
+            result.handoff = {
+              from: 'extract',
+              status: 'awaiting-adopt-confirm',
+              message: 'Found ' + scanResult.roots.length + ' legacy extraction folder(s). ' +
+                'Adopt: /extract-design --adopt ' + scanResult.roots[0],
+              nextMode: 'extract',
+              legacyRoots: scanResult.roots,
+            }
+            plog('Migrate: found ' + scanResult.roots.length + ' legacy root(s) — awaiting adopt')
+            stateCheckpoint('Migrate', 'awaiting-adopt')
+            await consolidate(slug, result, config)
+            return result
+          }
+          stateCheckpoint('Migrate', 'done')
+        }
+      }
+
+      // --confirm promotion: if entering via --confirm <pendingId>, promote the
+      // pending record before Gate X0. Promotion creates the folder, writes
+      // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
+      // and appends the permanent locator entry. Crash-idempotent on replay.
+      if (confirmRecord && !result.scopeManifestPath) {
+        phase('Promote')
+        phase('Promote')
+        // Override planDir with the deterministic folder from the pending record.
+        if (confirmRecord.derivedPlanDir) planDir = confirmRecord.derivedPlanDir
+        plog('Promoting pending record ' + confirmRecord.pendingId + ' -> ' + planDir)
+        const promo = await promotePendingRecord({
+          pendingDir: PENDING_DIR,
+          record: confirmRecord,
+          planDir,
+          result,
+          config,
+          timestamp: args && args.timestamp,
+          identityFields: {
+            scopeDigest: confirmRecord.scopeDigest,
+            area: confirmRecord.area,
+            scopeId16: confirmRecord.scopeId16,
+            featureId: confirmRecord.featureId,
+          },
+        })
+        result.extractScope = confirmRecord.verdict
+        result.scopeManifestPath = planDir + 'scope-manifest.md'
+        result.scopeConfirmed = true
+        if ((confirmRecord.verdict.ambiguities || []).length) {
+          await writeOpenQuestions(planDir, confirmRecord.verdict.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        }
+        plog('Promoted ' + confirmRecord.pendingId + ' -> ' + planDir + ' (' + (promo.isNew ? 'NEW' : 'EXISTING') + ')')
+
+        // Registry upsert after promotion: write the registry entry with initial
+        // status 'extracting'. Root-last readiness commit (status→'current') happens
+        // after extraction+publish+persist are durable.
+        if (promo.isNew && confirmRecord.featureId) {
+          phase('Registry Lookup')
+          var existingReg = await readRegistry(REGISTRY_PATH, result)
+          if (!existingReg) existingReg = { features: {} }
+          var registryEntry = {
+            featureId: confirmRecord.featureId,
+            planDir: planDir,
+            ownershipScopeDigest: confirmRecord.scopeDigest,
+            scopeId16: confirmRecord.scopeId16 || '',
+            files: (confirmRecord.fileHashes || []).map(function (fh) {
+              return { path: fh.path, contentSha256: fh.contentSha256 }
+            }),
+            anchorPath: confirmRecord.anchorPath || '',
+            status: 'extracting',
+            updatedAt: String((args && args.timestamp) || ''),
+          }
+          var updatedReg = upsertRegistryEntry(existingReg, registryEntry)
+          await writeRegistry(REGISTRY_PATH, updatedReg, result)
+          plog('Registry: upserted entry for ' + confirmRecord.featureId + ' (status=extracting)')
+          stateCheckpoint('Registry Lookup', 'done')
+        }
+
+        stateCheckpoint('Promote', 'done')
+      }
+
+      // Gate X0: scope resolution. Fresh runs use preflight (writes nothing to disk,
+      // returns a pendingId for confirmation). --confirm and --resume paths arrive
+      // with scopeManifestPath already set (via promotion or persisted state).
       if (result.scopeManifestPath) {
-        plog('resume: skip Extract Scope (scopeManifestPath set)')
+        plog('skip Extract Scope (scopeManifestPath set)')
       } else {
-        phase('Extract Scope')
-        plog('Resolving extraction input into a scope manifest')
-        const scope = await resolveScope({ task, planDir, result })
-        if (!scope || !scope.scopePath || !(scope.files || []).length) {
+        // Fresh run — preflight: resolve scope WITHOUT writing files, write pending
+        // record, return awaiting-scope-confirm with pendingId (D0 protocol).
+        phase('Pending Confirm')
+        plog('Resolving extraction scope (preflight — no file writes)')
+        const preflight = await resolveScopePreflight({ task, result, timestamp: args && args.timestamp })
+        if (!preflight || !preflight.verdict || !(preflight.verdict.files || []).length) {
           result.blockedAt = 'extract-scope'
           result.handoff = {
             from: 'extract',
-            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points), or --resume ${planDir} after inspecting scope-manifest.md.`,
+            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points).`,
             nextMode: 'extract',
             planDir,
           }
-          plog('Extract Scope: no scope resolved — blocking')
-          stateCheckpoint('Extract Scope', 'blocked')
+          plog('Preflight: no scope resolved — blocking')
+          stateCheckpoint('Pending Confirm', 'blocked')
           await consolidate(slug, result, config)
           return result
         }
-        result.extractScope = scope
-        result.scopeManifestPath = scope.scopePath
-        plog(`Extract Scope: ${scope.files.length} file(s), ${(scope.entryPoints || []).length} entry point(s), confidence=${scope.confidence || 'unspecified'}, wide=${!!scope.wide}`)
-        if ((scope.ambiguities || []).length) {
-          await writeOpenQuestions(planDir, scope.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        // Hash validation failure — block identity selection (fail-closed).
+        if (preflight.hashError) {
+          result.blockedAt = 'extract-hash-error'
+          result.handoff = {
+            from: 'extract',
+            message: `Scope hash validation failed: ${preflight.hashError}. Re-run /extract-design or use --feature=<featureId> to override.`,
+            nextMode: 'extract',
+            planDir,
+            hashError: preflight.hashError,
+          }
+          plog('Preflight: hash validation failed — ' + preflight.hashError)
+          stateCheckpoint('Pending Confirm', 'blocked')
+          await consolidate(slug, result, config)
+          return result
         }
-        stateCheckpoint('Extract Scope', 'done')
+        // Override planDir with the deterministic derived folder (Phase 13).
+        if (preflight.derivedPlanDir) planDir = preflight.derivedPlanDir
+
+        // Feature-identity registry lookup: determine if this scope reuses an
+        // existing feature folder (rename-resilient via content hash matching),
+        // creates a new one, or is ambiguous/blocked.
+        phase('Registry Lookup')
+        var registry = await readRegistry(REGISTRY_PATH, result)
+        if (!registry) registry = { features: {} }
+        var registryFeatures = Object.keys(registry.features).map(function (fid) {
+          return registry.features[fid]
+        })
+        var findResult = findFeature({
+          currentFiles: preflight.fileHashes || [],
+          currentAnchor: preflight.anchorPath || '',
+          registryFeatures: registryFeatures,
+        })
+        preflight.findFeatureDecision = findResult.decision
+        preflight.findFeatureFeatureId = findResult.featureId || null
+        preflight.findFeatureMatchCount = findResult.matchCount || 0
+        plog('Registry Lookup: findFeature decision=' + findResult.decision +
+          (findResult.featureId ? ' featureId=' + findResult.featureId : '') +
+          (findResult.reason ? ' reason=' + findResult.reason : ''))
+
+        if (findResult.decision === 'reuse') {
+          // Sticky folder: override planDir to the reused feature's folder.
+          var reusedEntry = registry.features[findResult.featureId]
+          if (reusedEntry && reusedEntry.planDir) {
+            planDir = reusedEntry.planDir
+            preflight.derivedPlanDir = planDir
+            plog('Registry Lookup: reusing existing folder ' + planDir + ' for ' + findResult.featureId)
+          }
+        } else if (findResult.decision === 'blocked') {
+          // Ambiguous or weak-only match — block with guidance.
+          result.blockedAt = 'registry-lookup-ambiguous'
+          result.handoff = {
+            from: 'extract',
+            message: 'Feature identity is ambiguous (' + (findResult.reason || 'unknown') +
+              '). Use --feature=<featureId> to select a specific feature, or --new to create a new folder.',
+            nextMode: 'extract',
+            planDir: planDir,
+            findFeatureReason: findResult.reason || 'unknown',
+            candidates: findResult.candidates || [],
+            weakMatches: findResult.weakMatches || [],
+          }
+          plog('Registry Lookup: blocked — ' + (findResult.reason || 'unknown'))
+          stateCheckpoint('Registry Lookup', 'blocked')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // For 'new' decision: collision guard before promotion.
+        if (findResult.decision === 'new') {
+          var collision = await checkFolderCollision({
+            planDir: planDir,
+            requesterDigest: preflight.scopeDigest,
+            result: result,
+          })
+          if (collision && collision.collision) {
+            result.blockedAt = 'registry-collision'
+            result.handoff = {
+              from: 'extract',
+              message: 'Folder ' + planDir + ' is owned by feature ' + collision.existingFeatureId +
+                '. Use --feature=' + collision.existingFeatureId + ' to update it, or --new to create a distinct folder.',
+              nextMode: 'extract',
+              planDir: planDir,
+              collisionWith: collision.existingFeatureId,
+            }
+            plog('Registry Lookup: collision with ' + collision.existingFeatureId + ' at ' + planDir)
+            stateCheckpoint('Registry Lookup', 'collision')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'done')
+
+        // Phase 18: resolve upsert mode (D3 — explicit upsert entrypoints).
+        // Determines whether this is an auto-update, force, fork-new, feature-select,
+        // continue-incomplete, or the default first-extraction pending-confirmation flow.
+        phase('Upsert')
+        var upsertMode = resolveUpsertMode(args, findResult)
+        preflight.upsertMode = upsertMode.mode
+        plog('Upsert: mode=' + upsertMode.mode +
+          (upsertMode.featureId ? ' featureId=' + upsertMode.featureId : '') +
+          (upsertMode.reason ? ' reason=' + upsertMode.reason : ''))
+
+        // --new + --feature: mutually exclusive — block.
+        if (upsertMode.mode === 'error') {
+          result.blockedAt = 'upsert-mutually-exclusive'
+          result.handoff = {
+            from: 'extract',
+            message: '--new and --feature are mutually exclusive. Use one or the other.',
+            nextMode: 'extract',
+            planDir,
+          }
+          plog('Upsert: blocked — mutually exclusive')
+          stateCheckpoint('Upsert', 'error')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // --feature=<id>: override findResult to force-select the specified feature.
+        if (upsertMode.mode === 'feature') {
+          var featureEntry = registry.features[upsertMode.featureId]
+          if (!featureEntry) {
+            result.blockedAt = 'feature-not-found'
+            result.handoff = {
+              from: 'extract',
+              message: 'Feature ' + upsertMode.featureId + ' not found in registry.',
+              nextMode: 'extract',
+              planDir,
+            }
+            plog('Upsert: feature not found — ' + upsertMode.featureId)
+            stateCheckpoint('Upsert', 'feature-not-found')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+          planDir = featureEntry.planDir
+          preflight.derivedPlanDir = planDir
+          // Update findResult so downstream registry refresh uses the correct feature.
+          findResult.featureId = upsertMode.featureId
+          findResult.decision = 'reuse'
+          plog('Upsert: --feature selected ' + upsertMode.featureId + ' at ' + planDir)
+          // Fall through to auto-update for the selected feature.
+          upsertMode.mode = 'auto-update'
+        }
+
+        // --new on an existing feature: fork a distinct folder.
+        if (upsertMode.mode === 'new' && findResult.decision === 'reuse') {
+          var forked = deriveForkedFeatureId(findResult.featureId, registry)
+          preflight.forkedFeatureId = forked.featureId
+          preflight.forkedN = forked.n
+          plog('Upsert: --new forks ' + findResult.featureId + ' -> ' + forked.featureId)
+          stateCheckpoint('Upsert', 'forked')
+          // Continue with the pending-confirmation flow (new folder for the fork).
+        }
+
+        // Auto-update / force / continue-incomplete: load existing state and run
+        // the update flow (or just continue), then proceed to extraction.
+        if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force' || upsertMode.mode === 'continue-incomplete') {
+          // Scope is already confirmed for an existing feature — skip confirmation.
+          result.extractScope = preflight.verdict
+          result.scopeManifestPath = planDir + 'scope-manifest.md'
+          result.scopeConfirmed = true
+
+          // Load existing pipeline-state (like --resume) to get the extract queue.
+          var loadedExisting = await loadPipelineStateWithRecovery(planDir)
+          var existingResult = loadedExisting && loadedExisting.state && loadedExisting.state.result
+          if (existingResult) {
+            if (Array.isArray(existingResult.extractQueue)) result.extractQueue = existingResult.extractQueue
+            if (existingResult.synthesisState !== undefined) result.synthesisState = existingResult.synthesisState
+            if (existingResult.persistenceTracker !== undefined) result.persistenceTracker = existingResult.persistenceTracker
+            if (existingResult.overviewPath !== undefined) result.overviewPath = existingResult.overviewPath
+          }
+          result.extractReady = false
+
+          if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force') {
+            // Change detection: reconcile slices → detect changes → invalidate.
+            phase('Reconcile Slices')
+            var reconciled = reconcileSlices(result.extractQueue, preflight.fileHashes || [])
+            plog('Reconcile Slices: ' + reconciled.slices.length + ' slices, ' +
+              reconciled.delta.added.length + ' added, ' + reconciled.delta.removed.length + ' removed')
+            stateCheckpoint('Reconcile Slices', 'done')
+
+            phase('Change Detection')
+            var detection = await runChangeDetection({
+              reconciledSlices: reconciled.slices,
+              fileHashes: preflight.fileHashes || [],
+              force: upsertMode.mode === 'force',
+              result: result,
+            })
+            plog('Change Detection: ' + ((detection && detection.decisions) || []).length + ' decisions')
+            stateCheckpoint('Change Detection', 'done')
+
+            // Apply invalidation for changed/removed slices.
+            phase('Invalidation')
+            var cdDecisions = (detection && detection.decisions) || []
+            for (var di = 0; di < cdDecisions.length; di++) {
+              var cd = cdDecisions[di]
+              var cdEntry = null
+              for (var qi = 0; qi < result.extractQueue.length; qi++) {
+                if (result.extractQueue[qi].id === cd.sliceId) {
+                  cdEntry = result.extractQueue[qi]
+                  break
+                }
+              }
+              if (!cdEntry) continue
+              if (cd.status === 'removed' || cd.status === 'slice-removed') {
+                onSliceRemoved(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' removed (parent path)')
+              } else if (cd.status === 'changed') {
+                invalidateSliceChain(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' invalidated for re-extraction')
+              }
+            }
+            stateCheckpoint('Invalidation', 'done')
+            result.extractQueue = reconciled.slices
+
+            // Refresh the registry entry's mutable files from the current revision so
+            // subsequent findFeature matches see current paths/hashes. Immutable ownership
+            // identity (featureId, planDir, ownershipScopeDigest, anchorPath) is untouched.
+            var refreshReg = await readRegistry(REGISTRY_PATH, result)
+            var refreshedReg = refreshRegistryFiles(refreshReg, findResult.featureId, preflight.fileHashes || [])
+            if (refreshedReg !== refreshReg) {
+              await writeRegistry(REGISTRY_PATH, refreshedReg, result)
+              plog('Registry: refreshed files for ' + findResult.featureId + ' after change detection')
+            }
+          }
+
+          stateCheckpoint('Upsert', upsertMode.mode)
+          plog('Upsert: ' + upsertMode.mode + ' prepared — continuing to extraction')
+          // Do NOT write pending record or return — fall through to extraction.
+          // scopeManifestPath is set (Gate X0 skips), scopeConfirmed is true (Gate X0.5 passes),
+          // extractQueue is loaded (Gate X1 skips re-seeding).
+        } else {
+          // Default fresh-run path: write pending record + return awaiting-scope-confirm.
+
+        // Write pending record — the ONLY durable state before promotion.
+        // pipeline-state.json is intentionally NOT written (RED gate: --resume
+        // cannot resume a not-yet-promoted checkpoint).
+        await writePendingRecord(PENDING_DIR, preflight, result)
+        result.extractScope = preflight.verdict
+        result.pendingId = preflight.pendingId
+        plog(`Preflight: ${(preflight.verdict.files || []).length} file(s), ${(preflight.verdict.entryPoints || []).length} entry point(s), confidence=${preflight.verdict.confidence || 'unspecified'}, pendingId=${preflight.pendingId}`)
+        // Return awaiting-scope-confirm with pendingId (primary: --confirm <pendingId>)
+        const pscope = preflight.verdict
+        result.handoff = {
+          from: 'extract',
+          status: 'awaiting-scope-confirm',
+          message: `Scope resolved to ${(pscope.files || []).length} file(s). Confirm: /extract-design --confirm ${preflight.pendingId}`,
+          nextMode: 'extract',
+          planDir,
+          pendingId: preflight.pendingId,
+          scopeSummary: {
+            files: pscope.files || [],
+            entryPoints: pscope.entryPoints || [],
+            confidence: pscope.confidence || 'unspecified',
+            wide: !!pscope.wide,
+            suggestedSlices: pscope.suggestedSlices || [],
+          },
+        }
+        plog('Preflight: awaiting scope confirmation (pendingId=' + preflight.pendingId + ') — returning')
+        stateCheckpoint('Pending Confirm', 'awaiting-confirm')
+        // Intentionally NO consolidate here — pipeline-state.json must not exist
+        // before promotion (RED gate: --resume cannot resume a pre-promotion checkpoint).
+        // The pending record is the sole durable state; --confirm recovers from it.
+        return result
+        } // end default fresh-run else (Phase 18 upsert-mode conditional)
       }
 
       // Gate X0.5: scope confirmation — pause-and-resume checkpoint, NO agent involved.
@@ -8724,6 +11278,34 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       }
       stateCheckpoint('Extract', 'done')
       plog(`Extract: extractReady=${readiness.ready} (${readiness.reason}) — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+
+      // Root-last readiness commit: after extraction + publish + persist are durable,
+      // update the registry entry status from 'extracting' to 'current'. This is the
+      // final registry write — the root of the readiness tree.
+      if (readiness.ready) {
+        phase('Registry Lookup')
+        var readyReg = await readRegistry(REGISTRY_PATH, result)
+        if (readyReg && readyReg.features) {
+          // Find the registry entry for this feature (by planDir match).
+          var readyFeatureId = null
+          var readyFeatures = Object.keys(readyReg.features)
+          for (var rfi = 0; rfi < readyFeatures.length; rfi++) {
+            if (readyReg.features[readyFeatures[rfi]].planDir === planDir) {
+              readyFeatureId = readyFeatures[rfi]
+              break
+            }
+          }
+          if (readyFeatureId) {
+            var readyEntry = readyReg.features[readyFeatureId]
+            readyEntry.status = 'current'
+            readyEntry.updatedAt = String((args && args.timestamp) || '')
+            var rootLastReg = upsertRegistryEntry(readyReg, readyEntry)
+            await writeRegistry(REGISTRY_PATH, rootLastReg, result)
+            plog('Registry: root-last readiness commit — ' + readyFeatureId + ' status→current')
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'root-last-done')
+      }
 
       // Phase 6: track the durable consolidate write through the persistence tracker.
       result.persistenceTracker = recordAttemptedWrite(
@@ -10510,6 +13092,27 @@ Use a clear conventional-commit message. Return the commit hash.`,
     }
     return result
   }
+}
+
+
+// Parent-path handler for a removed slice (emptied by membership loss).
+// Distinct from invalidateSliceChain (which resets for re-extraction):
+// the removed slice is terminal — lifecycle set to excluded, evidence
+// superseded, coverage denominator drops, parent publish/persist re-run.
+// Slice-local history (artifact paths) is preserved, NOT cleared.
+// PURE (operates on state/queueEntry objects) — calls invalidatePersistenceEvidence
+// and applyLifecycleEvent.
+function onSliceRemoved(state, sliceId, queueEntry) {
+  invalidatePersistenceEvidence(state, sliceId)
+
+  // Mark synthesis views stale for this slice — symmetric with the chain-based
+  // invalidator. Removal excludes the lifecycle and supersedes persistence evidence;
+  // this adds the explicit synthesis-staleness signal so views re-derive rather than
+  // serve cached data.
+  state.synthesisState = markStaleForSlice(state.synthesisState, sliceId)
+
+  var next = applyLifecycleEvent(queueEntry, { type: 'exclude', payload: { rationale: 'slice-removed-empty' } })
+  Object.assign(queueEntry, next)
 }
 
 const final = await main()

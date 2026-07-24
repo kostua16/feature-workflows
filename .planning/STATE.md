@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.5.0
-milestone_name: Project-Scale Extract Design
+milestone: v1.6.0
+milestone_name: Design-Extract Determination
 status: Awaiting next milestone
 stopped_at: Phase 10 complete — ready for Phase 11 planning
-last_updated: "2026-07-22T23:32:16.357Z"
-last_activity: 2026-07-22 — Milestone v1.5.0 completed and archived
+last_updated: "2026-07-24T00:24:14.583Z"
+last_activity: 2026-07-24 — Milestone v1.6.0 completed and archived
 progress:
-  total_phases: 11
-  completed_phases: 11
-  total_plans: 11
-  completed_plans: 11
+  total_phases: 8
+  completed_phases: 8
+  total_plans: 8
+  completed_plans: 8
   percent: 100
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-22)
 
 **Core value:** One user command must drive a trustworthy feature workflow from intent to durable, verifiable artifacts without silently losing work or overstating completion.
-**Current focus:** v1.5.0 shipped & archived — run `/gsd-new-milestone` to plan the next milestone
+**Current focus:** Milestone v1.6.0 complete (Phase 19 — Compatibility & Proof finished, 2427 tests green)
 
 ## Current Position
 
-Phase: Milestone v1.5.0 complete
+Phase: Milestone v1.6.0 complete
 Plan: —
 Status: Awaiting next milestone
-Last activity: 2026-07-22 — Milestone v1.5.0 completed and archived
+Last activity: 2026-07-24 — Milestone v1.6.0 completed and archived
 
 ## Performance Metrics
 

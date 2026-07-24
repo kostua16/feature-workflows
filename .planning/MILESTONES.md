@@ -1,5 +1,29 @@
 # Project Milestones: feature-workflows
 
+## v1.6.0 Design-Extract Determination (Shipped: 2026-07-24)
+
+**Phases completed:** 8 phases (12–19), 8 plans, 16 requirements
+
+**Delivered:** Deterministic, stable folder-per-feature for `/extract-design` — one folder per feature for its lifetime (surviving full renames), fail-closed change detection, a full invalidation chain, auto-update-by-default upsert, and seamless v1.5 docset adoption.
+
+**Key accomplishments:**
+
+- Pending-confirmation protocol with crash-idempotent promotion + permanent locator.
+- Deterministic identity (per-file content SHA-256 + scope digest, no LLM in the path).
+- Feature-identity registry with rename-resilient lookup + collision guard + atomic recovery.
+- Pure slice ownership reconciliation (union-find clustering, move detection, exactly-one-owner).
+- Fail-closed source-change detection (full 64-hex SHA-256, never skips on hash failure).
+- Full invalidation chain (publish/persist evidence, no-demote, removal parent path).
+- Auto-update upsert entrypoints + v1.5 docset adoption migration.
+
+**Quality:** 16/16 requirements delivered, all UAT-verified GOAL MET. 2443 tests, drift-free. Audit passed. 2 integration warnings found+fixed during cleanup (substring collision, `--feature` stale registry).
+
+**Stats:** 41 commits · 74 files (+25,756 / −372) · 2026-07-23 → 2026-07-24.
+
+**Git range:** `1ac9a33..HEAD` (branch `worktree-ver1.5.0`).
+
+---
+
 ## v1.5.0 Project-Scale Extract Design (Shipped: 2026-07-22)
 
 **Phases completed:** 11 phases (1–7 extract-orchestration core + 8–11 design-mode extension), 11 plans, plus a tech-debt cleanup pass

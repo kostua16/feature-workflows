@@ -7,9 +7,9 @@ import { computeContentDigest } from './revision.mjs'
 import { migrateResumeState } from './migration.mjs'
 import { chunkPlanIntoStages, selectBlockingFindings, buildIssuesHandoff, classifyAndRecordIssue, tickStageFile, readIssuesFile, planTuneFromIssues, invalidateStages } from './stages-issues.mjs'
 import { tuneRevisitGate } from './tune.mjs'
-import { seedExtractQueue, nextPendingSlice, resolveScope } from './extract-scope.mjs'
+import { seedExtractQueue, nextPendingSlice, resolveScope, resolveScopePreflight, writePendingRecord, readPendingRecord, resolveLocator, promotePendingRecord, PENDING_DIR, PENDING_LOCATOR_PATH, deriveFeatureFolder, normalizeToPosix, findFeature, upsertRegistryEntry, refreshRegistryFiles, readRegistry, writeRegistry, readIdentitySidecar, checkFolderCollision, recoverRegistry, REGISTRY_PATH, reconcileSlices, runChangeDetection, resolveUpsertMode, deriveForkedFeatureId, isLegacyRoot, scanForLegacyFolders, adoptLegacyFolder } from './extract-scope.mjs'
 import { meetsMinSeverity, resolveMinSeverity, resolveReviewLenses, collectReviewDocs, buildReviewReport, runReviewLenses, mergeReviewFindings, verifyReviewFindings, recordReviewIssues } from './review-mode.mjs'
-import { extractSlice, writeSystemOverview } from './extract-slice.mjs'
+import { extractSlice, writeSystemOverview, invalidateSliceChain } from './extract-slice.mjs'
 import { persistFindings, publishDesign } from './publish-persist.mjs'
 import { runTests } from './test-run.mjs'
 import { safeAgent, flexibleAgent, renderTelemetrySummary, recordDegradationEvent, degradationLogSummary } from './agent-core.mjs'
@@ -19,11 +19,12 @@ import { createBudgetLimits, createBudgetAccountant, setReserve, callsRemaining,
 import { createRetryPolicy, createAttemptHistory, recordAttempt, isTerminalFailure, terminalReason, attemptSummary, ATTEMPT_OUTCOMES } from './retry-policy.mjs'
 import { isolateFailure, shouldContinueAfterFailure, segmentOutcome, eligibleIndependents } from './failure-isolation.mjs'
 import { createContinuationState, nextSegmentId, idempotencyKey, createSegmentIntent, acknowledgeSegment, resolveConvergence, shouldContinue, resumeCommand, continuationSummary, canAutoRelaunch } from './continuation.mjs'
-import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary } from './synthesis.mjs'
-import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport } from './observe-persist.mjs'
+import { createSynthesisState, synthesizeProjectViews, isSynthesisCurrent, invalidateStaleViews, synthesisSummary, markStaleForSlice } from './synthesis.mjs'
+import { createPersistenceTracker, recordAttemptedWrite, verifyDurableWrite, failWrite, isRetrySafe, persistenceReport, invalidatePersistenceEvidence } from './observe-persist.mjs'
 import { deriveExtractReadiness, projectStatusProjection, readinessSummary, deriveDesignReadiness, DESIGN_READINESS_REASONS } from './status-truth.mjs'
 import { createDesignBudget, spendDesignGate, gateCallsRemaining, canAdmitDesignGate, designBudgetSummary, DESIGN_BUDGET_DEFAULTS } from './design-budget.mjs'
 import { createLoopBudgets, spendLoop, loopBudgetExhausted, loopBudgetSummary } from './design-loops.mjs'
+import { applyLifecycleEvent } from './lifecycle.mjs'
 
 
 // ---- Script body -----------------------------------------------------------
@@ -39,6 +40,58 @@ async function main() {
     try { args = JSON.parse(args) } catch (e) { log(`main: args arrived as unparseable string, coercing to {} (${String(e && e.message)})`); args = {} }
   } else if (args == null) {
     args = {}
+  }
+
+  // --confirm <pendingId>: pending-confirmation protocol entry point (extract D0).
+  // Resolves a pending scope checkpoint: PENDING → promote during extract; PROMOTED
+  // or locator-only → redirect to --resume; unknown/expired → blocked. Must execute
+  // BEFORE resumeArg parsing so a redirect flows through the existing resume handler.
+  let confirmRecord = null
+  if (args && args.confirm) {
+    phase('Pending Confirm')
+    log('main: --confirm ' + args.confirm + ' — resolving pending checkpoint')
+    const pendingRead = await readPendingRecord(PENDING_DIR, args.confirm, null)
+    if (pendingRead && pendingRead.record) {
+      const pr = pendingRead.record
+      if (pr.state === 'PROMOTED' && pr.planDir) {
+        log('main: --confirm ' + args.confirm + ' already PROMOTED at ' + pr.planDir + ' — redirecting to --resume')
+        args = Object.assign({}, args, { resume: pr.planDir, confirm: null })
+      } else if (pr.state === 'EXPIRED') {
+        const locEntry = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+        if (locEntry && locEntry.planDir) {
+          log('main: --confirm ' + args.confirm + ' payload expired, locator resolved — redirecting to --resume ' + locEntry.planDir)
+          args = Object.assign({}, args, { resume: locEntry.planDir, confirm: null })
+        } else {
+          log('main: --confirm ' + args.confirm + ' expired, no locator — blocked')
+          await writeFailedLaunch('confirm', 'confirm-expired', 'pendingId ' + args.confirm + ' expired', Object.keys(args || {}))
+          return {
+            task: '', mode: 'extract', ready: false, blockedAt: 'confirm-expired',
+            handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' has expired (30-day TTL). Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+            logLines: ['main: --confirm ' + args.confirm + ' expired'],
+          }
+        }
+      } else {
+        // PENDING or CONFIRMED — promote during the extract flow
+        confirmRecord = pr
+        args = Object.assign({}, args, { task: pr.task })
+        log('main: --confirm ' + args.confirm + ' PENDING — will promote during extract')
+      }
+    } else {
+      // Not in pending records — check locator (payload may have been TTL-expired)
+      const locEntry2 = await resolveLocator(PENDING_LOCATOR_PATH, args.confirm, null)
+      if (locEntry2 && locEntry2.planDir) {
+        log('main: --confirm ' + args.confirm + ' not in pending but locator resolved — redirecting to --resume ' + locEntry2.planDir)
+        args = Object.assign({}, args, { resume: locEntry2.planDir, confirm: null })
+      } else {
+        log('main: --confirm ' + args.confirm + ' not found — blocked')
+        await writeFailedLaunch('confirm', 'confirm-not-found', 'pendingId ' + args.confirm + ' not found', Object.keys(args || {}))
+        return {
+          task: '', mode: 'extract', ready: false, blockedAt: 'confirm-not-found',
+          handoff: { from: 'extract', message: 'Pending id ' + args.confirm + ' was not found. It may have expired or never existed. Run /extract-design <scope> to start fresh.', nextMode: 'extract' },
+          logLines: ['main: --confirm ' + args.confirm + ' not found'],
+        }
+      }
+    }
   }
 
   // --resume <planDir>: hydrate persisted pipeline state and re-run linearly.
@@ -442,11 +495,19 @@ async function main() {
   let planPath
   if (explicitPlanPath) {
     planPath = explicitPlanPath
-  } else if (gateModeActive('design', mode) || isExtractMode) {
-    // Fresh run with no explicit --plan → derive dynamically. Extract runs share the
-    // categorizer but land under a mode-specific path segment (extract/ instead of feature/)
-    // so as-is extraction docsets are distinguishable from forward feature designs.
-    const kindSeg = isExtractMode ? 'extract' : 'feature'
+  } else if (isExtractMode && confirmRecord && confirmRecord.derivedPlanDir) {
+    // Extract --confirm: use the deterministic planDir from the pending record (Phase 13).
+    planPath = confirmRecord.derivedPlanDir + 'plan.md'
+    log('Extract --confirm: using deterministic folder ' + confirmRecord.derivedPlanDir)
+  } else if (isExtractMode) {
+    // Extract fresh run: categorizer bypassed — the preflight derives the deterministic
+    // folder from file hashes (Phase 13). Use a temporary placeholder; the user never
+    // sees it because the preflight returns awaiting-scope-confirm with the real path.
+    planPath = 'docs/extract/.pending/plan.md'
+    log('Extract fresh run — categorizer bypassed; folder derived after preflight')
+  } else if (gateModeActive('design', mode)) {
+    // Fresh run with no explicit --plan → derive dynamically.
+    const kindSeg = 'feature'
     const leafId = jiraIdFromTask(task) || ((args && args.timestamp) ? args.timestamp : slug)
     if (useCategorizer) {
       phase('Categorize')
@@ -486,7 +547,7 @@ Return ONLY category + subCategory + leaf (all required). Do NOT commit.`,
   }
   const definitionPath = (args && args.definitionPath) ||
     planPath.replace(/plan\.md$/, 'idea.md')
-  const planDir = planPath.replace(/plan\.md$/, '')
+  let planDir = planPath.replace(/plan\.md$/, '')
   const archPath = planDir + 'architecture.md'
   const designPath = planDir + 'detailed-design.md'
 
@@ -1098,33 +1159,413 @@ ${task}`,
     // output is a /tune-feature- and /design-feature-compatible baseline. Runs AFTER
     // Translate (free-text scope input benefits from translation), never enters E4.
     if (isExtractMode) {
-      // Gate X0: scope resolution — hybrid input -> concrete scope manifest. Blocking.
+      // Startup registry recovery: reconcile 'extracting' entries from current
+      // pipeline-state + sidecars before any extraction work. Entries with
+      // incomplete evidence are marked 'stale' (fail-closed).
+      phase('Registry Recovery')
+      var recoveryResult = await recoverRegistry({ registryPath: REGISTRY_PATH, result: result })
+      if (recoveryResult && recoveryResult.failed > 0) {
+        plog('Registry Recovery: ' + recoveryResult.recovered + ' recovered, ' + recoveryResult.failed + ' failed (marked stale)')
+      }
+      stateCheckpoint('Registry Recovery', 'done')
+
+      // Phase 18 (D4): auto-scan for legacy v1.5 folders on first post-upgrade run.
+      // Fires ONLY when registry has zero entries AND docs/extract/ exists.
+      // --adopt <planDir> bypasses the scan and directly adopts a specific folder.
+      if (!args || (!args.confirm && !args.resume)) {
+        var migrateRegistry = await readRegistry(REGISTRY_PATH, result)
+        var hasRegisteredFeatures = migrateRegistry
+          && migrateRegistry.features
+          && Object.keys(migrateRegistry.features).length > 0
+
+        if (!hasRegisteredFeatures && args && args.adoptPlanDir) {
+          phase('Adopt')
+          var adoptResult = await adoptLegacyFolder({
+            planDir: args.adoptPlanDir, result, config,
+            timestamp: args && args.timestamp,
+          })
+          if (adoptResult && adoptResult.adopted) {
+            plog('Adopt: imported ' + adoptResult.planDir + ' -> ' + adoptResult.featureId)
+          } else if (adoptResult) {
+            plog('Adopt: ' + args.adoptPlanDir + ' — ' + adoptResult.reason)
+          }
+          stateCheckpoint('Adopt', 'done')
+        }
+
+        if (!hasRegisteredFeatures && !(args && args.adoptPlanDir)) {
+          phase('Migrate')
+          var scanResult = await scanForLegacyFolders({
+            docsRoot: 'docs/extract/', result,
+          })
+          if (scanResult && scanResult.roots && scanResult.roots.length > 0) {
+            result.handoff = {
+              from: 'extract',
+              status: 'awaiting-adopt-confirm',
+              message: 'Found ' + scanResult.roots.length + ' legacy extraction folder(s). ' +
+                'Adopt: /extract-design --adopt ' + scanResult.roots[0],
+              nextMode: 'extract',
+              legacyRoots: scanResult.roots,
+            }
+            plog('Migrate: found ' + scanResult.roots.length + ' legacy root(s) — awaiting adopt')
+            stateCheckpoint('Migrate', 'awaiting-adopt')
+            await consolidate(slug, result, config)
+            return result
+          }
+          stateCheckpoint('Migrate', 'done')
+        }
+      }
+
+      // --confirm promotion: if entering via --confirm <pendingId>, promote the
+      // pending record before Gate X0. Promotion creates the folder, writes
+      // scope-manifest.md + .identity.json + pipeline-state.json (root-last),
+      // and appends the permanent locator entry. Crash-idempotent on replay.
+      if (confirmRecord && !result.scopeManifestPath) {
+        phase('Promote')
+        phase('Promote')
+        // Override planDir with the deterministic folder from the pending record.
+        if (confirmRecord.derivedPlanDir) planDir = confirmRecord.derivedPlanDir
+        plog('Promoting pending record ' + confirmRecord.pendingId + ' -> ' + planDir)
+        const promo = await promotePendingRecord({
+          pendingDir: PENDING_DIR,
+          record: confirmRecord,
+          planDir,
+          result,
+          config,
+          timestamp: args && args.timestamp,
+          identityFields: {
+            scopeDigest: confirmRecord.scopeDigest,
+            area: confirmRecord.area,
+            scopeId16: confirmRecord.scopeId16,
+            featureId: confirmRecord.featureId,
+          },
+        })
+        result.extractScope = confirmRecord.verdict
+        result.scopeManifestPath = planDir + 'scope-manifest.md'
+        result.scopeConfirmed = true
+        if ((confirmRecord.verdict.ambiguities || []).length) {
+          await writeOpenQuestions(planDir, confirmRecord.verdict.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        }
+        plog('Promoted ' + confirmRecord.pendingId + ' -> ' + planDir + ' (' + (promo.isNew ? 'NEW' : 'EXISTING') + ')')
+
+        // Registry upsert after promotion: write the registry entry with initial
+        // status 'extracting'. Root-last readiness commit (status→'current') happens
+        // after extraction+publish+persist are durable.
+        if (promo.isNew && confirmRecord.featureId) {
+          phase('Registry Lookup')
+          var existingReg = await readRegistry(REGISTRY_PATH, result)
+          if (!existingReg) existingReg = { features: {} }
+          var registryEntry = {
+            featureId: confirmRecord.featureId,
+            planDir: planDir,
+            ownershipScopeDigest: confirmRecord.scopeDigest,
+            scopeId16: confirmRecord.scopeId16 || '',
+            files: (confirmRecord.fileHashes || []).map(function (fh) {
+              return { path: fh.path, contentSha256: fh.contentSha256 }
+            }),
+            anchorPath: confirmRecord.anchorPath || '',
+            status: 'extracting',
+            updatedAt: String((args && args.timestamp) || ''),
+          }
+          var updatedReg = upsertRegistryEntry(existingReg, registryEntry)
+          await writeRegistry(REGISTRY_PATH, updatedReg, result)
+          plog('Registry: upserted entry for ' + confirmRecord.featureId + ' (status=extracting)')
+          stateCheckpoint('Registry Lookup', 'done')
+        }
+
+        stateCheckpoint('Promote', 'done')
+      }
+
+      // Gate X0: scope resolution. Fresh runs use preflight (writes nothing to disk,
+      // returns a pendingId for confirmation). --confirm and --resume paths arrive
+      // with scopeManifestPath already set (via promotion or persisted state).
       if (result.scopeManifestPath) {
-        plog('resume: skip Extract Scope (scopeManifestPath set)')
+        plog('skip Extract Scope (scopeManifestPath set)')
       } else {
-        phase('Extract Scope')
-        plog('Resolving extraction input into a scope manifest')
-        const scope = await resolveScope({ task, planDir, result })
-        if (!scope || !scope.scopePath || !(scope.files || []).length) {
+        // Fresh run — preflight: resolve scope WITHOUT writing files, write pending
+        // record, return awaiting-scope-confirm with pendingId (D0 protocol).
+        phase('Pending Confirm')
+        plog('Resolving extraction scope (preflight — no file writes)')
+        const preflight = await resolveScopePreflight({ task, result, timestamp: args && args.timestamp })
+        if (!preflight || !preflight.verdict || !(preflight.verdict.files || []).length) {
           result.blockedAt = 'extract-scope'
           result.handoff = {
             from: 'extract',
-            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points), or --resume ${planDir} after inspecting scope-manifest.md.`,
+            message: `Could not resolve the extraction input into a concrete code scope. Re-run /extract-design with more specific input (paths, globs, or entry points).`,
             nextMode: 'extract',
             planDir,
           }
-          plog('Extract Scope: no scope resolved — blocking')
-          stateCheckpoint('Extract Scope', 'blocked')
+          plog('Preflight: no scope resolved — blocking')
+          stateCheckpoint('Pending Confirm', 'blocked')
           await consolidate(slug, result, config)
           return result
         }
-        result.extractScope = scope
-        result.scopeManifestPath = scope.scopePath
-        plog(`Extract Scope: ${scope.files.length} file(s), ${(scope.entryPoints || []).length} entry point(s), confidence=${scope.confidence || 'unspecified'}, wide=${!!scope.wide}`)
-        if ((scope.ambiguities || []).length) {
-          await writeOpenQuestions(planDir, scope.ambiguities.map((q) => ({ gate: 'Extract Scope', text: q, severity: 'unspecified' })), result)
+        // Hash validation failure — block identity selection (fail-closed).
+        if (preflight.hashError) {
+          result.blockedAt = 'extract-hash-error'
+          result.handoff = {
+            from: 'extract',
+            message: `Scope hash validation failed: ${preflight.hashError}. Re-run /extract-design or use --feature=<featureId> to override.`,
+            nextMode: 'extract',
+            planDir,
+            hashError: preflight.hashError,
+          }
+          plog('Preflight: hash validation failed — ' + preflight.hashError)
+          stateCheckpoint('Pending Confirm', 'blocked')
+          await consolidate(slug, result, config)
+          return result
         }
-        stateCheckpoint('Extract Scope', 'done')
+        // Override planDir with the deterministic derived folder (Phase 13).
+        if (preflight.derivedPlanDir) planDir = preflight.derivedPlanDir
+
+        // Feature-identity registry lookup: determine if this scope reuses an
+        // existing feature folder (rename-resilient via content hash matching),
+        // creates a new one, or is ambiguous/blocked.
+        phase('Registry Lookup')
+        var registry = await readRegistry(REGISTRY_PATH, result)
+        if (!registry) registry = { features: {} }
+        var registryFeatures = Object.keys(registry.features).map(function (fid) {
+          return registry.features[fid]
+        })
+        var findResult = findFeature({
+          currentFiles: preflight.fileHashes || [],
+          currentAnchor: preflight.anchorPath || '',
+          registryFeatures: registryFeatures,
+        })
+        preflight.findFeatureDecision = findResult.decision
+        preflight.findFeatureFeatureId = findResult.featureId || null
+        preflight.findFeatureMatchCount = findResult.matchCount || 0
+        plog('Registry Lookup: findFeature decision=' + findResult.decision +
+          (findResult.featureId ? ' featureId=' + findResult.featureId : '') +
+          (findResult.reason ? ' reason=' + findResult.reason : ''))
+
+        if (findResult.decision === 'reuse') {
+          // Sticky folder: override planDir to the reused feature's folder.
+          var reusedEntry = registry.features[findResult.featureId]
+          if (reusedEntry && reusedEntry.planDir) {
+            planDir = reusedEntry.planDir
+            preflight.derivedPlanDir = planDir
+            plog('Registry Lookup: reusing existing folder ' + planDir + ' for ' + findResult.featureId)
+          }
+        } else if (findResult.decision === 'blocked') {
+          // Ambiguous or weak-only match — block with guidance.
+          result.blockedAt = 'registry-lookup-ambiguous'
+          result.handoff = {
+            from: 'extract',
+            message: 'Feature identity is ambiguous (' + (findResult.reason || 'unknown') +
+              '). Use --feature=<featureId> to select a specific feature, or --new to create a new folder.',
+            nextMode: 'extract',
+            planDir: planDir,
+            findFeatureReason: findResult.reason || 'unknown',
+            candidates: findResult.candidates || [],
+            weakMatches: findResult.weakMatches || [],
+          }
+          plog('Registry Lookup: blocked — ' + (findResult.reason || 'unknown'))
+          stateCheckpoint('Registry Lookup', 'blocked')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // For 'new' decision: collision guard before promotion.
+        if (findResult.decision === 'new') {
+          var collision = await checkFolderCollision({
+            planDir: planDir,
+            requesterDigest: preflight.scopeDigest,
+            result: result,
+          })
+          if (collision && collision.collision) {
+            result.blockedAt = 'registry-collision'
+            result.handoff = {
+              from: 'extract',
+              message: 'Folder ' + planDir + ' is owned by feature ' + collision.existingFeatureId +
+                '. Use --feature=' + collision.existingFeatureId + ' to update it, or --new to create a distinct folder.',
+              nextMode: 'extract',
+              planDir: planDir,
+              collisionWith: collision.existingFeatureId,
+            }
+            plog('Registry Lookup: collision with ' + collision.existingFeatureId + ' at ' + planDir)
+            stateCheckpoint('Registry Lookup', 'collision')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'done')
+
+        // Phase 18: resolve upsert mode (D3 — explicit upsert entrypoints).
+        // Determines whether this is an auto-update, force, fork-new, feature-select,
+        // continue-incomplete, or the default first-extraction pending-confirmation flow.
+        phase('Upsert')
+        var upsertMode = resolveUpsertMode(args, findResult)
+        preflight.upsertMode = upsertMode.mode
+        plog('Upsert: mode=' + upsertMode.mode +
+          (upsertMode.featureId ? ' featureId=' + upsertMode.featureId : '') +
+          (upsertMode.reason ? ' reason=' + upsertMode.reason : ''))
+
+        // --new + --feature: mutually exclusive — block.
+        if (upsertMode.mode === 'error') {
+          result.blockedAt = 'upsert-mutually-exclusive'
+          result.handoff = {
+            from: 'extract',
+            message: '--new and --feature are mutually exclusive. Use one or the other.',
+            nextMode: 'extract',
+            planDir,
+          }
+          plog('Upsert: blocked — mutually exclusive')
+          stateCheckpoint('Upsert', 'error')
+          await writePendingRecord(PENDING_DIR, preflight, result)
+          await consolidate(slug, result, config)
+          return result
+        }
+
+        // --feature=<id>: override findResult to force-select the specified feature.
+        if (upsertMode.mode === 'feature') {
+          var featureEntry = registry.features[upsertMode.featureId]
+          if (!featureEntry) {
+            result.blockedAt = 'feature-not-found'
+            result.handoff = {
+              from: 'extract',
+              message: 'Feature ' + upsertMode.featureId + ' not found in registry.',
+              nextMode: 'extract',
+              planDir,
+            }
+            plog('Upsert: feature not found — ' + upsertMode.featureId)
+            stateCheckpoint('Upsert', 'feature-not-found')
+            await writePendingRecord(PENDING_DIR, preflight, result)
+            await consolidate(slug, result, config)
+            return result
+          }
+          planDir = featureEntry.planDir
+          preflight.derivedPlanDir = planDir
+          // Update findResult so downstream registry refresh uses the correct feature.
+          findResult.featureId = upsertMode.featureId
+          findResult.decision = 'reuse'
+          plog('Upsert: --feature selected ' + upsertMode.featureId + ' at ' + planDir)
+          // Fall through to auto-update for the selected feature.
+          upsertMode.mode = 'auto-update'
+        }
+
+        // --new on an existing feature: fork a distinct folder.
+        if (upsertMode.mode === 'new' && findResult.decision === 'reuse') {
+          var forked = deriveForkedFeatureId(findResult.featureId, registry)
+          preflight.forkedFeatureId = forked.featureId
+          preflight.forkedN = forked.n
+          plog('Upsert: --new forks ' + findResult.featureId + ' -> ' + forked.featureId)
+          stateCheckpoint('Upsert', 'forked')
+          // Continue with the pending-confirmation flow (new folder for the fork).
+        }
+
+        // Auto-update / force / continue-incomplete: load existing state and run
+        // the update flow (or just continue), then proceed to extraction.
+        if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force' || upsertMode.mode === 'continue-incomplete') {
+          // Scope is already confirmed for an existing feature — skip confirmation.
+          result.extractScope = preflight.verdict
+          result.scopeManifestPath = planDir + 'scope-manifest.md'
+          result.scopeConfirmed = true
+
+          // Load existing pipeline-state (like --resume) to get the extract queue.
+          var loadedExisting = await loadPipelineStateWithRecovery(planDir)
+          var existingResult = loadedExisting && loadedExisting.state && loadedExisting.state.result
+          if (existingResult) {
+            if (Array.isArray(existingResult.extractQueue)) result.extractQueue = existingResult.extractQueue
+            if (existingResult.synthesisState !== undefined) result.synthesisState = existingResult.synthesisState
+            if (existingResult.persistenceTracker !== undefined) result.persistenceTracker = existingResult.persistenceTracker
+            if (existingResult.overviewPath !== undefined) result.overviewPath = existingResult.overviewPath
+          }
+          result.extractReady = false
+
+          if (upsertMode.mode === 'auto-update' || upsertMode.mode === 'force') {
+            // Change detection: reconcile slices → detect changes → invalidate.
+            phase('Reconcile Slices')
+            var reconciled = reconcileSlices(result.extractQueue, preflight.fileHashes || [])
+            plog('Reconcile Slices: ' + reconciled.slices.length + ' slices, ' +
+              reconciled.delta.added.length + ' added, ' + reconciled.delta.removed.length + ' removed')
+            stateCheckpoint('Reconcile Slices', 'done')
+
+            phase('Change Detection')
+            var detection = await runChangeDetection({
+              reconciledSlices: reconciled.slices,
+              fileHashes: preflight.fileHashes || [],
+              force: upsertMode.mode === 'force',
+              result: result,
+            })
+            plog('Change Detection: ' + ((detection && detection.decisions) || []).length + ' decisions')
+            stateCheckpoint('Change Detection', 'done')
+
+            // Apply invalidation for changed/removed slices.
+            phase('Invalidation')
+            var cdDecisions = (detection && detection.decisions) || []
+            for (var di = 0; di < cdDecisions.length; di++) {
+              var cd = cdDecisions[di]
+              var cdEntry = null
+              for (var qi = 0; qi < result.extractQueue.length; qi++) {
+                if (result.extractQueue[qi].id === cd.sliceId) {
+                  cdEntry = result.extractQueue[qi]
+                  break
+                }
+              }
+              if (!cdEntry) continue
+              if (cd.status === 'removed' || cd.status === 'slice-removed') {
+                onSliceRemoved(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' removed (parent path)')
+              } else if (cd.status === 'changed') {
+                invalidateSliceChain(result, cd.sliceId, cdEntry)
+                plog('Invalidation: slice ' + cd.sliceId + ' invalidated for re-extraction')
+              }
+            }
+            stateCheckpoint('Invalidation', 'done')
+            result.extractQueue = reconciled.slices
+
+            // Refresh the registry entry's mutable files from the current revision so
+            // subsequent findFeature matches see current paths/hashes. Immutable ownership
+            // identity (featureId, planDir, ownershipScopeDigest, anchorPath) is untouched.
+            var refreshReg = await readRegistry(REGISTRY_PATH, result)
+            var refreshedReg = refreshRegistryFiles(refreshReg, findResult.featureId, preflight.fileHashes || [])
+            if (refreshedReg !== refreshReg) {
+              await writeRegistry(REGISTRY_PATH, refreshedReg, result)
+              plog('Registry: refreshed files for ' + findResult.featureId + ' after change detection')
+            }
+          }
+
+          stateCheckpoint('Upsert', upsertMode.mode)
+          plog('Upsert: ' + upsertMode.mode + ' prepared — continuing to extraction')
+          // Do NOT write pending record or return — fall through to extraction.
+          // scopeManifestPath is set (Gate X0 skips), scopeConfirmed is true (Gate X0.5 passes),
+          // extractQueue is loaded (Gate X1 skips re-seeding).
+        } else {
+          // Default fresh-run path: write pending record + return awaiting-scope-confirm.
+
+        // Write pending record — the ONLY durable state before promotion.
+        // pipeline-state.json is intentionally NOT written (RED gate: --resume
+        // cannot resume a not-yet-promoted checkpoint).
+        await writePendingRecord(PENDING_DIR, preflight, result)
+        result.extractScope = preflight.verdict
+        result.pendingId = preflight.pendingId
+        plog(`Preflight: ${(preflight.verdict.files || []).length} file(s), ${(preflight.verdict.entryPoints || []).length} entry point(s), confidence=${preflight.verdict.confidence || 'unspecified'}, pendingId=${preflight.pendingId}`)
+        // Return awaiting-scope-confirm with pendingId (primary: --confirm <pendingId>)
+        const pscope = preflight.verdict
+        result.handoff = {
+          from: 'extract',
+          status: 'awaiting-scope-confirm',
+          message: `Scope resolved to ${(pscope.files || []).length} file(s). Confirm: /extract-design --confirm ${preflight.pendingId}`,
+          nextMode: 'extract',
+          planDir,
+          pendingId: preflight.pendingId,
+          scopeSummary: {
+            files: pscope.files || [],
+            entryPoints: pscope.entryPoints || [],
+            confidence: pscope.confidence || 'unspecified',
+            wide: !!pscope.wide,
+            suggestedSlices: pscope.suggestedSlices || [],
+          },
+        }
+        plog('Preflight: awaiting scope confirmation (pendingId=' + preflight.pendingId + ') — returning')
+        stateCheckpoint('Pending Confirm', 'awaiting-confirm')
+        // Intentionally NO consolidate here — pipeline-state.json must not exist
+        // before promotion (RED gate: --resume cannot resume a pre-promotion checkpoint).
+        // The pending record is the sole durable state; --confirm recovers from it.
+        return result
+        } // end default fresh-run else (Phase 18 upsert-mode conditional)
       }
 
       // Gate X0.5: scope confirmation — pause-and-resume checkpoint, NO agent involved.
@@ -1587,6 +2028,34 @@ Return slices with kebab-case ids. Do NOT modify code. Do NOT commit.`,
       }
       stateCheckpoint('Extract', 'done')
       plog(`Extract: extractReady=${readiness.ready} (${readiness.reason}) — ${doneSlices.length} done, ${blockedCount} blocked, ${skippedCount} skipped`)
+
+      // Root-last readiness commit: after extraction + publish + persist are durable,
+      // update the registry entry status from 'extracting' to 'current'. This is the
+      // final registry write — the root of the readiness tree.
+      if (readiness.ready) {
+        phase('Registry Lookup')
+        var readyReg = await readRegistry(REGISTRY_PATH, result)
+        if (readyReg && readyReg.features) {
+          // Find the registry entry for this feature (by planDir match).
+          var readyFeatureId = null
+          var readyFeatures = Object.keys(readyReg.features)
+          for (var rfi = 0; rfi < readyFeatures.length; rfi++) {
+            if (readyReg.features[readyFeatures[rfi]].planDir === planDir) {
+              readyFeatureId = readyFeatures[rfi]
+              break
+            }
+          }
+          if (readyFeatureId) {
+            var readyEntry = readyReg.features[readyFeatureId]
+            readyEntry.status = 'current'
+            readyEntry.updatedAt = String((args && args.timestamp) || '')
+            var rootLastReg = upsertRegistryEntry(readyReg, readyEntry)
+            await writeRegistry(REGISTRY_PATH, rootLastReg, result)
+            plog('Registry: root-last readiness commit — ' + readyFeatureId + ' status→current')
+          }
+        }
+        stateCheckpoint('Registry Lookup', 'root-last-done')
+      }
 
       // Phase 6: track the durable consolidate write through the persistence tracker.
       result.persistenceTracker = recordAttemptedWrite(
@@ -3376,4 +3845,24 @@ Use a clear conventional-commit message. Return the commit hash.`,
 }
 
 
-export { main }
+// Parent-path handler for a removed slice (emptied by membership loss).
+// Distinct from invalidateSliceChain (which resets for re-extraction):
+// the removed slice is terminal — lifecycle set to excluded, evidence
+// superseded, coverage denominator drops, parent publish/persist re-run.
+// Slice-local history (artifact paths) is preserved, NOT cleared.
+// PURE (operates on state/queueEntry objects) — calls invalidatePersistenceEvidence
+// and applyLifecycleEvent.
+function onSliceRemoved(state, sliceId, queueEntry) {
+  invalidatePersistenceEvidence(state, sliceId)
+
+  // Mark synthesis views stale for this slice — symmetric with the chain-based
+  // invalidator. Removal excludes the lifecycle and supersedes persistence evidence;
+  // this adds the explicit synthesis-staleness signal so views re-derive rather than
+  // serve cached data.
+  state.synthesisState = markStaleForSlice(state.synthesisState, sliceId)
+
+  var next = applyLifecycleEvent(queueEntry, { type: 'exclude', payload: { rationale: 'slice-removed-empty' } })
+  Object.assign(queueEntry, next)
+}
+
+export { main, onSliceRemoved }

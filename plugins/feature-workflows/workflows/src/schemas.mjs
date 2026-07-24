@@ -970,4 +970,357 @@ const OVERVIEW_VERDICT = {
   },
 }
 
-export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT }
+// --- Pending-confirmation protocol schemas (extract D0) -------------------
+
+// PREFLIGHT_VERDICT: returned by resolveScopePreflight — wraps a SCOPE_VERDICT with
+// the pending-confirmation lifecycle fields. The pendingId is engine-generated
+// (deterministic djb2 of task+timestamp); the agent resolves the scope but does NOT
+// write any files. State transitions: PENDING → PROMOTED (on --confirm).
+const PREFLIGHT_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string', description: 'Deterministic 16-hex confirmation id' },
+    task: { type: 'string' },
+    verdict: { type: 'object', description: 'Full SCOPE_VERDICT from the preflight resolution' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED'] },
+    createdAt: { type: 'string', description: 'ISO-like timestamp from args.timestamp' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+    fileHashes: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash from the hash-sources agent',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+    featureId: { type: 'string', description: 'Deterministic feature id: <primarySlug>-<scopeId16>' },
+    derivedPlanDir: { type: 'string', description: 'Deterministic docs/extract/<area>/<featureId>/ path' },
+  },
+}
+
+// PENDING_RECORD: shape of docs/extract/.pending/<pendingId>.json — the durable
+// scratch checkpoint written by the preflight and updated on promotion.
+const PENDING_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'task', 'verdict', 'state', 'createdAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    task: { type: 'string' },
+    verdict: { type: 'object' },
+    state: { type: 'string', enum: ['PENDING', 'CONFIRMED', 'PROMOTED', 'EXPIRED'] },
+    createdAt: { type: 'string' },
+    promotedAt: { type: 'string' },
+    planDir: { type: 'string' },
+    expiredAt: { type: 'string', description: 'Set when the bulky payload is TTL-expired' },
+    fileHashes: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash from the hash-sources agent',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+    featureId: { type: 'string', description: 'Deterministic feature id: <primarySlug>-<scopeId16>' },
+    derivedPlanDir: { type: 'string', description: 'Deterministic docs/extract/<area>/<featureId>/ path' },
+  },
+}
+
+// HASH_SOURCES_VERDICT: the hash-sources agent reads each file, computes per-file
+// SHA-256 (64-hex), then frames sorted [path, contentSha256] pairs as JSON and
+// SHA-256s that to produce scopeDigest. Agent-mediated — the engine never hashes.
+const HASH_SOURCES_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['files', 'scopeDigest'],
+  properties: {
+    files: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    scopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs' },
+  },
+}
+
+// IDENTITY_RECORD: shape of <planDir>/.identity.json. The ownershipScopeDigest is the
+// immutable full 64-hex SHA-256 scope digest, fixed at creation (never overwritten).
+const IDENTITY_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['featureId', 'planDir', 'ownershipScopeDigest', 'area', 'createdAt'],
+  properties: {
+    featureId: { type: 'string', description: 'Deterministic feature id' },
+    planDir: { type: 'string', description: 'Repo-relative POSIX folder path' },
+    ownershipScopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 scope digest (immutable at creation)' },
+    area: { type: 'string', description: 'First-2-segment area, fixed at creation' },
+    scopeId16: { type: 'string', description: '16-hex display/folder id' },
+    createdAt: { type: 'string' },
+  },
+}
+
+// LOCATOR_ENTRY: compact permanent record in docs/extract/.pending-locator.json.
+// Retained indefinitely so --confirm <pendingId> always resolves to the authoritative
+// folder even after the bulky pending payload is TTL-expired.
+const LOCATOR_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pendingId', 'featureId', 'planDir', 'promotedAt'],
+  properties: {
+    pendingId: { type: 'string' },
+    featureId: { type: 'string' },
+    planDir: { type: 'string' },
+    promotedAt: { type: 'string' },
+  },
+}
+
+// REGISTRY_ENTRY: a single feature's entry in docs/extract/.registry.json.
+// The files array carries current per-file hashes (mutable — rebuilt from
+// pipeline-state on recovery). Immutable ownership fields come from .identity.json.
+const REGISTRY_ENTRY = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['featureId', 'planDir', 'ownershipScopeDigest', 'scopeId16', 'files', 'status', 'updatedAt'],
+  properties: {
+    featureId: { type: 'string', description: 'Deterministic feature id' },
+    planDir: { type: 'string', description: 'Repo-relative POSIX folder path' },
+    ownershipScopeDigest: { type: 'string', description: 'Full 64-hex SHA-256 scope digest (immutable, mirrors .identity.json)' },
+    scopeId16: { type: 'string', description: '16-hex display/folder id' },
+    files: {
+      type: 'array',
+      description: 'Current file set with content hashes',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string' },
+          contentSha256: { type: 'string' },
+        },
+      },
+    },
+    anchorPath: { type: 'string', description: 'Anchor file path (lex-smallest, immutable ownership evidence)' },
+    status: { type: 'string', enum: ['extracting', 'current', 'stale'], description: 'Registry lifecycle status' },
+    updatedAt: { type: 'string', description: 'ISO timestamp of last registry update' },
+  },
+}
+
+// REGISTRY_FILE: the top-level registry shape — a map of featureId to REGISTRY_ENTRY.
+const REGISTRY_FILE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['features'],
+  properties: {
+    features: {
+      type: 'object',
+      description: 'Map of featureId to REGISTRY_ENTRY',
+      additionalProperties: REGISTRY_ENTRY,
+    },
+  },
+}
+
+// RECONCILE_FILE: a file with its content fingerprint (shared input/output shape for reconcile).
+const RECONCILE_FILE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path', 'contentSha256'],
+  properties: {
+    path: { type: 'string', description: 'Repo-relative POSIX path' },
+    contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+  },
+}
+
+// RECONCILE_DELTA: change record returned by reconcileSlices.
+const RECONCILE_DELTA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['added', 'removed', 'moved', 'newSlices', 'removedSlices', 'overlaps'],
+  properties: {
+    added: {
+      type: 'array',
+      description: 'Files assigned to an existing non-removed slice via prefix score',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that received the file' },
+        },
+      },
+    },
+    removed: {
+      type: 'array',
+      description: 'Files dropped from their owner (old path no longer in current set)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'sliceId'],
+        properties: {
+          path: { type: 'string' },
+          sliceId: { type: 'string', description: 'Slice that lost the file' },
+        },
+      },
+    },
+    moved: {
+      type: 'array',
+      description: 'Files whose path changed but contentSha256 uniquely matches a gone old path',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['oldPath', 'newPath', 'contentSha256', 'sliceId'],
+        properties: {
+          oldPath: { type: 'string' },
+          newPath: { type: 'string' },
+          contentSha256: { type: 'string' },
+          sliceId: { type: 'string', description: 'Original owner (unchanged)' },
+        },
+      },
+    },
+    newSlices: {
+      type: 'array',
+      description: 'New slices created from zero-score clusters',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sliceId', 'files'],
+        properties: {
+          sliceId: { type: 'string' },
+          files: { type: 'array', items: RECONCILE_FILE },
+        },
+      },
+    },
+    removedSlices: {
+      type: 'array',
+      description: 'Slices emptied by membership loss (terminal for re-extraction)',
+      items: { type: 'string' },
+    },
+    overlaps: {
+      type: 'array',
+      description: 'Overlap conflicts resolved by lex-smallest sliceId',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'winnerSliceId', 'loserSliceId'],
+        properties: {
+          path: { type: 'string' },
+          winnerSliceId: { type: 'string' },
+          loserSliceId: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+// SLICE_DIGEST: shape of <sliceDir>/.source-digest.json — per-file fingerprints + slice digest.
+const SLICE_DIGEST = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['files', 'digest'],
+  properties: {
+    files: {
+      type: 'array',
+      description: 'Per-file path + SHA-256 content hash (fingerprints for change detection)',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'contentSha256'],
+        properties: {
+          path: { type: 'string', description: 'Repo-relative POSIX path' },
+          contentSha256: { type: 'string', description: 'Full 64-hex SHA-256 of file content' },
+        },
+      },
+    },
+    digest: { type: 'string', description: 'Full 64-hex SHA-256 over framed sorted (path, contentSha256) pairs for this slice' },
+  },
+}
+
+// SLICE_DIGEST_RESULT: agent return for per-slice SHA-256 digest computation.
+const SLICE_DIGEST_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['slices'],
+  properties: {
+    slices: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sliceId', 'digest'],
+        properties: {
+          sliceId: { type: 'string', description: 'Slice identifier' },
+          digest: { type: 'string', description: 'Full 64-hex SHA-256 of the framed per-file pairs' },
+        },
+      },
+    },
+  },
+}
+
+const INVALIDATION_EVENT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['sliceId', 'key', 'action'],
+  properties: {
+    sliceId: { type: 'string', description: 'Slice whose evidence was invalidated' },
+    key: { type: 'string', description: 'Durable key that was versioned or removed' },
+    action: { type: 'string', enum: ['versioned', 'removed', 'superseded'], description: 'How the key was invalidated (no-demote: never demoted)' },
+    reason: { type: 'string', description: 'Why the evidence was invalidated' },
+  },
+}
+
+const UPSERT_MODE_VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['mode'],
+  properties: {
+    mode: {
+      type: 'string',
+      enum: ['auto-update', 'continue-incomplete', 'force', 'new', 'feature', 'blocked', 'error'],
+      description: 'Resolved update behavior for an existing feature',
+    },
+    featureId: { type: 'string', description: 'Selected feature id (mode=feature)' },
+    reason: { type: 'string', description: 'Block/error reason' },
+  },
+}
+
+const ADOPT_RESULT = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['adopted'],
+  properties: {
+    adopted: { type: 'boolean', description: 'Whether adoption occurred' },
+    featureId: { type: 'string', description: 'Derived or forked feature id' },
+    planDir: { type: 'string', description: 'Adopted folder path' },
+    reason: {
+      type: 'string',
+      enum: ['already-adopted', 'not-a-root', 'collision-forked', 'success'],
+      description: 'Why adoption did or did not occur',
+    },
+  },
+}
+
+export { DEFINE_VERDICT, TRANSLATOR_VERDICT, KEBAB_PAT, CATEGORY_VERDICT, PLAN_VERDICT, REVIEW_VERDICT, REFINE_VERDICT, EXECUTE_VERDICT, TEST_VERDICT, TEST_AUTHORING_VERDICT, COMMIT_VERDICT, TODO_ACK, FILE_ACK, GSD_RUN_VERDICT, DEBUG_VERDICT, ESCALATION_REVIEW, QUICK_DECISION_SCHEMA, GOALKEEPER_SCHEMA, ARCH_VERDICT, DETAILED_DESIGN_VERDICT, TDD_VERDICT, PERSIST_VERDICT, KNOWLEDGE_VERDICT, INTERVIEW_VERDICT, E2E_USECASE_VERDICT, CODEBASE_FACTS_VERDICT, REQUIREMENTS_VERDICT, DESIGN_REVISE_VERDICT, DESIGN_REVIEW_VERDICT, ENHANCER_VERDICT, RECONCILE_VERDICT, PUBLISH_VERDICT, PIPELINE_STATE, PIPELINE_STATE_READ, ARTIFACT_CHECK, STAGE_PLAN_VERDICT, ISSUE_CLASSIFY_VERDICT, TUNE_PLAN_VERDICT, SCOPE_VERDICT, DECOMPOSE_VERDICT, AUDIT_VERDICT, REVIEW_FINDINGS_VERDICT, REVIEW_MERGE_VERDICT, REVIEW_VERIFY_VERDICT, OVERVIEW_VERDICT, PREFLIGHT_VERDICT, PENDING_RECORD, LOCATOR_ENTRY, HASH_SOURCES_VERDICT, IDENTITY_RECORD, REGISTRY_ENTRY, REGISTRY_FILE, RECONCILE_FILE, RECONCILE_DELTA, SLICE_DIGEST, SLICE_DIGEST_RESULT, INVALIDATION_EVENT, UPSERT_MODE_VERDICT, ADOPT_RESULT }

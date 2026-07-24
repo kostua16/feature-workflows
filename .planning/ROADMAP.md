@@ -2,10 +2,25 @@
 
 ## Milestones
 
+- ✅ **v1.6.0 Design-Extract Determination** — Phases 12-19 (shipped 2026-07-24). Full details: [`milestones/v1.6.0-ROADMAP.md`](milestones/v1.6.0-ROADMAP.md)
 - ✅ **v1.5.0 Project-Scale Extract Design** — Phases 1-11 (shipped 2026-07-22). Full details: [`milestones/v1.5.0-ROADMAP.md`](milestones/v1.5.0-ROADMAP.md)
 - ✅ **v1.4.5 Pre-GSD Baseline** — shipped before the GSD planning ledger.
 
 ## Phases
+
+<details>
+<summary>✅ v1.6.0 Design-Extract Determination (Phases 12-19) — SHIPPED 2026-07-24</summary>
+
+- [x] Phase 12: Pending-Confirmation Protocol & Promotion (1/1 plans)
+- [x] Phase 13: Deterministic Identity & Hashing (1/1 plans)
+- [x] Phase 14: Feature-Identity Registry, Lookup & Integrity (1/1 plans)
+- [x] Phase 15: Slice Ownership Reconciliation (1/1 plans)
+- [x] Phase 16: Change Detection (1/1 plans)
+- [x] Phase 17: Invalidation Chain & Removal Path (1/1 plans)
+- [x] Phase 18: Upsert Entrypoints & v1.5 Migration (1/1 plans)
+- [x] Phase 19: Compatibility & Proof (1/1 plans)
+
+</details>
 
 <details>
 <summary>✅ v1.5.0 Project-Scale Extract Design (Phases 1-11) — SHIPPED 2026-07-22</summary>
@@ -21,7 +36,6 @@
 - [x] Phase 9: Design-Mode Truthful Readiness and Outcome Reporting (1/1 plans)
 - [x] Phase 10: Design-Mode Bounded Budgets and Prompt Context (1/1 plans)
 - [x] Phase 11: Design-Mode Reliability, Verification, and Characterization Proof (1/1 plans)
-- [x] Tech-debt cleanup (post-audit): migration resume path, budget trade-off docs, token-plumbing, doc hygiene
 
 </details>
 
@@ -33,24 +47,10 @@ Run `/gsd-new-milestone` to define questioning → research → requirements →
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 1. State, Coverage, Migration, Revision | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 2. Bounded Discovery, Graph, Schedulability | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 3. Multi-Entry Build, Install, Version Lockstep | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 4. Checkpointed Feature Leaf | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 5. Bounded Scheduler, Transactional Continuation | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 6. Synthesis, Publish, Persist, Status Truth | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 7. Compatibility, Project-Scale Proof | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 8. Design-Mode Durable Checkpoints, Resume | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 9. Design-Mode Truthful Readiness, Outcomes | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 10. Design-Mode Bounded Budgets, Prompts | v1.5.0 | 1/1 | Complete | 2026-07-22 |
-| 11. Design-Mode Reliability, Characterization | v1.5.0 | 1/1 | Complete | 2026-07-22 |
+| 12-19 | v1.6.0 | 8/8 | Complete | 2026-07-24 |
+| 1-11 | v1.5.0 | 11/11 | Complete | 2026-07-22 |
 
 ## Deferred to Future Milestones
 
-Carried forward from v1.5.0 (see `milestones/v1.5.0-REQUIREMENTS.md` Future section):
-
-- Project-scale sharding & automatic continuation for non-extract modes (design/implement/tune/review) where a measured multi-item scaling need appears.
-- A generalized arbitrary-DAG orchestration platform beyond whole-project extraction.
-- Dynamic mid-leaf repartitioning, unless characterization proves fixed pre-admission slices insufficient.
-- Real per-gate **token-budget characterization** (plumbing added in v1.5.0 cleanup; needs a dogfood run to measure).
-- Runtime adoption of the Phase-2 **deterministic** discovery/scheduling primitives (currently contract-characterization libraries; the live extract path is LLM-driven by design).
+- **v1.6.0 future:** gate-level change-detection granularity; concurrent same-feature invocation safety; dynamic slice re-clustering; multi-run `main()` integration test.
+- **v1.5.0 future:** project-scale sharding for non-extract modes; generalized arbitrary-DAG platform; dynamic mid-leaf repartitioning; real token-budget characterization; runtime adoption of Phase-2 deterministic primitives.

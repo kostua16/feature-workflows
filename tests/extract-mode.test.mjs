@@ -213,8 +213,10 @@ test('extract branch is guarded by isExtractMode and returns before Phase E4', (
   assert.ok(branch < e4, 'extract branch sits before the E4 loop')
 })
 
-test('planDir derivation uses the extract path segment in extract mode', () => {
-  assert.match(source, /const kindSeg = isExtractMode \? 'extract' : 'feature'/)
+test('planDir derivation bypasses categorizer for extract mode (Phase 13)', () => {
+  // Extract mode no longer uses the categorizer — folder is deterministic from hashes.
+  // The categorizer branch is guarded by gateModeActive('design', mode) only.
+  assert.match(source, /docs\/extract\/\.pending\/plan\.md/)
 })
 
 test('scope confirmation is a pause-and-resume checkpoint with NO agent call', () => {
